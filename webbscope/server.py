@@ -21,7 +21,7 @@ from . import importer, xenium, batch, qc
 from .profiler import PROF
 import time
 from .transcripts import Transcripts
-from . import he_slide, he_registered, if_image
+from . import he_slide, he_registered, if_image, imc
 from pydantic import BaseModel
 
 WEB = Path(__file__).resolve().parent / "web"
@@ -29,6 +29,7 @@ app = FastAPI(title="WebbScope")
 app.add_middleware(GZipMiddleware, minimum_size=2000)
 S: Store = None
 HE_EXTRA = None         # folder holding registered H&E tiles (he/<key>/…, he/index.json) added when a project was opened, in the cache; else None
+IMX = None              # IMC slide of the open project: {store: Path, index: dict (imc.read_store)}, else None
 IFX = None              # IF images of the open project: {images: {key: entry}, samples: {sample: key}} (if_image.py), else None
 SM: Smoother = None
 NB: Neighbors = None
@@ -109,6 +110,7 @@ def meta():
     d["has_transcripts"] = TX is not None
     d["has_he_slide"] = (PROJ / "he_slide.json").exists()
     d["has_if"] = bool(IFX and IFX["samples"])
+    d["has_imc"] = bool(IMX)
     if TX is not None:                                           # transcripts in the whole run (= slide) each tissue came from: the rows of its transcripts.parquet
         for smp in d["samples"]:
             try:
@@ -763,6 +765,187 @@ def if_tile(key: str, ch: int, z: int, x: int, y: int, c: str = "white", lo: flo
     return Response(b, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
 
 
+# ---------------------------------------------------------------- IMC (.mcd) beside the cells
+class IMCState:
+    state = "idle"           # idle | converting | error
+    progress = 0.0
+    msg = ""
+    error = None
+    mcd = None
+
+
+IMS = IMCState()
+
+
+def _imc_links():
+    f = importer.cache_root() / "imc" / "_links.json"
+    try:
+        return f, json.loads(f.read_text())
+    except (OSError, ValueError):
+        return f, {}
+
+
+def _imc_link(project, store=None):
+    """Remember (store given) or look up which converted IMC store belongs to a project folder."""
+    f, d = _imc_links()
+    k = str(Path(project).resolve())
+    if store is None:
+        return d.get(k)
+    d[k] = str(store)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(d))
+
+
+def _imc_open_store(project):
+    global IMX
+    IMX = None
+    s = _imc_link(project)
+    ix = imc.read_store(s) if s else None
+    if ix:
+        IMX = {"store": Path(s), "index": ix}
+
+
+def _imc_map_file():
+    return IMX["store"] / ("map-" + __import__("hashlib").sha1(str(PROJ.resolve()).encode()).hexdigest()[:10] + ".json")
+
+
+def _imc_map():
+    try:
+        return json.loads(_imc_map_file().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _imc_start(path):
+    """Convert an .mcd file into the cache (background thread) and attach it to the open project when it is done."""
+    global IMX
+    if IMS.state == "converting":
+        raise HTTPException(409, "an IMC conversion is already running")
+    try:
+        info = imc.scan(path)
+    except imc.IMCError as e:
+        raise HTTPException(400, str(e))
+    proj = PROJ
+    IMS.state, IMS.progress, IMS.msg, IMS.error, IMS.mcd = "converting", 0.0, "starting", None, info["file"]
+
+    def work():
+        global IMX
+        try:
+            d = imc.convert(info["file"], importer.cache_root(), _log, lambda f, m="": (setattr(IMS, "progress", float(f)), setattr(IMS, "msg", m)), info)
+            if PROJ is proj:
+                _imc_link(proj, d)
+                _imc_open_store(proj)
+            IMS.state = "idle"
+            _log("IMC ready")
+        except Exception as e:
+            traceback.print_exc()
+            IMS.state, IMS.error = "error", str(e)
+            _log(f"IMC error: {e}")
+    threading.Thread(target=work, daemon=True).start()
+
+
+class IMCAddReq(BaseModel):
+    path: str
+
+
+@app.post("/api/imc/add", response_class=ORJSONResponse)
+def imc_add(r: IMCAddReq):
+    p = Path(r.path.strip()).expanduser()
+    if not p.is_file() or p.suffix.lower() != ".mcd":
+        raise HTTPException(400, f"not an .mcd file: {p}")
+    _imc_start(p)
+    return {"ok": True}
+
+
+@app.get("/api/imc", response_class=ORJSONResponse)
+def imc_info():
+    """The IMC slide of the open project: ROIs (acquisitions) with size, slide position and whether they are complete, the channels, the ROI chosen
+    for each tissue, and the conversion state."""
+    st = {"state": IMS.state, "progress": IMS.progress, "msg": IMS.msg, "error": IMS.error}
+    if not IMX:
+        return {"has": False, "status": st}
+    ix = IMX["index"]
+    mp = _imc_map()
+    first = complete = None
+    for r in ix["rois"]:
+        try:
+            m = json.loads((IMX["store"] / r["key"] / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        r["hi"] = m["hi"][0]
+        first = first or r["key"]
+        if r["complete"] and not complete:
+            complete = r["key"]
+    return {"has": True, "status": st, "file": ix["file"], "rois": ix["rois"], "channels": ix["channels"], "map": mp, "default": complete or first}
+
+
+class IMCMapReq(BaseModel):
+    sample: str
+    roi: str
+
+
+@app.post("/api/imc/map", response_class=ORJSONResponse)
+def imc_map(r: IMCMapReq):
+    if not IMX or r.roi not in {x["key"] for x in IMX["index"]["rois"]}:
+        raise HTTPException(404, "unknown ROI")
+    m = _imc_map()
+    m[r.sample] = r.roi
+    _imc_map_file().write_text(json.dumps(m))
+    return {"ok": True}
+
+
+def _imc_roi(roi):
+    if not IMX:
+        raise HTTPException(404, "no IMC data")
+    for r in IMX["index"]["rois"]:
+        if r["key"] == roi and (IMX["store"] / roi / "meta.json").is_file():
+            return r
+    raise HTTPException(404, "unknown ROI")
+
+
+@app.get("/api/imc/index", response_class=ORJSONResponse)
+def imc_scene(roi: str):
+    """One ROI in the shape of the H&E slide scan (/api/heslide?scan=...), so the side pane shows it like a scan."""
+    r = _imc_roi(roi)
+    m = json.loads((IMX["store"] / roi / "meta.json").read_text())
+    note = "" if m["complete"] else f" (incomplete: {m['rows']:,} of {m['h']:,} rows acquired)"
+    return {"source": f"IMC {r['name']}{note}", "bounds_um": [0, 0, m["w"], m["h"]],
+            "scenes": [{"key": f"imc:{roi}", "tsize": m["tile"], "px": 1.0, "nz": m["nz"], "x0": 0, "y0": 0, "w": m["w"], "h": m["h"]}]}
+
+
+def _imc_args(ch, c, b):
+    try:
+        chs = [int(x) for x in ch.split(",") if x != ""]
+        bs = [float(x) for x in b.split(",")] if b else []
+    except ValueError:
+        raise HTTPException(400, "bad channel list")
+    cols = c.split(",") if c else []
+    n = len(IMX["index"]["channels"])
+    if not chs or len(chs) > 16 or any(not 0 <= x < n for x in chs):
+        raise HTTPException(400, "choose 1 to 16 channels")
+    cols = (cols + ["white"] * len(chs))[:len(chs)]
+    bs = (bs + [1.0] * len(chs))[:len(chs)]
+    return chs, cols, bs
+
+
+@app.get("/api/imc/tile/{roi}/{z}/{x}_{y}.jpg")
+def imc_tile(roi: str, z: int, x: int, y: int, ch: str = "", c: str = "", b: str = "", g: float = 1.0):
+    _imc_roi(roi)
+    chs, cols, bs = _imc_args(ch, c, b)
+    out = imc.tile(IMX["store"], roi, z, x, y, chs, cols, bs, min(max(g, 0.2), 5.0))
+    if out is None:
+        raise HTTPException(404)
+    return Response(out, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/api/imc/fit/{roi}.jpg")
+def imc_fit(roi: str, w: int = 300, h: int = 300, ch: str = "", c: str = "", b: str = "", g: float = 1.0):
+    _imc_roi(roi)
+    chs, cols, bs = _imc_args(ch, c, b)
+    out = imc.fit(IMX["store"], roi, min(max(w, 32), 1600), min(max(h, 32), 1600), chs, cols, bs, min(max(g, 0.2), 5.0))
+    return Response(out, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=3600"})
+
+
 # ---------------------------------------------------------------- opening a project
 class State:
     state = "idle"          # idle | importing | ready | error
@@ -804,6 +987,7 @@ def _load(cache_dir, project):
         IFX = if_image.read_index(project)
     except Exception as e:                           # a damaged if.json must not stop the project from opening
         _log(f"IF images ignored: {e}")
+    _imc_open_store(project)
     TX = None
     if (Path(project) / "transcripts" / "index.json").exists():
         try:
@@ -813,7 +997,7 @@ def _load(cache_dir, project):
             _log(f"transcripts ignored: {e}")
 
 
-def open_project(path, force=False, prepare=None, roi_object=None, if_path=None, cols=None, he_reg=None):
+def open_project(path, force=False, prepare=None, roi_object=None, if_path=None, cols=None, he_reg=None, imc_path=None):
     """Import (if needed) and load a project folder, in a background thread."""
     global S
     if ST.state == "importing":
@@ -840,6 +1024,11 @@ def open_project(path, force=False, prepare=None, roi_object=None, if_path=None,
                 _user_if(if_path)
             if he_reg:
                 _register_he(he_reg, cdir)
+            if imc_path:
+                try:
+                    _imc_start(imc_path)
+                except HTTPException as e:
+                    _log(f"IMC ignored: {e.detail}")
             ST.state = "ready"
             _log("ready")
         except importer.ImportError_ as e:
@@ -908,6 +1097,7 @@ class OpenReq(BaseModel):
     if_image: str = ""             # IF image (.ome.tif or a Xenium output folder), optional
     he_reg_folder: str = ""        # folder of registered H&E OME-TIFFs (one per tissue), optional
     he_reg_index: str = ""         # index.json mapping image names to sample ids, optional
+    imc_file: str = ""             # IMC slide (.mcd), optional: converted into the cache in the background
     sample_col: str | None = None  # cell-table column that identifies the samples (None = project.json / found by name)
     donor_col: str | None = None   # cell-table column that identifies the donors ("" = there is none, None = found by name)
 
@@ -967,7 +1157,12 @@ def open_(r: OpenReq):
         if not ifp.exists():
             raise HTTPException(400, f"IF image not found: {ifp}")
     cols = {k: v.strip() for k, v in (("sample", r.sample_col), ("donor", r.donor_col)) if v is not None and (k == "donor" or v.strip())}
-    open_project(r.path, r.force, roi_object=roi, if_path=ifp, cols=cols or None, he_reg=_he_reg_args(r.he_reg_folder, r.he_reg_index))
+    imp = None
+    if r.imc_file.strip():
+        imp = Path(r.imc_file.strip()).expanduser()
+        if not imp.is_file() or imp.suffix.lower() != ".mcd":
+            raise HTTPException(400, f"IMC file not found or not an .mcd file: {imp}")
+    open_project(r.path, r.force, roi_object=roi, if_path=ifp, cols=cols or None, he_reg=_he_reg_args(r.he_reg_folder, r.he_reg_index), imc_path=imp)
     return {"ok": True}
 
 
@@ -1097,6 +1292,7 @@ class XConvertReq(BaseModel):
     he: bool = False
     he_reg_folder: str = ""
     he_reg_index: str = ""
+    imc_file: str = ""              # IMC slide (.mcd), optional: converted into the cache after the project opens
 
 
 @app.post("/api/xenium/convert", response_class=ORJSONResponse)
@@ -1109,6 +1305,11 @@ def xenium_convert(r: XConvertReq):
         raise HTTPException(400, "choose an output folder")
 
     hreg = _he_reg_args(r.he_reg_folder, r.he_reg_index)
+    imp = None
+    if r.imc_file.strip():
+        imp = Path(r.imc_file.strip()).expanduser()
+        if not imp.is_file() or imp.suffix.lower() != ".mcd":
+            raise HTTPException(400, f"IMC file not found or not an .mcd file: {imp}")
 
     def prepare():
         _log("converting the Xenium output to a project folder")
@@ -1120,7 +1321,7 @@ def xenium_convert(r: XConvertReq):
                 _log(f"registered H&E ignored: {e}")
         _log(f"project written to {out}")
         return out
-    open_project(str(out), False, prepare)
+    open_project(str(out), False, prepare, imc_path=imp)
     return {"ok": True}
 
 

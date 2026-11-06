@@ -35,14 +35,14 @@ async function openPath(p) {
   }
   $("#open").disabled = true; $("#log").textContent = ""; opening = true;
   const cols = $("#colsbox").hidden ? {} : { sample_col: $("#colsample").value, donor_col: $("#coldonor").value };
-  const r = await fetch("/api/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...cols, path: p, roi_object: $("#roi").value.trim(), if_image: $("#ifimg").value.trim(), he_reg_folder: $("#hereg").value.trim(), he_reg_index: $("#heregidx").value.trim() }) });
+  const r = await fetch("/api/open", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...cols, path: p, roi_object: $("#roi").value.trim(), if_image: $("#ifimg").value.trim(), imc_file: $("#imcfile").value.trim(), he_reg_folder: $("#hereg").value.trim(), he_reg_index: $("#heregidx").value.trim() }) });
   if (!r.ok) { $("#err").textContent = await r.text(); $("#open").disabled = false; return; }
   poll();
 }
 $("#open").onclick = () => { const p = $("#path").value.trim(); if (p) openPath(p); };
 $("#path").addEventListener("input", () => { askedFor = null; $("#colsbox").hidden = true; });   // another path: ask again
 $("#path").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#open").click(); });   // addEventListener: a handler that returns false would cancel typing
-$("#browse").hidden = false; $("#roibrowse").hidden = false; $("#heregbrowse").hidden = false; $("#heregidxbrowse").hidden = false; $("#ifbrowse").hidden = false;     // native dialog in the app window, else the local server's macOS dialog; the path can always be typed
+$("#browse").hidden = false; $("#roibrowse").hidden = false; $("#heregbrowse").hidden = false; $("#heregidxbrowse").hidden = false; $("#ifbrowse").hidden = false; $("#imcbrowse").hidden = false;     // native dialog in the app window, else the local server's macOS dialog; the path can always be typed
 $("#browse").onclick = async () => {
   let p = null;
   try { const api = window.pywebview && window.pywebview.api; p = api ? await api.pick_folder() : (await (await fetch("/api/pick?kind=dir")).json()).path; }
@@ -72,6 +72,12 @@ $("#ifbrowse").onclick = async () => {
   try { const api = window.pywebview && window.pywebview.api; p = api && api.pick_file ? await api.pick_file(["tif", "tiff"]) : (await (await fetch("/api/pick?kind=file&types=tif,tiff")).json()).path; }
   catch (e) { $("#err").textContent = "Cannot open a file dialog here; type the path instead."; return; }
   if (p) $("#ifimg").value = p;
+};
+$("#imcbrowse").onclick = async () => {
+  let p = null;
+  try { const api = window.pywebview && window.pywebview.api; p = api && api.pick_file ? await api.pick_file(["mcd"]) : (await (await fetch("/api/pick?kind=file&types=mcd")).json()).path; }
+  catch (e) { $("#err").textContent = "Cannot open a file dialog here; type the path instead."; return; }
+  if (p) $("#imcfile").value = p;
 };
 $("#ifimg").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#open").click(); });
 $("#roi").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#open").click(); });

@@ -35,6 +35,11 @@
         <label>index.json (optional)</label><input id="f_heregidx" placeholder="/path/to/index.json: image name → sample id" data-pick="file" data-types="json">
       </div>
       <p class="sub">They are shown under or beside the cells (the <b>Images</b> button), unlike the slide scan above. Each image goes to the tissue whose name is the image's file name (without <code>_warped_he.ome.tif</code>); with an <code>index.json</code> the names can be anything. The tissues here are called <code>tissue_1</code>, <code>tissue_2</code> … by the tissue detection, so an <code>index.json</code> is usually needed. The images are tiled into the project folder after the conversion.</p></details>
+    <details open><summary><b>IMC slide</b> (optional): an imaging mass cytometry <code>.mcd</code> file of the same slide</summary>
+      <div class="grid">
+        <label>IMC file (.mcd)</label><input id="f_imc" placeholder="/path/to/IMC_….mcd" data-pick="file" data-types="mcd">
+      </div>
+      <p class="sub">It is converted once into the cache (a few minutes for a file of 20 GB; the file itself is never changed) after the project opens, and shown beside the cells in the viewer (<b>Images</b> → IMC, <i>Beside</i>). It is not aligned to the Xenium coordinates: you pick the IMC ROI of each tissue in the viewer.</p></details>
     <div class="row"><button id="scan" class="primary">Read</button></div>
     <pre id="log"></pre><div id="err"></div>
   </section>

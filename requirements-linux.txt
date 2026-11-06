@@ -11,3 +11,5 @@ pillow
 pylibCZIrw
 pydantic
 pyinstaller
+readimc
+imageio

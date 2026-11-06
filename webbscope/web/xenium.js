@@ -190,7 +190,7 @@ $("#go").onclick = async () => {
   if (!Object.keys(X.prev.counts).length) { $("#err2").textContent = "No tissue is switched on."; return; }
   $("#go").disabled = true; $("#log2").textContent = "";
   const r = await post("/api/xenium/convert", { spec: X.spec, output: $("#outdir").value.trim(), name: $("#pname").value.trim(), annotation: ann || {}, transcripts: !!(X.info.has_transcripts && $("#wanttx").checked), he: !!(X.info.he && $("#wanthe").checked),
-    he_reg_folder: $("#f_hereg").value.trim(), he_reg_index: $("#f_heregidx").value.trim() });
+    he_reg_folder: $("#f_hereg").value.trim(), he_reg_index: $("#f_heregidx").value.trim(), imc_file: $("#f_imc").value.trim() });
   if (!r.ok) { $("#err2").textContent = (JSON.parse(await r.text()).detail) || "failed"; $("#go").disabled = false; return; }
   pollConv();
 };

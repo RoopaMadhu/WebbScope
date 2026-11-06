@@ -81,6 +81,7 @@ Optional additions to the main input.
 | IF (morphology) image | The run's `morphology_focus` files (`.ome.tif`, one per channel or one file), read from the folder, the bundle or a path you give; not copied. | **Yes**, read from each run |
 | Registered H&E | A folder of `.ome.tif` / `.ome.tiff`, one per tissue, already in the Xenium frame; optional `index.json` mapping image names to sample ids. | **Yes.** Images are matched to `<run>_tissue_N` by file name. |
 | H&E slide scan (not registered) | `.czi`, `.ome.tif` or `.ome.tiff`; optional ImageScope `.annotations` files. | **Yes.** A folder of scans, matched to the runs by the numbers in the names. |
+| IMC slide (imaging mass cytometry) | An `.mcd` file of the slide (all its ROIs and channels). Converted once into the cache; the file is never changed. See [IMC slide](#imc-slide-mcd). | **No.** Single-run import page, open-project page or the Images menu. |
 | ROI object (ROI heterogeneity) | A `region_heterogeneity` object: `.rds` (or `.qs2`, converted through R). | **No.** |
 | Pathologist regions, signatures | `regions.geojson` and `signatures.json` in a project folder. | **No.** Project folder only. |
 
@@ -132,6 +133,16 @@ In the Mac app window, **QC report**, **Profile** and the validation-report link
 ## H&E next to the cells
 
 There are two separate H&E features, with two kinds of input. **Raw, unregistered scans** (one whole-slide image, `.czi` or `.ome.tif` / `.ome.tiff`) are given in the H&E field of the import pages and open in the *H&E slide* window. **Registered images** (one OME-TIFF per tissue, already in the Xenium frame, `.ome.tif` or `.ome.tiff`) have their own fields on the open-project page, the single-run import page and the batch page: a folder of images and an optional `index.json` that maps image names to sample ids. They show under or beside the cells (the *Images* button). They can also be added with `python -m webbscope.he_registered`, or as a ready-made `he/` folder in the project. Neither is produced by the Xenium import unless you add the slide scan.
+
+## IMC slide (.mcd)
+
+An imaging mass cytometry file (for example the IMC run on the same slide after Xenium) can be shown beside the cells. It is **not aligned** to the Xenium coordinates, so, like the H&E slide scan, it only goes in the pane beside the cells (with its own pan and zoom, rotate and flip) and shows the **raw counts**.
+
+1. Give the `.mcd` in the **IMC slide** field of the open-project page or of the single-run Xenium import page (not the batch page), or in the viewer in the **Images** menu (*Add IMC file*). It is converted once, in the background, into the cache; the file is never changed.
+2. In the **Images** menu tick **IMC** under *Beside*. Each ROI (acquisition) of the file is a separate image, so pick the ROI that belongs to the tissue in the list next to the orientation buttons (the choice is remembered). Incomplete acquisitions are listed and marked.
+3. **IMC channels** opens a list of all channels with a search box. Tick one or several (up to 16): each has its own colour and brightness and the ticked channels are added up as light.
+
+The Gallery, Regions, Glomeruli and similar tile windows show the chosen ROI beside each tissue; the Slide window does not offer IMC. Details, limits and what was checked: [docs/NOTES.md](docs/NOTES.md#imc-slide-mcd).
 
 ## Command line
 

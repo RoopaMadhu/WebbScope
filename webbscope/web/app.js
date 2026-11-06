@@ -441,9 +441,9 @@ function layersCore(colors) {
     L.push(new deck.PolygonLayer({
       id: "cells-poly", data: pl, getPolygon: (j) => xy.subarray(off[di[j]] * 2, off[di[j] + 1] * 2),
       getFillColor: (j) => colors.subarray(j * 4, j * 4 + 4), filled: !HEW.main.outl,
-      getLineColor: S.grey ? GREY_LINE : HEW.main.outl ? (j) => { const o = j * 4; return [colors[o], colors[o + 1], colors[o + 2], Math.max(200, colors[o + 3])]; } : [20, 20, 20, 140],
+      getLineColor: S.grey ? GREY_LINE : HEW.main.outl || (HEW.main.on && S.opacity < 0.999) ? (j) => { const o = j * 4; return [colors[o], colors[o + 1], colors[o + 2], Math.max(200, colors[o + 3])]; } : [20, 20, 20, 140],   // translucent fills over an image keep a solid rim in the cell colour
       stroked: true, lineWidthUnits: "pixels", getLineWidth: S.grey ? 0.9 : HEW.main.outl ? 1.4 : 0.6, positionFormat: "XY", pickable: true,
-      updateTriggers: { getPolygon: [S.sample, S.drawIdx, pl.length, pl[0], pl[pl.length - 1]], getFillColor: [colors], getLineColor: [colors, HEW.main.outl, S.grey], getLineWidth: [S.grey, HEW.main.outl] },
+      updateTriggers: { getPolygon: [S.sample, S.drawIdx, pl.length, pl[0], pl[pl.length - 1]], getFillColor: [colors], getLineColor: [colors, HEW.main.outl, S.grey, HEW.main.on, S.opacity], getLineWidth: [S.grey, HEW.main.outl] },
     }));
     if (S.selected.size) {
       const sel = [...S.selected].filter((i) => S.vis[i]);
@@ -655,8 +655,9 @@ function ptInit() {
 // ---- Slide scan (unregistered H&E) beside the cells: the side pane shows the whole scan with its own pan / zoom (nothing links it to the cells); the
 // orientation buttons turn / flip it by transforming each tile's corners (the scan's own frame: micrometres from its top-left, y down).
 const SC = { idx: null, multi: null, key: "", sample: null, orient: {}, loading: null };
-const scanMode = () => HEW.main.sides.has("scan");
-const scOri = () => (SC.orient[SC.key] ||= { rot: 0, flip: false });
+const scanMode = () => HEW.main.sides.has("scan") || HEW.main.sides.has("imc");   // an unaligned pane: the slide scan or an IMC ROI
+const imcMode = () => HEW.main.sides.has("imc");
+const scOri = () => (SC.orient[(imcMode() ? "imc:" : "") + SC.key] ||= { rot: 0, flip: false });
 function scXf(o, W, H, x, y) { if (o.flip) x = W - x; let w = W, h = H; for (let i = 0; i < o.rot; i++) { [x, y] = [h - y, x]; [w, h] = [h, w]; } return [x, y]; }   // scan frame -> displayed frame (mirror, then quarter turns clockwise)
 function scIxf(o, W, H, x, y) {   // displayed frame -> scan frame
   const dims = [[W, H]]; for (let i = 0; i < o.rot; i++) { const [w, h] = dims[i]; dims.push([h, w]); }
@@ -691,7 +692,15 @@ function scanFit() {
   HEX.vs = { target: [w / 2, -h / 2, 0], zoom: Math.log2(Math.min((el.clientWidth || 600) / w, (el.clientHeight || 500) / h) * 0.94), _n: ++HEX.n };
   HEX.deck.setProps({ initialViewState: HEX.vs }); heSideLayers();
 }
+async function imcSceneLoad() {   // the IMC ROI chosen for the tissue being viewed (the first ROI until the user picks one)
+  const sel = $("scansel"); sel.replaceChildren();
+  for (const r of IMC.rois) { const o = document.createElement("option"); o.value = r.key; o.textContent = `${r.name} · ${r.w}×${r.h} µm${r.complete ? "" : " · incomplete"}`; sel.append(o); }
+  const key = imcRoiFor(S.sample); sel.value = key; SC.multi = { imc: true };
+  if (key !== SC.key || !SC.idx) { SC.key = key; SC.idx = await jget("/api/imc/index?roi=" + encodeURIComponent(key)); SC.sample = S.sample; scanUi(); return scanFit(); }
+  SC.sample = S.sample; scanUi(); heSideLayers();
+}
 async function scanLoad() {   // the scan of the tissue being viewed (a batch project can hold several: the one of this tissue's run, else the first)
+  if (imcMode()) return imcSceneLoad();
   const d = await jget("/api/heslide");
   if (d.multi) {
     SC.multi = d; const sm = S.meta.samples.find((x) => x.id === S.sample), run = sm ? subtypeOf(sm) : "", key = d.runs[run] || SC.key || d.scans[0].key, sel = $("scansel");
@@ -701,8 +710,8 @@ async function scanLoad() {   // the scan of the tissue being viewed (a batch pr
   SC.sample = S.sample; scanUi(); heSideLayers();
 }
 function scanUi() {
-  const on = scanMode() && HEW.main.side; $("scanrow").hidden = !on; $("scansel").hidden = !(on && SC.multi);
-  $("scannote").hidden = !on; $("scannote").textContent = SC.idx ? `${SC.idx.source}: not aligned to the cells; pan and zoom here are independent of the cell view.` : "loading the scan…";
+  const on = scanMode() && HEW.main.side; $("scanrow").hidden = !on; $("scansel").hidden = !(on && SC.multi); $("imcrow").hidden = !(on && imcMode()); $("scanlab").textContent = imcMode() ? "IMC" : "Slide scan";
+  $("scannote").hidden = !on; $("scannote").textContent = SC.idx ? `${SC.idx.source}: not aligned to the cells; pan and zoom here are independent of the cell view.${imcMode() ? " Pick the ROI of this tissue in the list." : ""}` : (imcMode() ? "loading the IMC ROI…" : "loading the scan…");
 }
 function scanInit() {
   const turn = (f) => () => { if (!SC.idx) return; f(scOri()); scanFit(); };
@@ -710,7 +719,9 @@ function scanInit() {
   $("scflipx").addEventListener("click", turn((o) => (o.flip = !o.flip)));
   $("scflipy").addEventListener("click", turn((o) => { o.flip = !o.flip; o.rot = (o.rot + 2) % 4; }));   // top-bottom mirror = left-right mirror + half turn
   $("scfit").addEventListener("click", () => scanFit());
-  $("scansel").addEventListener("change", async () => { SC.key = $("scansel").value; SC.idx = await jget("/api/heslide?scan=" + encodeURIComponent(SC.key)); scanFit(); });
+  $("scansel").addEventListener("change", async () => {
+    if (imcMode()) { const k = $("scansel").value; IMC.map[S.sample] = k; fetch("/api/imc/map", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ sample: S.sample, roi: k }) }); SC.key = k; SC.idx = await jget("/api/imc/index?roi=" + encodeURIComponent(k)); scanFit(); scanUi(); return; }
+    SC.key = $("scansel").value; SC.idx = await jget("/api/heslide?scan=" + encodeURIComponent(SC.key)); scanFit(); });
 }
 const HEX = { deck: null, vs: null, n: 0 };
 function heSideLayers() {
@@ -1194,7 +1205,7 @@ function drawSlideInto(cv, g, samples, bs, sc, k, geom, dpr, ts = 1, opt = {}) {
   const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, Wd, Hd);
   const X = (x) => (x - geom.x0 + geom.pad) * k, Y = (y) => (y - geom.y0 + geom.pad) * k + SLIDE_TOP, px = Math.max(1.2, 8 * k);
   if (opt.imgs) for (const s of samples) drawHE(ctx, { sample: s.id, redo: opt.redo, w: "slide", side: !!opt.imgOnly }, X, Y, Wd, Hd, k);   // registered H&E / IF of every tissue, at its true place
-  const cellsOn = !opt.imgOnly && hw("slide").cells; ctx.globalAlpha = opt.imgs && hw("slide").on ? hw("slide").a : 1;
+  const cellsOn = !opt.imgOnly && hw("slide").cells; ctx.globalAlpha = hw("slide").a;
   if (cellsOn) for (const dim of [true, false]) bs.forEach((b) => {   // filtered-out cells first, coloured ones on top
     const groups = new Map();
     for (let i = 0; i < b.n; i++) {
@@ -1303,7 +1314,7 @@ function heReady() { return HE.req || (HE.req = Promise.all([jget("/api/he").cat
 })); }
 // ---- IF (Xenium morphology) image: a second source for the same underlay / beside views. HE.data holds the list of whichever source is selected, so every window
 // that draws the H&E draws the IF image the same way (tiles come from /api/if, rendered on request in the chosen colour and brightness).
-const IFS = { idx: {}, he: {}, cur: {}, has: false, sel: new Set([0]), cfg: [], g: 1, ver: 0 };   // sel = the channels shown (tick several to overlay them); cfg[i] = { color, br } of channel i
+const IFS = { idx: {}, he: {}, cur: {}, has: false, sel: new Set(), auto: false, cfg: [], g: 1, ver: 0 };   // sel = the channels shown (tick several to overlay them); cfg[i] = { color, br } of channel i
 const IF_COLORS = ["blue", "green", "red", "yellow", "cyan", "magenta", "orange", "white"];
 const ifCfg = (i) => (IFS.cfg[i] ||= { color: IF_COLORS[i % IF_COLORS.length], br: 1 });
 function ifApply() {
@@ -1320,33 +1331,125 @@ function ifRerender() {   // every window that shows the image redraws; tiles ar
   IFS.ver++;
   for (const k of Object.keys(HEW)) if (HEW[k].on || HEW[k].side) { HE_T[k] && clearTimeout(HE_T[k]); HE_T[k] = setTimeout(() => HE_RENDER[k] && HE_RENDER[k](), 80); }
 }
-function ifUi() {   // the IF channel / colour / brightness controls (shared by every window) and the Images menus' availability
-  $("ifbox").hidden = !IFS.has;
-  const first = Object.values(IFS.idx)[0] || [], box = $("iflist"); box.replaceChildren();
-  first.forEach((c, i) => {   // one row per channel: show it, its colour, its brightness
-    const row = document.createElement("div"), lab = document.createElement("label"), cb = document.createElement("input"), nm = document.createElement("span"), sel = document.createElement("select"), br = document.createElement("input");
-    row.className = "ifch"; cb.type = "checkbox"; cb.dataset.ifsel = i; cb.checked = IFS.sel.has(i); nm.textContent = c.name; lab.title = "show this channel; tick several to overlay them (their light is added)"; lab.append(cb, " ", nm);
-    sel.dataset.ifcol = i; sel.title = "colour of this channel"; for (const k of IF_COLORS) { const o = document.createElement("option"); o.value = k; o.textContent = k; sel.append(o); } sel.value = ifCfg(i).color;
-    br.type = "range"; br.dataset.ifbr = i; br.min = -100; br.max = 100; br.value = Math.round(50 * Math.log2(ifCfg(i).br)); br.title = "brightness of this channel";
-    row.append(lab, sel, br); box.append(row);
-  });
+function ifUi() {   // the IF channel dropdown (shared by every window) and the Images menus' availability
+  $("ifbox").hidden = !IFS.has; ifBtn();
   for (const k of Object.keys(HEW)) heSync(k);
 }
-async function ifInit() {
-  await heReady(); ifUi();
-  $("iflist").addEventListener("change", (e) => {
-    const t = e.target;
-    if (t.dataset.ifsel !== undefined) { t.checked ? IFS.sel.add(+t.dataset.ifsel) : IFS.sel.delete(+t.dataset.ifsel); ifApply(); ifRerender(); }
-    else if (t.dataset.ifcol !== undefined) { ifCfg(+t.dataset.ifcol).color = t.value; ifRerender(); }
-  });
-  $("iflist").addEventListener("input", (e) => { const t = e.target; if (t.dataset.ifbr !== undefined) { ifCfg(+t.dataset.ifbr).br = 2 ** (t.value / 50); ifRerender(); } });
-  $("ifgamma").addEventListener("input", () => { IFS.g = +$("ifgamma").value; $("ifgammalab").textContent = IFS.g.toFixed(2); ifRerender(); });
+async function ifInit() { await heReady(); ifUi(); }
+// ---- IMC (imaging mass cytometry, .mcd): ROI images of a slide, raw counts, shown in the pane beside the cells only (they are not aligned to the cells). The main view
+// shows one ROI at a time (the one chosen for the tissue); the tile windows show that ROI whole beside each tissue. Tiles are rendered by the server (/api/imc), the ticked channels
+// added up, each in its colour.
+const IMC = { has: false, rois: [], chans: [], map: {}, sel: new Set(), cfg: {}, g: 1, ver: 0, dflt: null, status: null, poll: 0 };
+const IMC_MAX = 16;
+const imcCfg = (i) => (IMC.cfg[i] ||= { color: "white", br: 1 });
+const imcRoiFor = (sample) => IMC.map[sample] || IMC.dflt;
+const imcSel = () => [...IMC.sel].sort((a, b) => a - b);
+const imcQuery = () => { const l = imcSel(); return `ch=${l.join(",")}&c=${l.map((i) => imcCfg(i).color).join(",")}&b=${l.map((i) => imcCfg(i).br.toFixed(3)).join(",")}&g=${IMC.g}`; };
+const imcSide = (w) => !!(IMC.has && HEW[w] && HEW[w].sides.has("imc"));
+function imcTile(key, z, x, y, redo) { if (!IMC.sel.size) return null; return heLoad(HE.imgs, `${key}/${z}/${x}_${y}/i${IMC.ver}`, `/api/imc/tile/${key.slice(4)}/${z}/${x}_${y}.jpg?${imcQuery()}`, redo, 400); }
+function imcRerender() {   // every window that shows the IMC pane redraws; tiles are requested again with the new settings
+  IMC.ver++;
+  for (const k of Object.keys(HEW)) if (imcSide(k)) { HE_T[k] && clearTimeout(HE_T[k]); HE_T[k] = setTimeout(() => HE_RENDER[k] && HE_RENDER[k](), 80); }
+}
+function imcFirstColor() { const used = new Set(imcSel().map((i) => imcCfg(i).color)); return IF_COLORS.find((c) => !used.has(c)) || IF_COLORS[IMC.sel.size % IF_COLORS.length]; }
+function imcTick(i, on) {
+  if (on) { if (IMC.sel.size >= IMC_MAX) return false; if (!IMC.cfg[i] || IMC.cfg[i].color === "white") imcCfg(i).color = imcFirstColor(); IMC.sel.add(i); } else IMC.sel.delete(i);
+  return true;
+}
+async function imcLoad() {   // what the server holds: ROIs, channels, the ROI of each tissue, and the conversion state (polled while it runs)
+  let d; try { d = await jget("/api/imc"); } catch (e) { return; }
+  IMC.status = d.status;
+  if (d.has) {
+    const first = !IMC.has; IMC.has = true; IMC.rois = d.rois; IMC.chans = d.channels; IMC.map = d.map || {}; IMC.dflt = d.default;
+    if (first && !IMC.sel.size) { const k = IMC.chans.findIndex((c) => c.kind === "dna"); imcTick(k >= 0 ? k : Math.max(0, IMC.chans.findIndex((c) => c.kind === "marker")), true); imcCfg([...IMC.sel][0]).color = "blue"; }
+  }
+  imcStatusUi(); imcBtns();
+  if (d.status.state === "converting") { clearTimeout(IMC.poll); IMC.poll = setTimeout(imcLoad, 2000); }
+  else if (d.has) for (const k of Object.keys(HEW)) heSync(k);
+}
+function imcStatusUi() {   // the line at the bottom of the Images menu: add a file, progress or error
+  const el = $("imcstat"); if (!el) return; const s = IMC.status || {};
+  const busy = s.state === "converting";
+  el.textContent = busy ? `IMC: converting ${s.msg || ""} (${Math.round((s.progress || 0) * 100)}%); channels appear when it is done` : s.state === "error" ? `IMC failed: ${s.error}` : "";
+  $("imcadd").hidden = IMC.has || busy;
+}
+function chanMenu(btn, K) {   // a channel dropdown (IMC and IF): search, the picked channels first, then the others in groups; each row has a tick, a colour and a brightness slider
+  let m = $(K.id);
+  const P = (s) => K.id + s;
+  if (!m) {
+    m = document.createElement("div"); m.id = K.id; m.className = "chmenu"; m.hidden = true;
+    m.innerHTML = `<div class="chtop"><input type="search" id="${P("q")}" placeholder="search channels…"><span class="muted small" id="${P("n")}"></span><button type="button" id="${P("none")}" title="untick every channel">none</button></div><div class="chlist" id="${P("list")}"></div><div class="row"><label class="small">gamma</label><input type="range" id="${P("gamma")}" min="0.3" max="3" step="0.05" value="${K.gamma.get()}" style="flex:1"><span class="muted small" id="${P("gammalab")}">${K.gamma.get().toFixed(2)}</span></div><div class="muted small">${K.note}</div>`;
+    document.body.appendChild(m);
+    const rows = () => {
+      const q = $(P("q")).value.trim().toLowerCase(), box = $(P("list")), top = box.scrollTop; box.replaceChildren();
+      const chans = K.chans(), match = ([c]) => !q || c.name.toLowerCase().includes(q) || (c.label || "").toLowerCase().includes(q);
+      const picked = chans.map((c, i) => [c, i]).filter(([, i]) => K.sel.has(i) && match([chans[i]]));
+      const groups = [["Picked", picked], ...K.groups(chans).map(([title, idx]) => [title, idx.filter(([c, i]) => !K.sel.has(i) && match([c]))])];
+      for (const [title, idx] of groups) {
+        if (!idx.length) continue;
+        const h = document.createElement("div"); h.className = "chgrp"; h.textContent = title; box.append(h);
+        for (const [c, i] of idx) {
+          const row = document.createElement("div"), lab = document.createElement("label"), cb = document.createElement("input"), sel = document.createElement("select"), br = document.createElement("input");
+          row.className = "ifch"; cb.type = "checkbox"; cb.dataset.chsel = i; cb.checked = K.sel.has(i); lab.append(cb, " ", c.name);
+          sel.dataset.chcol = i; for (const k of IF_COLORS) { const o = document.createElement("option"); o.value = k; o.textContent = k; sel.append(o); } sel.value = K.color(i);
+          br.type = "range"; br.dataset.chbr = i; br.min = -100; br.max = 100; br.value = Math.round(50 * Math.log2(K.cfg(i).br)); br.title = "brightness of this channel";
+          row.append(lab, sel, br); box.append(row);
+        }
+      }
+      box.scrollTop = top;
+      $(P("n")).textContent = K.max ? `${K.sel.size} of up to ${K.max} picked` : `${K.sel.size} picked`;
+    };
+    m._rows = rows;
+    $(P("q")).addEventListener("input", rows);
+    $(P("none")).addEventListener("click", () => { K.sel.clear(); K.changed(); rows(); });
+    m.addEventListener("change", (e) => {
+      const t = e.target;
+      if (t.dataset.chsel !== undefined) { if (!K.tick(+t.dataset.chsel, t.checked)) { t.checked = false; $(P("n")).textContent = `at most ${K.max} channels at a time`; return; } K.changed(); rows(); }
+      else if (t.dataset.chcol !== undefined) { K.cfg(+t.dataset.chcol).color = t.value; K.changed(); }
+    });
+    m.addEventListener("input", (e) => { const t = e.target; if (t.dataset.chbr !== undefined) { K.cfg(+t.dataset.chbr).br = 2 ** (t.value / 50); K.changed(); } else if (t.id === P("gamma")) { K.gamma.set(+t.value); $(P("gammalab")).textContent = (+t.value).toFixed(2); K.changed(); } });
+    document.addEventListener("click", (e) => { if (!m.hidden && !e.target.closest("#" + K.id) && !e.target.closest(K.btnSel)) m.hidden = true; });
+  }
+  if (!m.hidden && m._btn === btn) { m.hidden = true; return; }
+  m._btn = btn; m._rows(); const r = btn.getBoundingClientRect(); m.style.left = Math.max(4, Math.min(r.left, innerWidth - 400)) + "px"; m.style.top = r.bottom + 2 + "px"; m.hidden = false;
+}
+const chShort = (c) => c.name.replace(/\s*\(.*$/, "");
+function chLabel(prefix, chans, sel) {   // the button text: what is picked, upfront
+  const l = [...sel].sort((a, b) => a - b).map((i) => chans[i] && chShort(chans[i])).filter(Boolean);
+  return { text: l.length ? `${prefix}: ${l.slice(0, 2).join(", ")}${l.length > 2 ? ` +${l.length - 2}` : ""} ▾` : `${prefix} channels ▾`, title: l.length ? `${prefix} channels shown: ${l.join(", ")}` : "choose the channels" };
+}
+const IMC_K = {
+  id: "imcmenu", btnSel: ".imcbtn", max: IMC_MAX, note: "raw counts; each channel is shown from 0 to a default limit (the 99.5th percentile of its non-zero pixels); the slider changes its brightness",
+  chans: () => IMC.chans, sel: IMC.sel, cfg: imcCfg, tick: imcTick, changed: () => { imcRerender(); imcBtns(); },
+  color: (i) => (imcCfg(i).color === "white" && !IMC.sel.has(i) ? imcFirstColor() : imcCfg(i).color), gamma: { get: () => IMC.g, set: (v) => (IMC.g = v) },
+  groups: (chans) => [["Antibodies", "marker"], ["DNA", "dna"], ["Cell segmentation stains", "seg"], ["Unlabelled masses", "other"]].map(([title, kind]) => [title, chans.map((c, i) => [c, i]).filter(([c]) => c.kind === kind)]),
+};
+function imcBtns() { const l = chLabel("IMC", IMC.chans, IMC.sel); document.querySelectorAll(".imcbtn").forEach((b) => { b.textContent = l.text; b.title = l.title; }); }
+const imcMenu = (btn) => chanMenu(btn, IMC_K);
+const IF_K = {
+  id: "ifmenu", btnSel: "#ifch", max: 0, note: "each channel is shown from 0 to its default limit; the slider changes its brightness (shared by every window)",
+  chans: () => Object.values(IFS.idx)[0] || [], sel: IFS.sel, cfg: ifCfg, color: (i) => ifCfg(i).color, gamma: { get: () => IFS.g, set: (v) => (IFS.g = v) },
+  tick: (i, on) => { on ? IFS.sel.add(i) : IFS.sel.delete(i); IFS.auto = true; ifApply(); return true; }, changed: () => { ifRerender(); ifBtn(); },
+  groups: (chans) => [["Channels", chans.map((c, i) => [c, i])]],
+};
+function ifBtn() { const b = $("ifch"); if (!b) return; const l = chLabel("IF", IF_K.chans(), IFS.sel); b.textContent = l.text; b.title = l.title; }
+async function imcInit() {
+  await imcLoad();
+  $("imcch").addEventListener("click", (e) => imcMenu(e.currentTarget));
+  $("ifch").addEventListener("click", (e) => chanMenu(e.currentTarget, IF_K));
+  document.addEventListener("click", (e) => { const b = e.target.closest(".imcbtn"); if (b && b.id !== "imcch") imcMenu(b); });
+}
+async function imcAdd() {
+  const p = $("imcpath").value.trim(); if (!p) return;
+  const r = await fetch("/api/imc/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: p }) });
+  if (!r.ok) { $("imcstat").textContent = (await r.text()).replace(/^.*"detail":"?|"?}$/g, ""); return; }
+  IMC.status = { state: "converting", progress: 0, msg: "starting" }; imcStatusUi(); clearTimeout(IMC.poll); IMC.poll = setTimeout(imcLoad, 1500);
 }
 // Display state, one per window that draws cells: H&E underlay, opacity of the cells over it, and cell outlines instead of filled cells.
 // main = the main viewer; gal / rgn = Gallery / Regions; glom = Glomeruli; gcmp = Compare glomeruli; nbh = Neighborhoods; gh = Glom heterogeneity detail; gz = glom zoom popup; sig = Signature maps (no outlines there).
-const HEW = {}; ["main", "gal", "rgn", "glom", "gcmp", "nbh", "gh", "gz", "sig", "rnb", "slide"].forEach((k) => (HEW[k] = { on: false, imgs: new Set(), sides: new Set(), a: 0.55, outl: false, side: false, link: true, cells: true }));   // cells = draw the Xenium cells (off: H&E and outlines only));
+const HEW = {}; ["main", "gal", "rgn", "glom", "gcmp", "nbh", "gh", "gz", "sig", "rnb", "slide"].forEach((k) => (HEW[k] = { on: false, imgs: new Set(), sides: new Set(), a: 1, touched: false, outl: false, side: false, link: true, cells: true }));   // cells = draw the Xenium cells (off: H&E and outlines only));
 const hw = (w) => HEW[w || "main"];
-const heOpt = (w) => ({ on: hw(w).on, a: hw(w).on ? hw(w).a : 1 });
+const heOpt = (w) => ({ on: hw(w).on, a: hw(w).a });   // a = opacity of the cells (filled: the fill; outlines: the lines)
 const heSel = (sample, w, side) => { const all = HE.data && HE.data[sample], st = HEW[w || "main"]; return all && st ? all.filter((e) => (side ? st.sides : st.imgs).has(e.key.startsWith("if:") ? "if" : "he")) : []; };   // side: the images of the pane beside the cells (else those under them)   // the images window w shows for a sample: H&E first, then IF
 const heFor = (sample, w) => (hw(w).on && HE.data && HE.data[sample] ? sample : null);
 const HE_SIDE = ["gal", "rgn", "glom", "gcmp", "gh", "rnb"];   // windows that can show the H&E beside the cells ("main" has its own control in the sidebar)
@@ -1362,35 +1465,40 @@ function openTab(path, ev) {
   if (ev) return true;                      // a plain link: the browser follows it
   window.open(path, "_blank"); return false;
 }
-const IMG_NAMES = { he: "H&E", if: "IF", scan: "Slide scan (not aligned)" };
+const IMG_NAMES = { he: "H&E", if: "IF", scan: "Slide scan (not aligned)", imc: "IMC (not aligned)" };
+const BESIDE_ONLY = ["scan", "imc"];   // not in the cells' frame: only the pane beside them
+const IMC_WINDOWS = ["main", ...HE_SIDE];   // windows with a pane beside the cells that can show an IMC ROI
 const heImgsHTML = (w) => `<button type="button" class="heimgsbtn" data-w="${w}" title="which images this window shows: under the cells (overlay) and / or in a pane beside them">Images ▾</button>`;
-function heAvail() { return { he: Object.keys(IFS.he).length > 0, if: IFS.has, scan: !!(S.meta && S.meta.has_he_slide) }; }
+function heAvail() { return { he: Object.keys(IFS.he).length > 0, if: IFS.has, scan: !!(S.meta && S.meta.has_he_slide), imc: IMC.has }; }
 function heMenu(btn) {   // one menu for every window: ticks = that window's images; fixed position so no window's overflow can clip it
   let m = $("heimgsmenu");
   if (!m) {
     m = document.createElement("div"); m.id = "heimgsmenu"; m.hidden = true;
-    m.innerHTML = `<div class="imgrow imghead"><span></span><span>Under</span><span>Beside</span></div>` + Object.entries(IMG_NAMES).map(([k, n]) => `<div class="imgrow"><span>${n} <span class="muted small" data-none="${k}"></span></span><input type="checkbox" data-img="${k}" data-mode="under" title="draw it under the cells"><input type="checkbox" data-img="${k}" data-mode="side" title="show it in the pane beside the cells"></div>`).join("");
+    m.innerHTML = `<div class="imgrow imghead"><span></span><span>Under</span><span>Beside</span></div>` + Object.entries(IMG_NAMES).map(([k, n]) => `<div class="imgrow"><span>${n} <span class="muted small" data-none="${k}"></span></span><input type="checkbox" data-img="${k}" data-mode="under" title="draw it under the cells"><input type="checkbox" data-img="${k}" data-mode="side" title="show it in the pane beside the cells"></div>`).join("") + `<div id="imcadd" class="imcadd" hidden><input id="imcpath" placeholder="IMC file (.mcd) to add" title="an .mcd file of this slide; it is converted once into the cache (a few minutes for 20 GB) and never changed"><button type="button" id="imcaddbtn">Add</button></div><div id="imcstat" class="muted small"></div>`;
     document.body.appendChild(m);
+    m.querySelector("#imcaddbtn").addEventListener("click", imcAdd);
     m.addEventListener("change", (e) => { const i = e.target.closest("input[data-img]"); if (i && m._w) heSet(m._w, "img", { src: i.dataset.img, on: i.checked, side: i.dataset.mode === "side" }); });
     document.addEventListener("click", (e) => { if (!m.hidden && !e.target.closest("#heimgsmenu") && !e.target.closest(".heimgsbtn")) m.hidden = true; });
   }
   if (!m.hidden && m._w === btn.dataset.w) { m.hidden = true; return; }
   m._w = btn.dataset.w; const av = heAvail(), st = hw(m._w);
-  m.querySelectorAll("input[data-img]").forEach((i) => { const sc = i.dataset.img === "scan"; i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(i.dataset.img); i.disabled = !av[i.dataset.img] || (sc && (m._w !== "main" || i.dataset.mode === "under")); i.style.visibility = sc && i.dataset.mode === "under" ? "hidden" : ""; });
-  m.querySelectorAll("[data-none]").forEach((e) => (e.textContent = !av[e.dataset.none] ? "(none in this project)" : (e.dataset.none === "scan" && m._w !== "main" ? "(main view only)" : "")));
+  m.querySelectorAll("input[data-img]").forEach((i) => { const k = i.dataset.img, bo = BESIDE_ONLY.includes(k), ok = k === "scan" ? m._w === "main" : k === "imc" ? IMC_WINDOWS.includes(m._w) : true; i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(k); i.disabled = !av[k] || !ok || (bo && i.dataset.mode === "under"); i.style.visibility = bo && i.dataset.mode === "under" ? "hidden" : ""; });
+  imcStatusUi();
+  m.querySelectorAll("[data-none]").forEach((e) => (e.textContent = !av[e.dataset.none] ? (e.dataset.none === "imc" ? "(none added yet)" : "(none in this project)") : (e.dataset.none === "scan" && m._w !== "main" ? "(main view only)" : e.dataset.none === "imc" && !IMC_WINDOWS.includes(m._w) ? "(not in this window)" : "")));
   const r = btn.getBoundingClientRect(); m.style.left = Math.min(r.left, innerWidth - 190) + "px"; m.style.top = r.bottom + 2 + "px"; m.hidden = false;
 }
 function heCtlHTML(w) {   // the H&E controls placed in each window's header
-  if (w === "slide") return `<span class="hectl" title="this window only: images of the tissues of the slide, under the cells and / or in a second view beside them"><label title="draw the Xenium cells (untick to see the images alone)"><input type="checkbox" data-he="cells" data-hew="slide" checked> Xenium</label> ${heImgsHTML("slide")} <label class="small heop" data-heop="slide" title="how solid the filled cells are over the images drawn under them (0 = see-through, 100 = solid); no effect with outlines ticked or no image under the cells">cell opacity <input type="range" data-he="a" data-hew="slide" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label></span>`;
-  return `<span class="hectl" title="this window only: overlay the images ticked in Images (H&amp;E, IF) under the cells${w === "sig" ? "" : "; outlines draws cell boundaries unfilled"}"><label title="draw the Xenium cells (untick to see the images and outlines alone)"><input type="checkbox" data-he="cells" data-hew="${w}" checked> Xenium</label> ${heImgsHTML(w)} <label class="small heop" data-heop="${w}" title="how solid the filled cells are over the images drawn under them (0 = see-through, 100 = solid); no effect with outlines ticked or no image under the cells">cell opacity <input type="range" data-he="a" data-hew="${w}" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label>${w === "sig" ? "" : ` <label><input type="checkbox" data-he="outl" data-hew="${w}"> outlines</label>`}${HE_SIDE.includes(w) ? ` <span class="ptwin" data-ptw="${w}" hidden title="arrows you place on the tissue: the same arrow appears in the cells and in the image beside them"><button type="button" class="ptwbtn" data-act="tool" data-w="${w}">Pointer</button><button type="button" class="ptwbtn" data-act="undo" data-w="${w}">Undo</button><button type="button" class="ptwbtn" data-act="clear" data-w="${w}" title="remove the arrows of all tissues">Clear</button></span> <label class="small" data-hlink="${w}" hidden title="zoom and pan the images and the cells together"><input type="checkbox" data-he="link" data-hew="${w}" checked> link zoom</label>` : ""}</span>`;
+  if (w === "slide") return `<span class="hectl" title="this window only: images of the tissues of the slide, under the cells and / or in a second view beside them"><label title="draw the Xenium cells (untick to see the images alone)"><input type="checkbox" data-he="cells" data-hew="slide" checked> Xenium</label> ${heImgsHTML("slide")} <label class="small heop" data-heop="slide" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="slide" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label></span>`;
+  return `<span class="hectl" title="this window only: overlay the images ticked in Images (H&amp;E, IF) under the cells${w === "sig" ? "" : "; outlines draws cell boundaries unfilled"}"><label title="draw the Xenium cells (untick to see the images and outlines alone)"><input type="checkbox" data-he="cells" data-hew="${w}" checked> Xenium</label> ${heImgsHTML(w)}<button type="button" class="imcbtn" data-w="${w}" hidden title="choose the IMC channels (shared by every window)">IMC channels ▾</button> <label class="small heop" data-heop="${w}" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="${w}" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label>${w === "sig" ? "" : ` <label><input type="checkbox" data-he="outl" data-hew="${w}"> outlines</label>`}${HE_SIDE.includes(w) ? ` <span class="ptwin" data-ptw="${w}" hidden title="arrows you place on the tissue: the same arrow appears in the cells and in the image beside them"><button type="button" class="ptwbtn" data-act="tool" data-w="${w}">Pointer</button><button type="button" class="ptwbtn" data-act="undo" data-w="${w}">Undo</button><button type="button" class="ptwbtn" data-act="clear" data-w="${w}" title="remove the arrows of all tissues">Clear</button></span> <label class="small" data-hlink="${w}" hidden title="zoom and pan the images and the cells together"><input type="checkbox" data-he="link" data-hew="${w}" checked> link zoom</label>` : ""}</span>`;
 }
 function heSync(w) {   // show window w's settings in its controls
   const st = hw(w);
   document.querySelectorAll(`[data-hew="${w}"]`).forEach((el) => { const k = el.dataset.he; if (el.type === "checkbox") el.checked = !!st[k]; else el.value = Math.round(st[k] * 100); });
-  document.querySelectorAll(`[data-hlink="${w}"]`).forEach((e) => (e.hidden = !st.side));
-  document.querySelectorAll(`[data-heop="${w}"]`).forEach((e) => { const off = !st.on || (st.outl && w !== "slide"); e.classList.toggle("dim", off); e.querySelector("input").disabled = off; });   // the opacity of filled cells only matters with an image under them and no outlines
+  document.querySelectorAll(`[data-hlink="${w}"]`).forEach((e) => { e.hidden = !st.side; const c = e.querySelector("input"); if (c) c.disabled = st.sides.has("scan") || st.sides.has("imc"); });
+  document.querySelectorAll(`.imcbtn[data-w="${w}"]`).forEach((b) => { if (b.id !== "imcch") b.hidden = !imcSide(w); });
+
   document.querySelectorAll(`[data-ptw="${w}"]`).forEach((e) => (e.hidden = !ptAllowedFor(w)));
-  const names = [...new Set([...st.imgs, ...st.sides])].sort().map((k) => (k === "scan" ? "scan" : IMG_NAMES[k]));      // "he" before "if"
+  const names = [...new Set([...st.imgs, ...st.sides])].sort().map((k) => (k === "scan" ? "scan" : k === "imc" ? "IMC" : IMG_NAMES[k]));      // "he" before "if"
   document.querySelectorAll(`.heimgsbtn[data-w="${w}"]`).forEach((b) => { b.textContent = names.length ? `Images: ${names.join(" + ")} ▾` : "Images ▾"; b.classList.toggle("on", names.length > 0); });
   if ($("heimgsmenu") && $("heimgsmenu")._w === w && !$("heimgsmenu").hidden) $("heimgsmenu").querySelectorAll("input[data-img]").forEach((i) => (i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(i.dataset.img)));
   if (w === "main" && $("scanrow")) { scanUi(); ptUi(); if (HEX.deck) ptDraw(); }
@@ -1400,9 +1508,15 @@ async function heSet(w, key, val) {
   const st = hw(w);
   if (key === "img") {
     const set = val.side ? st.sides : st.imgs; val.on ? set.add(val.src) : set.delete(val.src);
-    st.on = st.imgs.size > 0; st.side = st.sides.size > 0;   // on = something under the cells, side = something in the pane beside them
+    if (w === "main" && val.side && val.on && BESIDE_ONLY.includes(val.src)) { st.sides.delete(val.src === "imc" ? "scan" : "imc"); SC.idx = null; SC.multi = null; SC.key = ""; }   // the slide scan and an IMC ROI share one pane
+    if (w === "main" && val.side && !val.on && BESIDE_ONLY.includes(val.src)) { SC.idx = null; SC.multi = null; SC.key = ""; }
+    st.on = st.imgs.size > 0; st.side = st.sides.size > 0;
+    const un = st.sides.has("scan") || st.sides.has("imc");   // an unaligned image beside the cells cannot follow their zoom: Link zoom goes off (and back to what it was when it is gone)
+    if (un && st.linkPrev === undefined) { st.linkPrev = st.link; st.link = false; } else if (!un && st.linkPrev !== undefined) { st.link = st.linkPrev; st.linkPrev = undefined; }
+    if (val.src === "if" && val.on && !IFS.sel.size && !IFS.auto) { IFS.auto = true; IFS.sel.add(0); ifApply(); ifBtn(); }   // the IF starts with its first channel once the user ticks IF; until then none is picked   // on = something under the cells, side = something in the pane beside them
   }
-  else st[key] = key === "a" ? val / 100 : val;
+  else { st[key] = key === "a" ? val / 100 : val; if (key === "a") st.touched = true; }
+  if (key === "img" && !val.side && !st.touched) st.a = st.imgs.size ? 0.55 : 1;   // cells start see-through once an image is under them (until the slider is moved)
   heSync(w);
   if (w === "main" && key === "outl") for (const k of Object.keys(HEW)) if (k !== "main" && k !== "sig") { HEW[k].outl = val; heSync(k); HE_T[k] && clearTimeout(HE_T[k]); HE_T[k] = setTimeout(() => HE_RENDER[k] && HE_RENDER[k](), 0); }   // the main view's Outlines setting carries over to the windows; each window can still be changed on its own afterwards
   const none = (HEW.main.on || HEW.main.side) && !scanMode() && !(HE.data && HE.data[S.sample]); document.querySelectorAll(".henote").forEach((e) => (e.textContent = none ? (S.meta && S.meta.has_he_slide ? "the slide H&E is not aligned to the cells yet: use the toolbar “H&E slide”" : "none for this tissue") : ""));
@@ -1421,7 +1535,7 @@ const hePairDims = (dims, w) => (dims ? { W: Math.floor((dims.W - 6) / 2), H: di
 function hePane(t, cv, w, sample) {   // idempotent: windows whose canvas persists (glom detail) call it on every draw
   cv._ptSample = sample; if (t._he2) t._he2._ptSample = sample;
   if (!cv._ptb) { cv._ptb = true; ptBindCanvas(cv, w); }
-  if (!hw(w).side || !HE.data?.[sample]) { if (t._he2) { const pr = cv.parentNode; if (pr.classList.contains("hepair")) pr.replaceWith(cv); t._he2 = null; } return null; }
+  if (!hw(w).side || !(HE.data?.[sample] || imcSide(w))) { if (t._he2) { const pr = cv.parentNode; if (pr.classList.contains("hepair")) pr.replaceWith(cv); t._he2 = null; } return null; }
   if (t._he2 && t._he2.isConnected) return t._he2;
   const pair = document.createElement("div"); pair.className = "hepair"; cv.replaceWith(pair);
   const cv2 = document.createElement("canvas"), m1 = document.createElement("i"), m2 = document.createElement("i"); cv2._heOnly = true; cv2._hw = w; cv2.className = cv.className; cv2.title = "H&E (no cells)";
@@ -1454,7 +1568,7 @@ function heLoad(map, id, url, redo, cap) {   // -> loaded <img> or null (starts 
   if (!e.ok && !e.bad && redo) e.w.add(redo);
   return e.ok ? e.img : null;
 }
-const heTile = (key, z, x, y, redo) => key.startsWith("if:") ? ifTile(key, z, x, y, redo) : heLoad(HE.imgs, `${key}/${z}/${x}_${y}`, `/api/he/${encodeURIComponent(key)}/${z}/${x}_${y}.jpg`, redo, 400);
+const heTile = (key, z, x, y, redo) => key.startsWith("imc:") ? imcTile(key, z, x, y, redo) : key.startsWith("if:") ? ifTile(key, z, x, y, redo) : heLoad(HE.imgs, `${key}/${z}/${x}_${y}`, `/api/he/${encodeURIComponent(key)}/${z}/${x}_${y}.jpg`, redo, 400);
 // Per-glomerulus crop (tools/he_gloms.py): one image per glom instead of several pyramid tiles. Looked up by the glom's first cell index.
 function heCrop(sample, cells) {
   const m = (HE.cropMap && HE.cropMap[sample]) || (HE.cropMap && (HE.cropMap[sample] = new Map((HE.crops[sample] || []).map((r) => [r.i, r])))); if (!m || !m.size) return null;
@@ -1462,7 +1576,16 @@ function heCrop(sample, cells) {
 }
 const heCropImg = (sample, r, redo, small) => { const f = small && r.fs ? r.fs : r.f; return heLoad(HE.cropImgs, `${sample}/${f}`, `/api/heglom/${encodeURIComponent(sample)}/${f}`, redo, 80); };   // small = half-resolution copy, enough for the ~330 px tiles
 // he = { sample, redo }: X / Y map um to canvas pixels, kz = canvas px per um. Tiles not loaded yet are drawn from a coarser level when one is available.
+function drawImcFit(ctx, he, W, H) {   // one IMC ROI, whole, in a tile window's side canvas (not aligned, so no zoom link): the ROI chosen for the tissue, turned as in the main view
+  const roi = imcRoiFor(he.sample); if (!roi || !IMC.sel.size) return;
+  const o = (SC.orient["imc:" + roi] ||= { rot: 0, flip: false }), odd = o.rot % 2 === 1, rw = odd ? H : W, rh = odd ? W : H;
+  const img = heLoad(HE.imgs, `imcfit/${roi}/${rw}x${rh}/i${IMC.ver}`, `/api/imc/fit/${roi}.jpg?w=${rw}&h=${rh}&${imcQuery()}`, he.redo, 400);
+  if (!img) { if (he.miss) he.miss.n++; return; }
+  const iw = img.naturalWidth, ih = img.naturalHeight, s = Math.min(W / (odd ? ih : iw), H / (odd ? iw : ih));
+  ctx.save(); ctx.imageSmoothingQuality = "high"; ctx.translate(W / 2, H / 2); ctx.rotate(o.rot * Math.PI / 2); if (o.flip) ctx.scale(-1, 1); ctx.drawImage(img, -iw * s / 2, -ih * s / 2, iw * s, ih * s); ctx.restore();
+}
 function drawHE(ctx, he, X, Y, W, H, kz) {
+  if (he.side && imcSide(he.w) && he.w !== "main") return drawImcFit(ctx, he, W, H);
   const list = heSel(he.sample, he.w, he.side); if (!list.length) return;
   ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "medium";
   const ux = (sx) => (sx - X(0)) / (X(1) - X(0)), uy = (sy) => (sy - Y(0)) / (Y(1) - Y(0));
@@ -1498,12 +1621,12 @@ function drawCells(ctx, order, b, X, Y, W, H, px, poly, a = 1, ol = false, q = 1
   if (poly && vis <= pmax) {
     ctx.lineJoin = "round";
     for (const [col, list] of order) {
-      if (ol) { ctx.globalAlpha = 1; ctx.lineWidth = 1.6 * q; ctx.strokeStyle = col.startsWith("rgba") ? "rgba(150,155,168,0.55)" : col; }
-      else { ctx.globalAlpha = a; ctx.lineWidth = (S.grey ? 0.9 : 0.8) * q; ctx.strokeStyle = S.grey ? "rgba(128,134,143,0.92)" : "rgba(10,10,10,0.75)"; ctx.fillStyle = col; }
+      if (ol) { ctx.globalAlpha = Math.max(a, 0.08); ctx.lineWidth = 1.6 * q; ctx.strokeStyle = col.startsWith("rgba") ? "rgba(150,155,168,0.55)" : col; }
+      else { ctx.globalAlpha = a; ctx.lineWidth = (S.grey ? 0.9 : 0.8) * q; ctx.strokeStyle = S.grey ? "rgba(128,134,143,0.92)" : a < 0.999 && !col.startsWith("rgba") ? col : "rgba(10,10,10,0.75)"; ctx.fillStyle = col; }
       for (const i of list) {
         const sx = X(b.xy[i * 2]), sy = Y(b.xy[i * 2 + 1]); if (sx < -m || sy < -m || sx > W + m || sy > H + m) continue;
         ctx.beginPath(); for (let q = poly.off[i] * 2, f = true; q < poly.off[i + 1] * 2; q += 2, f = false) { const x = X(poly.xy[q]), y = Y(poly.xy[q + 1]); f ? ctx.moveTo(x, y) : ctx.lineTo(x, y); }
-        ctx.closePath(); if (!ol) ctx.fill(); ctx.stroke();
+        ctx.closePath(); if (!ol) ctx.fill(); if (!ol && a < 0.999) ctx.globalAlpha = 0.95; ctx.stroke(); if (!ol) ctx.globalAlpha = a;   // a translucent fill keeps a solid rim in the cell colour, so only the fill fades
       }
     }
     ctx.globalAlpha = 1; return true;
@@ -1522,6 +1645,7 @@ function drawTile(cv, s, b, sc, box = GAL_BOX, view = null, cache = null, dims =
   const X = (x) => W / 2 + (x - cx) * kz, Y = (y) => H / 2 + (y - cy) * kz;
   cv._xf = { s: kz, ox: W / 2 - cx * kz, oy: H / 2 - cy * kz };
   if (he) drawHE(ctx, { ...(he.w ? he : { ...he, w: w8 }), side: !!cv._heOnly }, X, Y, W, H, kz);
+  if (cv._heOnly && imcSide(w8)) cv._xf = null;   // an IMC ROI is not in the cells' frame
   if (cv._heOnly || !hw(w8).cells) return;   // the H&E beside the cells, or Xenium switched off: no cells
   let order = cache?.order;
   if (!order) {
@@ -1533,7 +1657,7 @@ function drawTile(cv, s, b, sc, box = GAL_BOX, view = null, cache = null, dims =
     order = [...groups.entries()].sort((p, q) => (p[0].startsWith("rgba") ? -1 : 0) - (q[0].startsWith("rgba") ? -1 : 0));  // grey first
     if (cache) cache.order = order;
   }
-  drawCells(ctx, order, b, X, Y, W, H, px, poly, he ? he.a : 1, hw(w8).outl, q);   // cells sit on the H&E at the chosen opacity
+  drawCells(ctx, order, b, X, Y, W, H, px, poly, hw(w8).a, hw(w8).outl, q);   // cells sit on the H&E at the chosen opacity
 }
 // Compare views (Gallery and Regions, "only ticked"): the window is split into one chunk per ticked tissue; wheel = zoom at the cursor, drag = pan,
 // double-click = reset; "link zoom" applies one view to every tile. rec = { bb: {x0, y0, w, h}, draw(view) }; cfg = { views(), sync(), tiles() }.
@@ -1695,14 +1819,14 @@ function drawGlom(cv, b, sc, poly, cells, context = true, focus = -1, outline = 
   const vx0 = B.x0 - ox / k, vx1 = vx0 + W / k, vy0 = B.y0 - oy / k, vy1 = vy0 + H / k;   // visible window (um)
   const ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, W, H); ctx.lineWidth = Math.max(1, W / 328); ctx.lineJoin = "round";   // CPU canvas: hundreds of small tiles would otherwise each get a GPU surface
   cv._redraw = () => drawGlom(cv, b, sc, poly, cells, context, focus, outline, onHe, view, dims);
-  const st = hw(cv._hw), hs = cv._heOnly ? (HE.data?.[b.sample] ? b.sample : null) : heFor(b.sample, cv._hw), al = hs ? st.a : 1, ol = st.outl, lw = Math.max(1, Math.min(W, H) / 328);
+  const st = hw(cv._hw), hs = cv._heOnly ? (HE.data?.[b.sample] || imcSide(cv._hw) ? b.sample : null) : heFor(b.sample, cv._hw), al = st.a, ol = st.outl, lw = Math.max(1, Math.min(W, H) / 328);
   if (hs) {
-    const redo = onHe || (() => heRedoCv(cv)), cr = (cv._heOnly ? st.sides : st.imgs).has("he") ? heCrop(hs, cells) : null, sl = 1;
+    const redo = onHe || (() => heRedoCv(cv)), cr = (cv._heOnly ? st.sides : st.imgs).has("he") && !(cv._heOnly && imcSide(cv._hw)) ? heCrop(hs, cells) : null, sl = 1;
     if (cr && vx0 >= cr.x0 - sl && vx1 <= cr.x0 + cr.w + sl && vy0 >= cr.y0 - sl && vy1 <= cr.y0 + cr.h + sl) {   // the glom's own crop covers the window: one image, one draw
       const im = heCropImg(hs, cr, redo, k <= 2.6); if (im) { ctx.imageSmoothingQuality = "low"; ctx.drawImage(im, ox + (cr.x0 - B.x0) * k, oy + (cr.y0 - B.y0) * k, cr.w * k, cr.h * k); }
     } else drawHE(ctx, { sample: hs, redo, w: cv._hw, side: !!cv._heOnly }, (x) => ox + (x - B.x0) * k, (y) => oy + (y - B.y0) * k, W, H, k);
   }
-  cv._xf = { s: k, ox: ox - B.x0 * k, oy: oy - B.y0 * k };
+  cv._xf = cv._heOnly && imcSide(cv._hw) ? null : { s: k, ox: ox - B.x0 * k, oy: oy - B.y0 * k };
   const paint = (i, fill, stroke) => { path(i); if (ol) { ctx.lineWidth = lw * 1.8; ctx.strokeStyle = stroke; ctx.stroke(); } else { ctx.globalAlpha = al; ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = lw; ctx.strokeStyle = "rgba(10,10,10,0.8)"; ctx.stroke(); ctx.globalAlpha = 1; } };
   const path = (i) => { ctx.beginPath(); for (let q = poly.off[i] * 2, f = true; q < poly.off[i + 1] * 2; q += 2, f = false) { const X = ox + (poly.xy[q] - B.x0) * k, Y = oy + (poly.xy[q + 1] - B.y0) * k; f ? ctx.moveTo(X, Y) : ctx.lineTo(X, Y); } ctx.closePath(); };
   const inGlom = new Set(cells);
@@ -3348,7 +3472,7 @@ function bindUI() {
   $("psize").addEventListener("input", (e) => { S.psize = +e.target.value; $("psizelab").textContent = S.psize + " µm"; render(); });
   $("shape").addEventListener("change", (e) => { S.shape = e.target.value; render(); });
   $("opacity").addEventListener("input", (e) => { S.opacity = +e.target.value; render(); });
-  bindHE(); ifInit(); scanInit(); ptInit();
+  bindHE(); ifInit(); imcInit(); scanInit(); ptInit();
   $("cellsearch").addEventListener("input", debounce((e) => { S.cellSearch = e.target.value.trim(); refresh(); }));
   $("resetf").addEventListener("click", () => { S.filters = {}; S.exprFilters = []; S.hiddenCats = {}; S.cellSearch = ""; $("cellsearch").value = ""; refresh(); });
   $("fit").addEventListener("click", () => { fitView(); });
@@ -3774,8 +3898,9 @@ function drawRegionTile(cv, r, sc, rings, pen, box, ctxOn, bb = regionBBox(r, ri
   ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, W, H);
   cv._xf = { s: kz, ox: W / 2 - cx * kz, oy: H / 2 - cy * kz };
   if (he) drawHE(ctx, { ...(he.w ? he : { ...he, w: w8 }), side: !!cv._heOnly }, X, Y, W, H, kz);
+  if (cv._heOnly && imcSide(w8)) cv._xf = null;
   const ho = cv._heOnly || !hw(w8).cells;   // H&E beside the cells, or Xenium switched off: no cells, but the region outline and scale bar stay
-  ctx.globalAlpha = he ? he.a : 1;
+  ctx.globalAlpha = hw(w8).a;
   const inView = (x, y) => { const sx = X(x), sy = Y(y); return sx >= -px && sy >= -px && sx <= W && sy <= H; };
   if (ctxOn && !ho) { ctx.fillStyle = "rgba(105,110,122,0.16)"; for (let i = 0; i < b.n; i++) if (!inR[i]) { const x = b.xy[i * 2], y = b.xy[i * 2 + 1]; if (x >= x0 && x <= x0 + w && y >= y0 && y <= y0 + h && inView(x, y)) ctx.fillRect(X(x), Y(y), px, px); } }
   let order = cache?.order;
@@ -3784,7 +3909,7 @@ function drawRegionTile(cv, r, sc, rings, pen, box, ctxOn, bb = regionBBox(r, ri
     for (const i of cells) { const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : "rgba(105,110,122,0.45)"; (groups.get(col) || groups.set(col, []).get(col)).push(i); }
     order = [...groups.entries()].sort((p, q) => (p[0].startsWith("rgba") ? -1 : 0) - (q[0].startsWith("rgba") ? -1 : 0)); if (cache) cache.order = order;
   }
-  if (!ho) drawCells(ctx, order, b, X, Y, W, H, px, poly, he ? he.a : 1, hw(w8).outl);
+  if (!ho) drawCells(ctx, order, b, X, Y, W, H, px, poly, hw(w8).a, hw(w8).outl);
   ctx.globalAlpha = 1; ctx.lineJoin = "round";
   for (const [lw, col] of [[4, "rgba(0,0,0,0.85)"], [2, pen]]) { ctx.lineWidth = lw; ctx.strokeStyle = col; for (const ring of rings) { ctx.beginPath(); ring.forEach(([x, y], j) => (j ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.closePath(); ctx.stroke(); } }
   const target = 0.2 * (W - 8) / kz, p = Math.pow(10, Math.floor(Math.log10(target))), nice = [1, 2, 5, 10].map((f) => f * p).reduce((a, c) => (Math.abs(c - target) < Math.abs(a - target) ? c : a));
