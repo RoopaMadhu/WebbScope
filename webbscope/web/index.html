@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebbScope</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/deck.min.js"></script>
+</head><body>
+<header>
+  <b>WebbScope</b>
+  <span id="dsinfo" class="muted"></span>
+  <span class="spacer"></span>
+  <a href="/api/validation" target="_blank" onclick="return openTab('/api/validation', event)">validation report (JSON)</a>
+  <a href="/welcome" style="margin-left:14px">open another project…</a>
+</header>
+<main>
+<aside id="left">
+  <section><h3>Donor</h3>
+    <select id="sample"></select>
+    <div class="muted small">Coordinates are per tissue section, so one donor tissue piece is shown at a time (a donor with two pieces has two entries, “· fragment 1/2”).</div></section>
+  <section><h3>Colour by</h3>
+    <select id="colorby"></select>
+    <div id="numbox" style="display:none">
+      <div class="row"><label>Log scale</label><input type="checkbox" id="numlog" title="colour by log(1 + value)"><span class="muted small">log(1 + value)</span><button id="numreset" style="margin-left:auto">Reset</button></div>
+      <div class="row"><label>Colour bar</label><input type="number" id="numcmin" placeholder="min (auto p1)" style="width:50%"><input type="number" id="numcmax" placeholder="max (auto p99)" style="width:50%"></div>
+      <div class="row"><label>Keep only</label><input type="number" id="numfmin" placeholder="min" style="width:50%"><input type="number" id="numfmax" placeholder="max" style="width:50%"></div>
+      <div class="muted small">Colour bar: values below the min / above the max take the lowest / highest colour. Keep only: cells outside this range are drawn grey. Leave blank for automatic. Applies to the Gallery too.</div>
+    </div>
+    <div id="genebox">
+      <div class="row" id="rowA"><label>Gene A</label><input id="geneA" list="genelist" placeholder="search gene…" autocomplete="off"></div>
+      <div class="row" id="rowB"><label>Gene B</label><input id="geneB" list="genelist" placeholder="second gene (green)" autocomplete="off"></div>
+      <div id="sigbox">
+        <div class="muted small" id="siglabA"></div>
+        <select id="sigpreset" title="load a built-in signature"><option value="">— load a built-in signature —</option></select>
+        <textarea id="sigtext" rows="4" placeholder="Paste genes (comma, space or newline separated), e.g. NPHS1 NPHS2 PODXL"></textarea>
+        <div class="row"><button id="applysig" class="sm">Apply signature</button></div>
+        <div id="sigstatus" class="muted small"></div>
+        <div class="muted small">Score = mean of each gene's expression (selected layer) across the signature genes.</div>
+      </div>
+      <div id="sigbox2">
+        <div class="muted small">Signature B (orange); cells high in both look near white</div>
+        <select id="sigpreset2" title="load a built-in signature as B"><option value="">— load a built-in signature —</option></select>
+        <textarea id="sigtext2" rows="3" placeholder="Paste genes for signature B"></textarea>
+        <div class="row"><button id="applysig2" class="sm">Apply signature B</button></div>
+        <div id="sigstatus2" class="muted small"></div>
+      </div>
+      <datalist id="genelist"></datalist>
+      <div class="row"><label>Layer</label>
+        <select id="layer"><option value="logcpx">log-normalised (log1p counts/total × scale)</option><option value="counts">raw counts</option></select></div>
+      <div class="row"><label>Smooth σ</label><input type="range" id="smooth" min="0" max="100" step="5" value="0"><span id="smoothlab">off</span></div>
+      <div class="row"><label>Z-score</label><select id="zscope">
+        <option value="none">none (raw values)</option>
+        <option value="sample">within each donor</option>
+        <option value="subtype">across samples of the same disease subtype</option>
+        <option value="type">across samples of the same disease type</option>
+        <option value="all">across all samples</option>
+        <option value="nocontrol">across all non-control samples (Control excluded from the reference)</option></select></div>
+      <div class="row"><label>Compute over</label><select id="zregion" title="which cells take part in the smoothing and in the z-score reference">
+        <option value="tissue">the whole tissue</option>
+        <option value="glom">glomeruli only (each glom smoothed on its own)</option>
+        <option value="region" id="zregionopt">the region chosen in the Regions window</option></select></div>
+      <div class="muted small">Smoothing: Gaussian kernel (σ in µm, truncated at 3σ) over neighbouring cells, applied to the gene / signature score. Z-score is computed on the smoothed values, pooled over the chosen group of samples. “Compute over” limits both steps to glomerulus cells (a glom never mixes with the tissue around it or with another glom, and the z-score mean / SD come from glomerulus cells only) or to one region; cells outside the subset are drawn grey.</div>
+      <div class="row"><label>Clip at</label><input type="range" id="clip" min="90" max="100" step="0.5" value="99.5"><span id="cliplab">p99.5</span></div>
+    </div>
+  </section>
+  <section><h3>Display</h3>
+    <div class="row"><label>Cell shape</label><select id="shape">
+      <option value="auto">Auto: centroids → cell boundaries when zoomed in</option>
+      <option value="centroid">Centroids (fixed size)</option>
+      <option value="polygon">Cell boundaries (segmentation polygons)</option></select></div>
+    <div class="row"><label>Point size</label><input type="range" id="psize" min="1" max="20" step="0.5" value="5"><span id="psizelab">5 µm</span></div>
+    <div class="row"><label title="draw the Xenium cells in the main view (untick to see the images and outlines alone)">Xenium</label><input type="checkbox" id="xenmain" data-he="cells" data-hew="main" checked></div>
+    <div class="row"><label title="which images the main view shows under the cells: H&amp;E, IF, or both (each window has its own Images button in its header)">Images</label><span data-heimgs="main"></span><span class="muted small henote"></span></div>
+    <div id="ifbox" hidden>
+      <div id="iflist" title="IF channels: tick several to overlay them, each in its own colour"></div>
+      <div class="row"><label title="below 1 lifts dim structures, above 1 darkens them">Gamma</label><input type="range" id="ifgamma" min="0.4" max="2.5" step="0.05" value="1"><span id="ifgammalab" class="muted small">1.00</span></div>
+    </div>
+    <div class="row"><label title="draw cell boundaries as outlines instead of filled shapes in the main view (cell boundaries are drawn where the view is zoomed in enough)">Outlines</label><input type="checkbox" id="olmain" data-he="outl" data-hew="main"><span class="muted small">cell boundaries unfilled</span></div>
+    <div class="row"><label title="Draw every cell in one plain grey (fill and outline) instead of the colouring chosen above, e.g. to look at transcripts over the cells. Filters still apply: cells filtered out stay dimmed.">Grey cells</label><input type="checkbox" id="greycells"><span class="muted small">plain fill and outline</span></div>
+    <div class="row" id="txrow" hidden><label title="Show the individual decoded transcripts of up to 8 genes (comma-separated) over the cells. Only the part of the tissue in view is loaded; when more points fall in view than the limit, they are thinned evenly.">Transcripts</label><input type="checkbox" id="txon"><input id="txgenes" list="genelist" placeholder="genes, e.g. NPHS1, UMOD" style="flex:1;min-width:0"></div>
+    <div class="row" id="txrow2" hidden><label>Dot size</label><input type="range" id="txsize" min="1" max="6" step="0.5" value="2.5"><select id="txmax" title="most points loaded for the view"><option value="50000">50k</option><option value="200000" selected>200k</option><option value="500000">500k</option></select></div>
+    <div id="txnote" class="muted small" hidden></div>
+        <div class="row" id="scanrow" hidden><label title="the slide scan beside the cells is not aligned to them: turn or flip it to match, zoom and pan it on its own">Slide scan</label><span class="scanbtns"><button id="scrotl" title="rotate left" type="button">⟲</button><button id="scrotr" title="rotate right" type="button">⟳</button><button id="scflipx" title="flip left–right" type="button">⇋</button><button id="scflipy" title="flip top–bottom" type="button">⇅</button><button id="scfit" title="fit the scan in the pane" type="button">Fit</button></span><select id="scansel" hidden title="the scans of this project (one per slide)"></select></div>
+    <div id="scannote" class="muted small" hidden></div>
+    <div class="row" id="ptrow" hidden><label title="arrows you place on the tissue; the same arrow appears in the cell view and in the image beside it, and Save PNG includes them">Pointers</label><span class="scanbtns"><button id="ptadd" type="button" title="turn on, then click the tissue or the image beside it to place an arrow">Add pointer</button><button id="ptundo" type="button" title="remove the last arrow">Undo</button><button id="ptclr" type="button" title="remove all arrows of this tissue">Clear</button></span><span id="ptn" class="muted small"></span></div>
+    <div class="row" data-hlink="main" hidden><label title="zoom and pan the images and the cells together">Link zoom</label><input type="checkbox" data-he="link" data-hew="main" checked><span class="muted small">the images follow the cells</span></div>
+    <div class="row"><label>Opacity</label><input type="range" id="opacity" min="0.1" max="1" step="0.05" value="0.9"></div>
+    <div class="muted small">Cell boundaries are the segmentation polygons, drawn for the cells in view when zoomed in (otherwise centroids). Point size applies to centroid mode only.</div>
+
+  </section>
+  <section><h3>Filters <button id="resetf" class="sm">Reset</button></h3>
+    <div id="filters"></div>
+    <div class="row"><label>Cell ID</label><input id="cellsearch" placeholder="find cell id…"></div>
+  </section>
+</aside>
+<section id="center">
+  <div id="toolbar">
+    <button id="fit">Fit</button>
+    <button id="qcbtn" title="One-page QC report of this tissue (opens in a new tab, or in your browser from the app window; print it to PDF)" onclick="openTab('/qc/' + encodeURIComponent(S.sample))">QC report</button>
+    <button id="profbtn" title="Time and memory of opening this project, and of each request the viewer makes (opens in a new tab, or in your browser from the app window)" onclick="openTab('/profile')">Profile</button>
+    <button id="viobtn" title="Violin plots of a gene / signature per donor, by cell type or cell state">Violins</button>
+    <button id="ghbtn" title="Heterogeneity of the regions of interest (ROIs, e.g. glomeruli) of the region_heterogeneity object: PCA / UMAP of the ROIs, coloured by gene, signature, activity / chronicity, disease; PC correlation heatmaps">ROI heterogeneity</button>
+    <button id="sigbtn" title="Gene signatures: interferon types, fibrosis, immune and kidney programmes">Signatures</button>
+    <button id="cmpbtn" title="Cell fractions of this donor in Xenium vs the same donor in scFFPE">Xenium vs scFFPE</button>
+    <button id="nbrbtn" title="Who are the neighbours of the cells passing the current filters, per donor / disease type / subtype?">Neighbors</button>
+    <button id="glombtn" title="All glomeruli with their id and QC status; click one to open it, tick several to compare them">Glomeruli</button>
+    <button id="rgnbtn" title="One region (e.g. Cortex) in every donor, with the pathologist boundary">Regions</button>
+    <button id="rnbbtn" title="One tile per region object (e.g. each sclerotic glomerulus) with the cells inside it and within a distance of its outline">Region neighbourhoods</button>
+    <button id="slidebtn" title="The whole slide: every tissue at its true position, each in a labelled box; click one to open it">Slide</button>
+    <button id="galbtn" title="All tissues of a disease subtype; click one to open it">Gallery</button>
+    <button id="boxsel">Box select</button>
+    <button id="clearsel">Clear selection</button>
+    <span id="crumbs"></span>
+    <span class="spacer"></span>
+    <button id="hesbtn" hidden title="The H&amp;E slide scan with its annotations (floating window; the scan is not aligned to the Xenium coordinates)">H&amp;E slide</button>
+    <button id="umapbtn" title="Floating window with the UMAP and the Harmony PCA of all cells; the cells you click or select are highlighted there">Embeddings</button>
+    <button id="legbtn" title="Show / hide a legend over the viewer (shortcut: L)">Legend</button>
+    <button id="focusbtn" title="Hide / show the header and side panels (shortcut: F)">Hide panels</button>
+    <button id="png">Save PNG</button>
+    <button id="pubbtn" title="Journal-quality figure of this view: Arial/Helvetica 5–7 pt text, Nature column widths, 300/600 dpi PNG or PDF">Figure…</button>
+  </div>
+  <div id="viewer"><div id="deckwrap"><i class="hept" id="heptr1" hidden></i></div><div id="hewrap"><i class="hept" id="heptr2" hidden></i></div><div id="boxrect"></div><div id="tip"></div>
+    <div id="pngmenu" hidden><div class="small muted">Save this window as one picture:</div>
+      <button id="pngvis">What I see now (visible tiles)</button><button id="pngall">Everything (all tiles, full scroll height)</button></div>
+    <div id="heswin" hidden>
+      <div id="heshead" title="drag to move · drag the bottom-right corner to resize"><span id="hestitle">H&amp;E slide</span> <select id="hesscan" hidden title="the scans of this project (one per slide); the one of the tissue you are viewing is chosen when the window opens"></select>
+        <span class="umctl"><label class="small" title="draw the pathologist annotations"><input type="checkbox" id="hesann" checked> annotations</label>
+        <label class="small" title="image opacity">opacity <input type="range" id="hesop" min="0.2" max="1" step="0.05" value="1" style="width:64px;vertical-align:middle"></label>
+        <button id="hesfit" title="fit the whole slide">Fit</button><button id="hesx" title="hide">✕</button></span></div>
+      <div id="hesbody"><div id="hesdeck"></div><div id="hespanel"></div><div id="hesnote" class="small"></div></div>
+    </div>
+    <div id="umapwin" hidden>
+      <div id="umhead" title="drag to move · drag the bottom-right corner to resize"><span id="umtitle">Embeddings</span>
+        <span class="umctl"><select id="umemb"><option value="umap">UMAP</option><option value="pca">Harmony PCA</option></select>
+        <span id="umpcs" hidden><select id="umpcx" title="x axis"></select><select id="umpcy" title="y axis"></select></span>
+        <button id="umfit" title="fit all cells">Fit</button><button id="umclear" title="remove the highlight">Clear</button><button id="umx" title="hide">✕</button></span></div>
+      <div id="umbody"><div id="umdeck"></div><div id="umnote" class="small"></div></div>
+      <i class="fgrip" id="umgrip" title="drag to resize"></i>
+    </div>
+    <div id="ovleg" hidden>
+      <div id="ovhead" title="drag to move · drag the bottom-right corner to resize"><span id="ovtitle"></span>
+        <span class="ovbtns"><button id="ovsm" title="smaller text">A−</button><button id="ovbg" title="larger text">A+</button><button id="ovx" title="hide legend">✕</button></span></div>
+      <div id="ovbody"></div>
+      <div id="ovgrip" title="drag to resize"></div>
+    </div>
+    <div id="scalebar"><div id="sbline"></div><span id="sblabel"></span></div>
+    <div id="loading">Loading…</div>
+    <div id="nbr" hidden>
+      <div id="nbrhead"><b>Neighbors</b>
+        <label>Neighbour type <select id="nbfield"></select></label>
+        <label>Neighbours by <select id="nbmethod"><option value="radius">Distance (radius)</option><option value="knn">k nearest</option><option value="delaunay">Delaunay (n steps)</option></select></label>
+        <label id="nbkwrap" hidden>k <input type="number" id="nbk" min="1" max="50" step="1" value="6"></label>
+        <label id="nbstwrap" hidden>Steps <input type="number" id="nbsteps" min="1" max="8" step="1" value="1"></label>
+        <label><span id="nbdistlab">Radius</span> <input type="range" id="nbrad" min="5" max="150" step="5" value="25"><span id="nbradlab">25 µm</span></label>
+        <label>View <select id="nbview"><option value="bars">Composition (stacked bars)</option><option value="heat">Enrichment vs background (heatmap)</option><option value="table">Table</option><option value="dist">Spread across index cells (violin)</option><option value="forest">Enrichment with 95% interval</option></select></label>
+        <label id="nbgrouplab" hidden>Group by <select id="nbgroup"><option value="subtype">disease subtype</option><option value="type">disease type</option><option value="sample">donor</option></select></label>
+        <span id="nbdonwrap" style="position:relative"><button id="nbdonbtn" title="choose which donors are included in the Neighbors and Neighborhoods windows">Donors ▾</button><div id="nbdonpop" hidden></div></span>
+        <button id="nbhbtn" title="Draw each index cell with its neighbours in space (tiles, like the glomeruli window)">Neighborhoods in space ▸</button>
+        <button id="nbcounts" title="Table of how many index cells each donor has (respects all current filters)">Index cells per donor</button>
+        <button id="nbcsv">Export CSV</button><span class="spacer"></span><button id="nbclose">Close ✕</button></div>
+      <div id="nbrinfo" class="muted small"></div>
+      <div id="nbrbody"></div>
+    </div>
+    <div id="nbh" hidden>
+      <div id="nbhhead"><b>Neighborhoods</b>
+        <label>Show <select id="nbhsample"></select></label>
+        <label>Tiles per donor <input type="number" id="nbhn" min="4" max="200" step="4" value="48"></label>
+        <label>Order <select id="nbhorder"><option value="random">random</option><option value="most">most neighbours</option><option value="fewest">fewest neighbours</option></select></label>
+        <button id="nbhshuffle" title="draw a different random set">Shuffle</button><span data-hectl="nbh"></span> <button id="nbhback">◂ Neighbors</button><span class="spacer"></span><button id="nbhclose">Close ✕</button></div>
+      <div id="nbhinfo" class="muted small"></div><div id="nbhleg" class="winleg"></div>
+      <div id="nbhgrid"></div>
+    </div>
+    <div id="cmp" hidden>
+      <div id="cmphead"><b>Xenium vs scFFPE</b>
+        <label>Compare <select id="cmplevel"><option value="cell_type">cell types</option><option value="cell_state">cell states</option></select></label>
+        <label class="chk2"><input type="checkbox" id="cmpincl"> include scFFPE “Low quality” and “Proliferating” cells</label>
+        <button id="cmpview">Table</button><span class="spacer"></span><button id="cmpclose">Close ✕</button></div>
+      <div id="cmpinfo" class="muted small"></div>
+      <div id="cmpbody"></div>
+    </div>
+    <div id="sigwin" hidden>
+      <div id="sighead"><b>Signatures</b>
+        <span id="sigtabs"><button id="sigtab-explore" class="on">Explorer</button><button id="sigtab-loc">Type I vs II localisation</button></span>
+        <span class="spacer"></span><button id="sigclose">Close ✕</button></div>
+      <div id="sigmain"><div id="siglist"><input id="sigsearch" placeholder="search signatures…"><div id="sigitems"></div></div><div id="sigpane"></div></div>
+    </div>
+    <div id="vio" hidden>
+      <div id="viohead"><b>Violins</b> <span class="muted small">one violin per donor, grouped by disease subtype</span><span class="spacer"></span><button id="vioclose">Close ✕</button></div>
+      <div id="vioctl">
+        <div class="sctl"><label>Gene <input id="viogene" list="genelist" placeholder="add a gene…" autocomplete="off"></label><button id="vioaddg">Add gene</button>
+          <label>Signature <select id="viosig"><option value="">— pick —</option></select></label><button id="vioadds">Add signature</button><span id="viomsg" class="snote"></span></div>
+        <div id="viochips" class="chips"></div>
+        <div class="sctl"><label>Show <select id="vioshow"><option value="cell_type">cell type (one panel per cell type)</option><option value="cell_state">cell states of a cell type (one plot per cell type)</option></select></label>
+          <details id="viocts"><summary id="vioctssum"></summary><div id="vioctlist"></div></details>
+          <label>Show per <select id="vionit"><option value="sample">donor</option><option value="subtype">disease subtype (bars: mean of donors)</option><option value="type">disease type (bars: mean of donors)</option></select></label>
+          <label>Score <select id="vioscope"><option value="none">no z-score</option><option value="sample">z-score within each donor</option><option value="all">z-score across all samples</option><option value="nocontrol">z-score vs non-control samples</option></select></label>
+          <label><input type="checkbox" id="vionz"> expressing cells only (&gt; 0)</label>
+          <label title="violins: one per donor; histogram: the per-cell values themselves (all donors pooled), plus the raw counts for a single gene, to check the scale">Plot <select id="viotype"><option value="violin">violins</option><option value="hist">histogram of the values</option></select></label>
+          <label hidden><input type="checkbox" id="viology"> log y-axis</label></div>
+      </div>
+      <div id="viobody"></div>
+    </div>
+    <div id="ghet" hidden>
+      <div id="ghhead"><b>ROI heterogeneity</b> <span class="muted small" id="ghsub"></span> <span data-hectl="gh"></span><span class="spacer"></span><button id="ghclose">Close ✕</button></div>
+      <div id="ghctl" class="sctl">
+        <label>Colour by <select id="ghcol">
+          <option value="disease_subtype">Disease subtype</option><option value="disease_type">Disease type</option><option value="activity">Activity score</option><option value="chronicity">Chronicity score</option>
+          <option value="sample">Donor</option><option value="cluster">Cluster</option><option value="gene">Gene</option><option value="dual">Two genes (dual colour)</option><option value="signature">Gene signature</option><option value="sigdual">Two gene signatures (dual colour)</option>
+          <option value="type">Cell-type fraction</option><option value="state">Cell-state fraction</option></select></label>
+        <label id="ghgenel" hidden><input id="ghgene" list="genelist" placeholder="gene A (red)…" autocomplete="off"></label>
+        <label id="ghgene2l" hidden><input id="ghgene2" list="genelist" placeholder="gene B (green)…" autocomplete="off"></label>
+        <label id="ghsigl" hidden><span id="ghsiglab">Signature</span> <select id="ghsig"></select> <input id="ghsigtxt" placeholder="or paste genes…" autocomplete="off" title="space / comma separated; overrides the list"></label>
+        <label id="ghsig2l" hidden>B (orange) <select id="ghsig2"></select> <input id="ghsigtxt2" placeholder="or paste genes…" autocomplete="off"></label>
+        <label id="ghctl_" hidden><select id="ghct"></select></label>
+        <label id="ghcsl" hidden><select id="ghcs"></select></label>
+        <label id="ghclrl" hidden>resolution <select id="ghclr"></select></label>
+        <label title="which PCs the heatmaps below correlate with (the plots above show both)">Heatmap PCs <select id="ghlayer"><option value="harmony">Harmony-corrected</option><option value="raw">uncorrected</option></select></label>
+        <label>x <select id="ghpx"></select></label><label>y <select id="ghpy"></select></label>
+        <label>Point size <input type="range" id="ghsize" min="1.5" max="10" step="0.5" value="4.4" style="width:90px"></label><label>Opacity <input type="range" id="ghop" min="0.1" max="1" step="0.05" value="0.92" style="width:90px"></label>
+        <label><input type="checkbox" id="ghhide"> hide gloms not passing the filters</label>
+        <span id="ghmsg" class="snote"></span>
+      </div>
+      <div id="ghexp" class="sctl" hidden>
+        <label id="ghsrcl">Expression from <select id="ghsrc"><option value="object">region_heterogeneity object (ROI-level log-normalised)</option><option value="cells">viewer cells (mean over each ROI's cells)</option></select></label>
+        <label>Layer <select id="ghexl"><option value="logcpx">log-normalised</option><option value="counts">raw counts</option></select></label>
+        <label>Smooth σ <input type="range" id="ghsm" min="0" max="100" step="5" value="0" style="width:90px"><span id="ghsmlab">off</span></label>
+        <label>Z-score <select id="ghzs"><option value="none">none</option><option value="sample">within each donor</option><option value="subtype">same disease subtype</option><option value="type">same disease type</option><option value="all">all samples</option><option value="nocontrol">vs non-control samples</option></select></label>
+        <label>Compute over <select id="ghwi"><option value="tissue">the whole tissue</option><option value="glom">glomeruli only (each glom smoothed on its own)</option><option value="region">the region chosen in the Regions window</option></select></label>
+        <span class="snote">These are the main window's gene / signature settings (changing them here changes them there). Smoothing, layer, z-score and “compute over” act on the cells; each dot is the mean of its glom's cells.</span>
+      </div>
+      <div id="ghbody">
+        <div id="ghplots"><div class="ghp"><div class="ghpt">PCA (Harmony-corrected)</div><svg id="ghpca"></svg></div><div class="ghp"><div class="ghpt">PCA (uncorrected)</div><svg id="ghpcaraw"></svg></div><div class="ghp"><div class="ghpt">UMAP</div><svg id="ghumap"></svg></div>
+          <div id="ghdet"><div class="ghpt" id="ghdett">Click a dot to see the ROI</div><canvas id="ghcv" width="300" height="300" hidden></canvas><div id="ghdi" class="small"></div><button id="ghzoom" hidden>Zoom / save PNG</button> <button id="ghadd" hidden title="add this glom to the comparison (same list as the ticks in the Glomeruli window)">Add to comparison</button> <button id="ghcmp" title="compare the ticked gloms side by side">Compare (0)</button></div></div>
+        <div id="ghleg" class="small muted"></div>
+        <div id="ghhm"><div class="sctl"><span class="tabs"><button id="ghtab-gene" class="on">Genes</button><button id="ghtab-type">Cell types</button><button id="ghtab-state">Cell states</button></span>
+          <label><span id="ghtoplab">genes per PC (top + bottom)</span> <input id="ghtop" type="number" min="1" max="100" value="10" style="width:56px"></label>
+          <label>View <select id="ghview"><option value="heat">Heatmap</option><option value="table">Table</option></select></label>
+          <label>Sort by <select id="ghsort" title="rank the rows by their correlation with one PC (you can also click a PC header)"><option value="">default order</option></select></label>
+          <label><select id="ghdir"><option value="desc">most positive first</option><option value="asc">most negative first</option><option value="abs">strongest |r| first</option></select></label>
+          <button id="ghcsv" class="sm">Export CSV</button><span id="ghhmnote" class="snote"></span></div>
+          <div id="ghhmbox"></div></div>
+      </div>
+    </div>
+    <div id="nbrtip" hidden></div>
+    <div id="glom" hidden>
+      <div id="glomhead"><b>Glomeruli</b>
+        <label>Show <select id="glomscope"></select></label>
+        <label>QC <select id="glomqc"><option value="all">all</option><option value="passed qc">passed qc</option><option value="failed qc">failed qc</option></select></label>
+        <label title="show only the glomeruli you ticked, split into one chunk each, to compare them"><input type="checkbox" id="glomonly"> only ticked (<span id="glomn">0</span>)</label>
+        <span id="glomzoomctl" hidden><label title="apply one zoom and position to every ticked glom (relative to each glom's own box)"><input type="checkbox" id="glomsync"> link zoom</label> <button id="glomrz">Reset zoom</button></span>
+        <span data-hectl="glom"></span> <span id="glominfo" class="muted small"></span><span class="spacer"></span>
+        <button id="glomcmpbtn" title="Tick gloms with the checkbox on each tile, then compare them side by side">Compare selected (0)</button><button id="glomselclr" title="untick every glom">Clear ticks</button><button id="glomclose">Close ✕</button></div>
+      <div id="glomleg" class="winleg"></div>
+      <div id="glomgrid"></div>
+    </div>
+    <div id="glomcmp" hidden>
+      <div id="gchead"><b>Compare glomeruli</b> <span id="gcinfo" class="muted small"></span> <span data-hectl="gcmp"></span><span class="spacer"></span>
+        <label class="small">Tile size <select id="gcsize"><option value="300">small</option><option value="420" selected>medium</option><option value="560">large</option></select></label>
+        <label class="small"><input type="checkbox" id="gcctx" checked> show neighbouring cells</label>
+        <label class="small"><input type="checkbox" id="gcown" checked> colour scale fitted to these gloms</label>
+        <button id="gcsave">Save PNG</button><button id="gcclr">Clear ticks</button><button id="gcclose">Back ✕</button></div>
+      <div id="gcleg" class="winleg"></div>
+      <div id="gcgrid"></div>
+    </div>
+    <div id="rgn" hidden>
+      <div id="rgnhead"><b>Regions</b>
+        <label>Region from <select id="rgnsrc"></select></label>
+        <label>Region <select id="rgnsel"></select></label>
+        <label>Show <select id="rgnsub"></select></label>
+        <label>Tile size <select id="rgnsz"><option value="300">small</option><option value="420" selected>medium</option><option value="600">large</option></select></label>
+        <label><input type="checkbox" id="rgnout" checked> boundary</label>
+        <label><input type="checkbox" id="rgnctx"> other cells (faint)</label>
+        <label title="show only the tissues you ticked, split into one chunk each, to compare them"><input type="checkbox" id="rgnonly"> only ticked (<span id="rgnn">0</span>)</label><button id="rgnclr">Untick all</button>
+        <span data-hectl="rgn"></span>
+        <span id="rgnzoomctl" hidden><label title="apply one zoom and position to every ticked tissue (relative to each tissue's own extent)"><input type="checkbox" id="rgnsync"> link zoom</label> <button id="rgnrz">Reset zoom</button></span>
+        <button id="rgnfilt" title="keep only the cells of this region in the main window (a filter you can reset there)">Filter main window to this region</button>
+        <span class="spacer"></span><button id="rgnclose">Close ✕</button></div>
+      <div id="rgninfo" class="muted small"></div>
+      <div id="rgnleg" class="winleg"></div>
+      <div id="rgngrid"></div>
+    </div>
+    <div id="rnb" hidden>
+      <div id="rnbhead"><b>Region neighbourhoods</b>
+        <label>Region <select id="rnbsel"></select></label>
+        <label>Show <select id="rnbscope"></select></label>
+        <label title="cells whose centre is within this distance of the region outline are included (µm)">Distance <input type="number" id="rnbd" min="1" max="500" step="5" value="50" style="width:64px"> µm</label>
+        <label>Tile size <select id="rnbsz"><option value="200">small</option><option value="280" selected>medium</option><option value="400">large</option><option value="560">extra large</option></select></label>
+        <label title="show only the regions you ticked, split into one chunk each, to compare them"><input type="checkbox" id="rnbonly"> only ticked (<span id="rnbn">0</span>)</label><button id="rnbclr">Untick all</button>
+        <span id="rnbzoomctl" hidden><label title="apply one zoom and position to every ticked region (relative to each region's own box)"><input type="checkbox" id="rnbsync"> link zoom</label> <button id="rnbrz">Reset zoom</button></span>
+        <span data-hectl="rnb"></span><span class="spacer"></span><button id="rnbclose">Close ✕</button></div>
+      <div id="rnbinfo" class="muted small"></div>
+      <div id="rnbleg" class="winleg"></div>
+      <div id="rnbgrid"></div>
+    </div>
+    <div id="glomzoom" hidden>
+      <div id="gzhead"><b id="gztitle"></b> <span data-hectl="gz"></span><span class="spacer"></span>
+        <label class="small"><input type="checkbox" id="gzctx" checked> show neighbouring cells</label> <span class="muted small">wheel = zoom · drag = pan · double-click = reset</span>
+        <button id="gzsave">Save PNG</button><button id="gzopen">Open in main viewer</button><button id="gzclose">Close ✕</button></div>
+      <div id="gzbody"><canvas id="gzcanvas" width="900" height="1080"></canvas></div>
+    </div>
+    <div id="slide" hidden>
+      <div id="slidehead"><b>Slide</b> <label>Slide <select id="slidesel"></select></label><label id="slidecolsl" hidden>per row <select id="slidecols"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></label><span data-hectl="slide"></span> <span id="slideinfo" class="muted small"></span><span class="spacer"></span><button id="slideclose">Close ✕</button></div>
+      <div id="slideleg" class="winleg"></div>
+      <div id="slidepair"><canvas id="slidecv"></canvas><canvas id="slidecv2" hidden></canvas></div>
+      <div id="slideall" hidden></div>
+    </div>
+    <div id="gallery" hidden>
+      <div id="galhead"><b>Gallery</b> <label>Show <select id="galsub"></select></label>
+        <label>Tile size <select id="galsz"><option value="220">small</option><option value="300" selected>medium</option><option value="460">large</option><option value="640">extra large</option><option value="0">fit window</option></select></label>
+        <label title="show only the tissues you ticked, to compare them side by side"><input type="checkbox" id="galonly"> only ticked (<span id="galn">0</span>)</label><button id="galclr">Untick all</button>
+        <span data-hectl="gal"></span>
+        <span id="galzoomctl" hidden><label title="apply one zoom and position to every ticked tissue (relative to each tissue's own extent)"><input type="checkbox" id="galsync"> link zoom</label> <button id="galrz">Reset zoom</button></span>
+        <span id="galinfo" class="muted small"></span><span class="spacer"></span><button id="galclose">Close ✕</button></div>
+      <div id="galleg" class="winleg"></div>
+      <div id="galgrid"></div>
+    </div></div>
+</section>
+<aside id="right">
+  <section><h3>Current view</h3><table id="stats" class="kv"></table></section>
+  <section id="legendsec"><h3>Legend <span id="legtitle" class="muted"></span> <input id="legsearch" placeholder="search…"></h3><div id="legend"></div><div id="legnote" class="small muted"></div></section>
+  <section><h3 id="comphead">Composition</h3>
+    <select id="compfield"></select><div id="comp"></div></section>
+  <section><h3>Cell</h3><div id="cell" class="muted">Click a cell.</div></section>
+  <section><h3>Selection</h3><div id="selinfo" class="muted">No cells selected.</div>
+    <button id="expsel" class="sm">Export selected (CSV)</button> <button id="expfilt" class="sm">Export filtered (CSV)</button></section>
+</aside>
+</main>
+<div id="pubwin" hidden><div id="pubbox">
+  <div id="pubhead"><b>Publication figure</b> <span class="muted small">Nature style: Arial/Helvetica, 5–7 pt text, 8 pt bold panel letter</span><button id="pubx" class="sm">✕</button></div>
+  <div id="pubbody"><div id="pubctl">
+    <label>Width <select id="pubw"><option value="89">89 mm (1 column)</option><option value="120">120 mm (1.5 columns)</option><option value="136">136 mm (1.5 columns, wide)</option><option value="183">183 mm (2 columns)</option></select></label>
+    <label>Max height (mm) <input type="number" id="pubmaxh" value="170" min="40" max="247"></label>
+    <label>Resolution <select id="pubdpi"><option value="300">300 dpi</option><option value="600">600 dpi</option></select></label>
+    <label>Region <select id="pubreg"><option value="view">What the viewer shows now</option><option value="all">Whole tissue</option></select></label>
+    <label>Text size (pt, 5–7) <input type="number" id="pubsize" value="7" min="5" max="7" step="0.5"></label>
+    <label>Panel letter <input id="publetter" value="a" maxlength="3"></label>
+    <label class="chk"><input type="checkbox" id="pubtitle" checked> sample name and cell count</label>
+    <label class="chk"><input type="checkbox" id="pubsb" checked> scale bar</label>
+    <label class="chk"><input type="checkbox" id="pubdark"> dark background</label>
+    <div class="small muted" id="pubinfo"></div>
+    <div class="small muted">The PNG records its size and dpi. The PDF has live Helvetica text and a vector scale bar and colour bar; the cells are one image at the chosen dpi. The H&amp;E slide is not included.</div>
+    <div><button id="pubpng">Save PNG</button> <button id="pubpdf">Save PDF</button></div>
+  </div><div id="pubpv"><canvas id="pubprev"></canvas></div></div>
+</div></div>
+<script src="/static/app.js"></script>
+<script src="/static/pubfig.js"></script>
+</body></html>

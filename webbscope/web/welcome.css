@@ -1,0 +1,8 @@
+*{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,system-ui,sans-serif;background:#16181d;color:#dfe3ea}
+#box{max-width:720px;margin:12vh auto;padding:0 20px}h1{margin:0 0 8px}
+button,input{font:inherit;background:#262a33;color:#dfe3ea;border:1px solid #3a4050;border-radius:4px;padding:6px 10px}button{cursor:pointer}button:hover{background:#31364a}
+.row{display:flex;gap:6px;margin:14px 0}.row input{flex:1}
+#log{background:#101216;padding:8px;min-height:3em;max-height:260px;overflow:auto;color:#9fb0cc;border-radius:4px;font-size:12px}
+#err{color:#ff8a80;margin-top:8px;white-space:pre-wrap}#current{margin:10px 0;color:#9fb0cc}a{color:#7fb2ff}
+.sub{color:#8f9bb0;font-size:12px}
+[hidden]{display:none !important}

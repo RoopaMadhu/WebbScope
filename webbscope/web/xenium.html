@@ -1,0 +1,83 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WebbScope — import Xenium output</title>
+<link rel="stylesheet" href="/static/welcome.css"><link rel="stylesheet" href="/static/xenium.css"></head><body>
+<div id="xbox">
+  <h1>Import Xenium output</h1>
+  <p class="sub">Turns a Xenium output bundle into a WebbScope project. Only the counts, cell table, cell boundaries and the 10x analysis files are read, plus the transcripts and an H&amp;E scan if you ask for them; the Xenium images are never touched. <a href="/welcome">← open an existing project</a></p>
+
+  <section id="s1">
+    <h2>1 · Xenium output</h2>
+    <div class="row"><input id="path" placeholder="/path/to/output-XETG….tar.gz or .zip  or  the extracted output folder" autofocus>
+      <button id="bfile" data-pick-for="path" data-kind="file" data-types="gz,tgz,tar,zip">Archive…</button><button id="bdir" data-pick-for="path" data-kind="dir">Folder…</button></div>
+    <details><summary>or give the files separately (override / complete the above)</summary>
+      <div class="grid">
+        <label>Count matrix (cell_feature_matrix folder or matrix.mtx.gz)</label><input id="f_matrix" data-pick="dir">
+        <label>Cells (cells.parquet / cells.csv.gz)</label><input id="f_cells" data-pick="file" data-types="parquet,gz,csv">
+        <label>Cell boundaries (cell_boundaries.parquet / .csv.gz)</label><input id="f_boundaries" data-pick="file" data-types="parquet,gz,csv">
+        <label>10x clusters (clusters.csv)</label><input id="f_clusters" data-pick="file" data-types="csv">
+        <label>10x UMAP (projection.csv)</label><input id="f_umap" data-pick="file" data-types="csv">
+        <label>10x PCA (projection.csv)</label><input id="f_pca" data-pick="file" data-types="csv">
+        <label>experiment.xenium</label><input id="f_experiment" data-pick="file" data-types="xenium,json">
+        <label>Transcripts (transcripts.parquet)</label><input id="f_transcripts" data-pick="file" data-types="parquet">
+        <label>IF image (morphology_focus.ome.tif)</label><input id="f_if_image" data-pick="file" data-types="tif,tiff">
+      </div></details>
+    <label class="rad"><input type="checkbox" id="wanttx" checked> Include the transcripts (<code>transcripts.parquet</code>, about 300 MB; adds roughly a minute and ~200 MB to the project). They can be shown per gene in the viewer.</label>
+    <label class="rad"><input type="checkbox" id="wantif" checked> Include the IF (morphology) image: <code>morphology_focus.ome.tif</code> (else <code>morphology_mip.ome.tif</code>) of the run, if it has one. It is not copied: the project records where the file is, so keep it there. The viewer shows it under or beside the cells like the H&amp;E.</label>
+    <details open><summary><b>H&amp;E slide scan</b> (optional, a separate file from the Xenium output; works with the .tar.gz / .zip too)</summary>
+      <div class="grid">
+        <label>H&amp;E scan (.czi or .ome.tif / .ome.tiff)</label><input id="f_hecz" placeholder="/path/to/HE_….czi  or  HE_….ome.tif" data-pick="file" data-types="czi,tif,tiff">
+        <label>Annotations (ImageScope .annotations, optional)</label><input id="f_heann" placeholder="/path/to/HE_….annotations" data-pick="file" data-types="annotations,xml">
+      </div>
+      <p class="sub">The scan is tiled and shown in the viewer's “H&amp;E slide” window. It is not aligned to the Xenium coordinates (yet): it is shown as the scanned slide, with the annotations drawn on it.</p></details>
+    <details open><summary><b>Registered H&amp;E images</b> (optional): one <code>.ome.tif</code> / <code>.ome.tiff</code> per tissue, already in the Xenium frame</summary>
+      <div class="grid">
+        <label>Folder of registered images</label><input id="f_hereg" placeholder="/path/to/folder with the registered H&amp;E OME-TIFFs" data-pick="dir">
+        <label>index.json (optional)</label><input id="f_heregidx" placeholder="/path/to/index.json: image name → sample id" data-pick="file" data-types="json">
+      </div>
+      <p class="sub">They are shown under or beside the cells (the <b>Images</b> button), unlike the slide scan above. Each image goes to the tissue whose name is the image's file name (without <code>_warped_he.ome.tif</code>); with an <code>index.json</code> the names can be anything. The tissues here are called <code>tissue_1</code>, <code>tissue_2</code> … by the tissue detection, so an <code>index.json</code> is usually needed. The images are tiled into the project folder after the conversion.</p></details>
+    <div class="row"><button id="scan" class="primary">Read</button></div>
+    <pre id="log"></pre><div id="err"></div>
+  </section>
+
+  <section id="s2" hidden>
+    <h2>2 · Tissues on the slide</h2>
+    <p class="sub" id="runinfo"></p>
+    <div id="tiss">
+      <div id="cwrap"><canvas id="cv"></canvas><div id="cnote"></div></div>
+      <div id="side">
+        <div class="grid3">
+          <label title="pieces closer than this are one tissue">Merge pieces closer than (µm)<input id="p_gap" type="number" value="200" min="0" step="50"></label>
+          <label title="smaller pieces are switched off by default">Minimum cells per tissue<input id="p_minc" type="number" value="500" min="1" step="100"></label>
+          <label title="cells with fewer panel-gene transcripts are left out (the 10x analysis also leaves out empty cells)">Minimum transcripts per cell<input id="p_mint" type="number" value="1" min="0"></label>
+        </div>
+        <table id="ttab"><thead><tr><th></th><th>use</th><th>name (same name = merged)</th><th>cells</th><th></th></tr></thead><tbody></tbody></table>
+        <div class="row"><button id="draw">Rectangle</button><button id="drawfree">Free-hand</button><span class="sub">draw on the slide (free-hand: hold the mouse button and trace): splits a piece, joins pieces, or (untick “use”) removes an area</span></div>
+        <div id="tsum"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="s3" hidden>
+    <h2>3 · Cell labels</h2>
+    <label class="rad"><input type="radio" name="lab" value="10x" checked> <span id="lab10x">10x graph clusters</span> <span class="sub">(stand-in for cell types)</span></label>
+    <label class="rad"><input type="radio" name="lab" value="ann"> My annotation file</label>
+    <div id="annbox" hidden>
+      <div class="row"><input id="annpath" placeholder="/path/to/annotation.csv (.tsv / .parquet): one row per cell, with its cell id" data-pick="file" data-types="csv,tsv,txt,parquet,gz"><button id="annload">Load</button></div>
+      <div class="grid" id="anncols" hidden>
+        <label>cell id column</label><select id="a_id"></select>
+        <label>cell type column</label><select id="a_type"></select>
+        <label>cell state column (optional)</label><select id="a_state"></select>
+      </div><div id="annmsg" class="sub"></div>
+    </div>
+  </section>
+
+  <section id="s4" hidden>
+    <h2>4 · Create the project</h2>
+    <div class="grid"><label>Project name</label><input id="pname"><label>Output folder (new or empty; the input is never modified)</label><input id="outdir"></div>
+    <label class="rad" id="herow" hidden><input type="checkbox" id="wanthe" checked> <span id="hetxt"></span></label>
+    <div class="row"><button id="go" class="primary">Convert and open</button></div>
+    <pre id="log2"></pre><div id="err2"></div>
+  </section>
+</div>
+<script src="/static/xenium.js"></script>
+</body></html>

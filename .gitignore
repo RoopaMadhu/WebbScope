@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.pyc
+.venv*/
+
+# Build output and build logs
+build/
+build-linux/
+dist/
+*.log
+
+# Packaged archives (attach to a GitHub Release instead)
+*.tar.gz
+*.zip
+
+# Example / test data and raw Xenium output: far over GitHub's 100 MB per-file limit
+sample_project/
+atera_sample/
+registered_H_E_images/
+Xenium_Preview_*/
+output-XETG*/
+index.json
+
+# Data file types, wherever they are
+*.qs2
+*.rds
+*.parquet
+*.ome.tif
+*.ome.tiff
+*.czi
+*.zarr
+*.zarr.zip
+
+# Local caches, editor and OS files
+.webbscope/
+.DS_Store
+.claude/
+.idea/
+.vscode/
+*.swp
+.ipynb_checkpoints/
+.pytest_cache/
+*.egg-info/
+.env
+.Rhistory
+.RData
+
+# Local helper
+tools/make_sample.py

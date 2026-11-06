@@ -1,0 +1,13 @@
+# Runtime + build dependencies for the Linux (server-only) build. No pywebview / pyobjc: there is no native window on the HPC.
+fastapi
+uvicorn
+orjson
+numpy
+pandas
+pyarrow
+scipy
+shapely
+pillow
+pylibCZIrw
+pydantic
+pyinstaller

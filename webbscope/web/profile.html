@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WebbScope — profile</title>
+<link rel="stylesheet" href="/static/welcome.css"><link rel="stylesheet" href="/static/xenium.css">
+<style>table.p{border-collapse:collapse;font-size:12px;width:100%;margin:6px 0}table.p th{font-weight:500;color:#8f9bb0;text-align:left;padding:2px 8px}table.p td{padding:2px 8px;border-top:1px solid #23262f}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}.slow{color:#ffb74d}.vslow{color:#ff8a80}</style></head><body>
+<div id="xbox">
+  <h1>Profile</h1>
+  <p class="sub" id="head"></p>
+  <div class="row"><button id="refresh" class="primary">Refresh</button><button id="reset" title="clear the request timings, then use the app, then Refresh">Reset request timings</button>
+    <button id="copy">Copy as text</button><label class="rad" style="display:inline"><input type="checkbox" id="auto"> refresh every 2 s</label></div>
+  <section><h2>Opening the project: steps</h2><table class="p" id="steps"></table></section>
+  <section><h2>Opening the project: log with time and memory</h2>
+    <p class="sub">t = seconds since the open started, +dt = since the previous line; RSS = resident memory (Linux only), peak = highest memory so far in this process.</p><table class="p" id="events"></table></section>
+  <section><h2>Requests since the open (or the last reset), slowest total first</h2>
+    <p class="sub">Each row is one API endpoint; every tissue load, colouring, smoothing or window the viewer asks for shows up here with its time and size.</p><table class="p" id="reqs"></table></section>
+</div>
+<script src="/static/profile.js"></script>
+</body></html>
