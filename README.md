@@ -1,6 +1,6 @@
 # WebbScope
 
-A browser-based viewer for spatial-transcriptomics data, built for 10x **Xenium** data. The inputs can be a counts matrix and metadata or raw Xenium output.
+A browser-based viewer for spatial-transcriptomics data. The inputs can be a counts matrix and metadata or raw output (.tar.gz or folders) from Xenium SpaceRanger.
 
 ## What it does
 
@@ -13,38 +13,29 @@ A browser-based viewer for spatial-transcriptomics data, built for 10x **Xenium*
 
 ## Install
 
-Pick one. All three run the same code.
 
 ### A. macOS app
 
-1. Download `WebbScope-mac.zip` and unzip it.
-2. Right-click `WebbScope.app` → **Open**. The app is unsigned, so macOS asks once.
-3. Click **Browse…** and choose a project folder.
+Download WebbScope-v0.1.0-mac.zip: The app is unsigned, so macOS throws a security warning.
 
-To build the app yourself, see [Build from source](#build-from-source).
 
 ### B. Linux or HPC cluster (server only)
 
-A cluster has no screen, so WebbScope serves the page and you view it in a browser on your own computer through an SSH tunnel. PyInstaller cannot cross-compile, so build the binary on the cluster:
+
+Download WebbScope-v0.1.0-src.tar.gz to the HPC.
 
 ```bash
-# on your computer
-./pack_source.sh                      # makes webbscope-src.tar.gz
-scp webbscope-src.tar.gz <cluster>:~/
-
 # on the cluster (a compute node is best)
-tar xzf webbscope-src.tar.gz
-module load python                    # Python 3.10 or newer; module names vary
-bash build_linux.sh                   # needs internet or a pip mirror once
+tar xzf WebbScope-v0.1.0-src.tar.gz
+cd WebbScope
+bash build_linux.sh      # needs Python >=3.10
 ```
-
-This produces `dist/WebbScope/` and `dist/WebbScope-linux-x86_64.tar.gz`. The build needs `binutils` (`objdump`). Build on the oldest machine you will run on.
 
 Run it inside a job:
 
 ```bash
-srun --pty -c 8 --mem 32G bash
-WEBBSCOPE_CACHE=/path/to/scratch/webbscope_cache \
+srun --pty -c 8 --mem 70G bash
+WEBBSCOPE_CACHE=/path/to/webbscope_cache \
   dist/WebbScope/WebbScope --port 8765 /path/to/project
 ```
 
@@ -163,8 +154,8 @@ A project is a folder with `project.json`, a count matrix (`matrix.mtx.gz` + `fe
 | Target | Command |
 |---|---|
 | macOS app | `./build_app.sh` (needs a `.venv` with `pyinstaller` and `pywebview`) → `dist/WebbScope.app` |
-| Linux binary | `bash build_linux.sh` on a Linux machine → `dist/WebbScope-linux-x86_64.tar.gz` |
-| Source tarball | `./pack_source.sh` → `webbscope-src.tar.gz` |
+| Linux binary | `bash build_linux.sh` on a Linux machine → `dist/WebbScope-v0.1.0-linux-x86_64.tar.gz` |
+| Source tarball | `./pack_source.sh` → `WebbScope-v0.1.0-src.tar.gz` |
 
 
 More detail, including what was checked and how, is in [docs/NOTES.md](docs/NOTES.md).

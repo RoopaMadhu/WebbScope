@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Build WebbScope for Linux (x86_64). Run this ON Linux (PyInstaller cannot cross-compile), e.g. on an HPC compute node:
 #     bash build_linux.sh            # uses `python3` (3.10+); override with PYTHON=/path/to/python3.12
-# Output: dist/WebbScope-linux-x86_64.tar.gz  (unpack anywhere, run ./WebbScope/WebbScope PROJECT_FOLDER)
+# Output: dist/WebbScope-v<version>-linux-x86_64.tar.gz  (unpack anywhere, run ./WebbScope/WebbScope PROJECT_FOLDER)
+# The version comes from webbscope/__init__.py.
 # Needs internet or a pip mirror for the first run. Everything lands in .venv-linux/, dist/ and build-linux/.
 set -euo pipefail
 cd "$(dirname "$0")"
+VERSION="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' webbscope/__init__.py)"
 PYTHON="${PYTHON:-python3}"
 "$PYTHON" -c 'import sys; assert sys.version_info >= (3, 10), "need Python >= 3.10 (try: module load python/3.12)"'
 # PyInstaller needs objdump (package binutils) on Linux. Try the cluster's module system first, then stop with instructions.
@@ -28,5 +30,5 @@ fi
   run_app.py
 echo "--- smoke test"
 dist/WebbScope/WebbScope --version
-tar -C dist -czf dist/WebbScope-linux-x86_64.tar.gz WebbScope
-echo "built dist/WebbScope-linux-x86_64.tar.gz"
+tar -C dist -czf "dist/WebbScope-v$VERSION-linux-x86_64.tar.gz" WebbScope
+echo "built dist/WebbScope-v$VERSION-linux-x86_64.tar.gz"

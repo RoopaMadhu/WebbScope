@@ -45,7 +45,7 @@ def main(argv=None):
     ap.add_argument("--window", action="store_true", help="Linux only: try the native window (needs a display and pywebview) instead of server-only mode")
     ap.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1, reachable only from this machine / through an SSH tunnel)")
     ap.add_argument("--force", action="store_true", help="redo the import even if the cache is current")
-    ap.add_argument("--version", action="version", version=__version__)
+    ap.add_argument("--version", action="version", version=f"v{__version__}")
     a = ap.parse_args(argv)
 
     if sys.platform.startswith("linux") and not a.window and not a.browser:
@@ -59,7 +59,7 @@ def main(argv=None):
             sys.exit("server did not start")
         time.sleep(0.02)
     url = f"http://127.0.0.1:{port}"
-    print(f"WebbScope {__version__} → {url}", flush=True)
+    print(f"WebbScope v{__version__} → {url}", flush=True)
     if a.headless and sys.platform.startswith("linux"):
         host = socket.gethostname()
         print(f"\nOn your own computer run (jumps through the login node to this machine, {host}):\n"
