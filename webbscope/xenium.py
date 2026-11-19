@@ -23,7 +23,8 @@ from . import importer, if_image
 MARKER = ".webbscope_xenium_import.json"
 IF_KEY = "run"                                  # name of the IF image in a single run's if.json
 CTRL_KEYS = {"Negative Control Probe": "nc_probe", "Negative Control Codeword": "nc_codeword", "Unassigned Codeword": "unassigned_codeword", "Deprecated Codeword": "deprecated_codeword"}
-BIN_UM = 50.0                                   # density grid for tissue detection
+BIN_UM = 50.0                                   # density grid for tissue detection from cells
+TX_BIN_UM = 100.0                               # ... and from transcripts
 CLUSTERS_REL = "analysis/clustering/gene_expression_graphclust/clusters.csv"
 UMAP_REL = "analysis/umap/gene_expression_2_components/projection.csv"
 PCA_RE = re.compile(r"^analysis/pca/gene_expression_\d+_components/projection\.csv$")
@@ -235,7 +236,9 @@ def resolve_sources(path, overrides, log, want_tx=False, want_if=False):
         else:
             raise importer.ImportError_(f"not found: {p}")
     if not want_tx:
-        src.pop("tx", None)
+        tx = src.pop("tx", None)
+        if tx is not None:
+            src["tx_probe"] = tx                              # not imported, but readable for the transcript-density tissue detection
     if not want_if:
         for k in [k for k in src if k.startswith("if_")]:
             del src[k]
@@ -295,6 +298,63 @@ def _read_lines(p, col=0):
     opener = gzip.open if str(p).endswith(".gz") else open
     with opener(p, "rt") as f:
         return [l.rstrip("\n").split("\t") for l in f if l.strip()]
+
+
+def tx_density(path, bin_um=TX_BIN_UM, min_qv=20.0):
+    """Gene transcripts (quality >= min_qv) per square bin of bin_um micrometres, streamed one row group at a time (about 0.4 GB for 70 million
+    transcripts, 4 s). Returns (x origin, y origin, 2-D counts [x bin, y bin])."""
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(path)
+    names, md = pf.schema_arrow.names, pf.metadata
+    for c in ("x_location", "y_location"):
+        if c not in names:
+            raise importer.ImportError_(f"{Path(path).name} has no column {c}")
+    cols = ["x_location", "y_location"] + [c for c in ("qv", "is_gene") if c in names]
+    ci = [names.index("x_location"), names.index("y_location")]
+    lo, hi = [np.inf, np.inf], [-np.inf, -np.inf]
+    for g in range(md.num_row_groups):                        # extent from the row-group statistics (no data read)
+        for k, c in enumerate(ci):
+            st = md.row_group(g).column(c).statistics
+            if st is None or not st.has_min_max:
+                lo = None
+                break
+            lo[k], hi[k] = min(lo[k], st.min), max(hi[k], st.max)
+        if lo is None:
+            break
+    if lo is None:                                            # no statistics: one pass to find the extent
+        lo, hi = [np.inf, np.inf], [-np.inf, -np.inf]
+        for g in range(md.num_row_groups):
+            t = pf.read_row_group(g, columns=cols[:2])
+            for k in (0, 1):
+                v = t.column(k).to_numpy(zero_copy_only=False)
+                if len(v):
+                    lo[k], hi[k] = min(lo[k], float(np.nanmin(v))), max(hi[k], float(np.nanmax(v)))
+    if not (np.isfinite(lo).all() and np.isfinite(hi).all()):
+        raise importer.ImportError_(f"{Path(path).name} has no transcript positions")
+    nx, ny = int((hi[0] - lo[0]) // bin_um) + 1, int((hi[1] - lo[1]) // bin_um) + 1
+    if nx * ny > 5e7:
+        raise importer.ImportError_(f"the transcript extent ({nx} x {ny} bins) is implausibly large")
+    H = np.zeros(nx * ny, np.int64)
+    for g in range(md.num_row_groups):
+        t = pf.read_row_group(g, columns=cols)
+        x, y = t.column("x_location").to_numpy(zero_copy_only=False), t.column("y_location").to_numpy(zero_copy_only=False)
+        m = np.isfinite(x) & np.isfinite(y)
+        if "qv" in cols:
+            m &= t.column("qv").to_numpy(zero_copy_only=False) >= min_qv
+        if "is_gene" in cols:
+            m &= t.column("is_gene").to_numpy(zero_copy_only=False).astype(bool)
+        H += np.bincount(((x[m] - lo[0]) // bin_um).astype(np.int64) * ny + ((y[m] - lo[1]) // bin_um).astype(np.int64), minlength=nx * ny)
+    return float(lo[0]), float(lo[1]), H.reshape(nx, ny)
+
+
+def auto_tx_threshold(H):
+    """Minimum transcripts per bin that counts as tissue when the user gives none: 0.5% of the median count of the busiest quarter of the occupied bins
+    (about 120 per 100 µm bin on a 5000-gene panel, where tissue bins hold thousands and cell-free background a handful), never below 5."""
+    nz = H[H > 0]
+    if not len(nz):
+        return 5
+    top = nz[nz >= np.percentile(nz, 75)]
+    return int(max(5, round(0.005 * float(np.median(top)))))
 
 
 class Session:
@@ -374,24 +434,74 @@ class Session:
         if "pca" in src:
             p = pd.read_csv(src["pca"]); p = p.set_index(p.columns[0])
             self.emb["pca"] = p.reindex(ids)
-        self._auto = {}
+        self._auto, self._txview = {}, {}
         self.xy32 = np.column_stack([self.x, self.y]).astype(np.float32)
         log(f"{self.n:,} cells x {self.n_genes:,} genes ready")
 
     # ---- tissue detection --------------------------------------------------------------------------------------------------------
-    def auto(self, gap, min_cells, min_counts):
+    def tx_grid(self):
+        """Transcript counts per bin of the run (read once, then kept): (x origin, y origin, counts)."""
+        if getattr(self, "_txg", None) is None:
+            p = self.src.get("tx") or self.src.get("tx_probe")
+            if not p:
+                raise importer.ImportError_("tissue detection from transcripts needs transcripts.parquet, and this run has none that could be found. For a .tar.gz or .zip "
+                                            "bundle the transcripts have to be extracted: tick the transcripts option and read the run again.")
+            self._txg = tx_density(p)
+        return self._txg
+
+    def piece_boxes(self, gap, min_cells, min_counts, detect, tx_min):
+        """{piece id: [x0, y0, x1, y1]} of the detected tissues: the extent of the piece's cells, or (transcript detection) of its transcript bins."""
+        comp, comps = self.auto(gap, min_cells, min_counts, detect, tx_min)
+        tv = self._txview.get((round(float(gap), 3), int(min_cells), int(min_counts), "transcripts", int(tx_min))) if detect == "transcripts" else None
+        out = {}
+        for c in comps:
+            if c["id"] <= 0:
+                continue
+            if tv is not None and c["id"] in tv["boxes"]:
+                out[c["id"]] = [round(float(v), 1) for v in tv["boxes"][c["id"]]]
+            else:
+                m = comp == c["id"]
+                if m.any():
+                    out[c["id"]] = [round(float(self.x[m].min()), 1), round(float(self.y[m].min()), 1), round(float(self.x[m].max()), 1), round(float(self.y[m].max()), 1)]
+        return out
+
+    def tx_payload(self, gap, min_cells, min_counts, detect, tx_min):
+        """Transcript density for display (None in cell mode): the bins that hold transcripts as flat [x bin, y bin, brightness 0-255 (log scale), tissue id] quadruples."""
+        self.auto(gap, min_cells, min_counts, detect, tx_min)
+        v = self._txview.get((round(float(gap), 3), int(min_cells), int(min_counts), "transcripts", int(tx_min))) if detect == "transcripts" else None
+        if v is None:
+            return None
+        H = v["counts"]
+        xs, ys = np.nonzero(H)
+        c = H[xs, ys].astype(np.float64)
+        top = max(float(np.percentile(c, 99.5)), 1.0)
+        bright = np.clip(np.round(255 * np.log1p(c) / np.log1p(top)), 1, 255).astype(np.int64)
+        return {"ox": v["ox"], "oy": v["oy"], "bin": v["bin"], "thr": v["thr"], "q": np.column_stack([xs, ys, bright, v["lab"][xs, ys]]).astype(np.int64).ravel().tolist()}
+
+    def auto(self, gap, min_cells, min_counts, detect="cells", tx_min=0):
         """Connected components of the cell-density map. Returns (comp id per cell: -1 = below min_counts, 0 = isolated cell,
         1..K = pieces in the order they would be named, sorted by x), and a list of piece descriptions."""
-        key = (round(float(gap), 3), int(min_cells), int(min_counts))
+        detect = "transcripts" if detect == "transcripts" else "cells"
+        key = (round(float(gap), 3), int(min_cells), int(min_counts), detect, int(tx_min) if detect == "transcripts" else 0)
         if key in self._auto:
             return self._auto[key]
         ok = self.gene_counts >= min_counts
-        ix = ((self.x - self.x.min()) // BIN_UM).astype(np.int64)
-        iy = ((self.y - self.y.min()) // BIN_UM).astype(np.int64)
-        nx, ny = ix.max() + 1, iy.max() + 1
-        H = np.bincount((ix * ny + iy)[ok], minlength=nx * ny).reshape(nx, ny)
-        occ = H >= 2
-        it = max(0, int(math.ceil(gap / (2 * BIN_UM))))
+        if detect == "transcripts":                          # tissue = bins with enough transcripts, wherever the cells are
+            ox, oy, Ht = self.tx_grid()
+            nx, ny = Ht.shape
+            ix = np.clip(((self.x - ox) // TX_BIN_UM).astype(np.int64), 0, nx - 1)
+            iy = np.clip(((self.y - oy) // TX_BIN_UM).astype(np.int64), 0, ny - 1)
+            thr = int(tx_min) if int(tx_min) > 0 else auto_tx_threshold(Ht)
+            self.tx_threshold = thr
+            occ = Ht >= thr
+        else:
+            ix = ((self.x - self.x.min()) // BIN_UM).astype(np.int64)
+            iy = ((self.y - self.y.min()) // BIN_UM).astype(np.int64)
+            nx, ny = ix.max() + 1, iy.max() + 1
+            H = np.bincount((ix * ny + iy)[ok], minlength=nx * ny).reshape(nx, ny)
+            occ = H >= 2
+        B = TX_BIN_UM if detect == "transcripts" else BIN_UM
+        it = max(0, int(math.ceil(gap / (2 * B))))
         dil = ndimage.binary_dilation(occ, iterations=it) if it else occ
         lab, k = ndimage.label(dil, structure=np.ones((3, 3), int))
         cell_lab = lab[ix, iy]
@@ -407,7 +517,16 @@ class Session:
             remap[old] = new
             is_big = old in big
             nb = sum(1 for o in order[:new] if o in big)
-            comps.append({"id": new, "n": int(cnt[old]), "name": f"tissue_{nb}" if is_big else f"small_piece_{new - len(big)}", "keep": bool(is_big)})
+            comps.append({"id": new, "n": int(cnt[old]), "name": f"T{nb - 1}" if is_big else f"S{new - len(big) - 1}", "keep": bool(is_big)})
+        if detect == "transcripts":                              # what a viewer needs: the density, the tissue of every bin, and each piece's box around its bins
+            bl = remap[lab]
+            boxes = {}
+            for c in comps:
+                m = occ & (bl == c["id"])
+                if m.any():
+                    xs, ys = np.nonzero(m)
+                    boxes[c["id"]] = [ox + xs.min() * B, oy + ys.min() * B, ox + (xs.max() + 1) * B, oy + (ys.max() + 1) * B]
+            self._txview[key] = {"ox": ox, "oy": oy, "bin": B, "counts": Ht, "lab": bl, "boxes": boxes, "thr": thr}
         comp = np.where(ok, remap[cell_lab], -1)
         n0 = int(((comp == 0)).sum())
         if n0:
@@ -418,8 +537,11 @@ class Session:
     def labels(self, spec):
         """Apply the user's edits. Returns (names, idx per cell (-1 = dropped, -2 = below min_counts), pieces, per-name counts)."""
         gap, mc, mn = float(spec.get("gap", 200)), int(spec.get("min_cells", 500)), int(spec.get("min_counts", 1))
-        comp, comps = self.auto(gap, mc, mn)
+        comp, comps = self.auto(gap, mc, mn, spec.get("detect", "cells"), int(spec.get("tx_min", 0) or 0))
         edits = spec.get("comps", {}) or {}
+        auto_off = bool(spec.get("auto_off"))                       # tissue boxes loaded from a GeoJSON define the tissues: detected pieces start switched off
+        if auto_off:
+            comps = [{**c, "keep": False} for c in comps]
         nm, kp = {}, {}
         for c in comps:
             e = edits.get(str(c["id"]), {})
@@ -454,15 +576,10 @@ class Session:
         return order, idx, comps, counts
 
     def _inside(self, r):
-        """Cells inside a drawn shape: a rectangle {x0,y0,x1,y1} or a free-hand polygon {pts: [[x, y], ...]}."""
+        """Cells inside a drawn shape: a rectangle {x0,y0,x1,y1} or a free-hand polygon {pts: [[x, y], ...], holes?: [[[x, y], ...], ...]}."""
         if r.get("pts"):
             import shapely
-            from shapely.geometry import Polygon
-            from shapely.validation import make_valid
-            pts = np.asarray(r["pts"], float)
-            if pts.ndim != 2 or pts.shape[1] != 2 or len(pts) < 3 or len(pts) > 5000 or not np.isfinite(pts).all():
-                raise importer.ImportError_("a drawn shape needs 3 to 5000 valid points")
-            g = make_valid(Polygon(pts))
+            g = shape_geom(r)
             x0, y0, x1, y1 = g.bounds
             sel = np.zeros(self.n, bool)
             m = (self.x >= x0) & (self.x <= x1) & (self.y >= y0) & (self.y <= y1)
@@ -515,6 +632,61 @@ class Session:
         if cstate is None:
             cstate = ctype
         return np.asarray(ctype, dtype=object), np.asarray(cstate, dtype=object), extra
+
+
+class Light(Session):
+    """A run without its counts matrix: cell centroids and per-cell transcript counts only. Enough to detect tissues, draw shapes on them and preview
+    the result (the slide gallery of the batch import). The per-cell counts stand in for the panel-gene counts the full import uses, so with a
+    'minimum transcripts per cell' above 1 the pieces can differ slightly from the converted ones; the shapes are plain coordinates and do not."""
+
+    def __init__(self, src, log=lambda m: None):
+        self.src, self.log, self.meta = src, log, {}
+        key = "cells_parquet" if "cells_parquet" in src else "cells_csv"
+        p = Path(src[key])
+        want = ("x_centroid", "y_centroid", "transcript_counts")
+        if p.name.endswith(".parquet"):
+            import pyarrow.parquet as pq
+            have = set(pq.ParquetFile(p).schema.names)
+            c = pd.read_parquet(p, columns=[k for k in want if k in have])
+        else:
+            c = pd.read_csv(p, usecols=lambda k: k in want)
+        for col in want[:2]:
+            if col not in c.columns:
+                raise importer.ImportError_(f"cells table has no column {col}")
+        c = c.dropna(subset=list(want[:2]))
+        self.x = c["x_centroid"].values.astype(np.float64)
+        self.y = c["y_centroid"].values.astype(np.float64)
+        self.n = len(self.x)
+        if not self.n:
+            raise importer.ImportError_("the cells table is empty")
+        self.gene_counts = c["transcript_counts"].fillna(0).values.astype(np.int64) if "transcript_counts" in c.columns else np.ones(self.n, np.int64)
+        self._auto, self._txview = {}, {}
+        self.xy32 = np.column_stack([self.x, self.y]).astype(np.float32)
+
+    def thumb_polys(self, gap, min_cells, min_counts, detect, tx_min, comp, comps):
+        """The carved box of every kept piece (default names), as {piece id: polygons}, for the gallery thumbnails."""
+        spec = {"gap": gap, "min_cells": min_cells, "min_counts": min_counts, "detect": detect, "tx_min": tx_min}
+        names, idx, _, _ = self.labels(spec)
+        by_name = {c["name"]: c["id"] for c in comps}
+        return {str(by_name[p["name"]]): p["polys"] for p in polys_payload(tissue_boxes(self, spec, names, idx)) if p["name"] in by_name}
+
+    def thumb(self, gap, min_cells, min_counts, max_pts=12000, detect="cells", tx_min=0):
+        """What a thumbnail needs: a thinned set of cells (whole micrometres) with the piece each belongs to, and every piece's name and bounding box."""
+        comp, comps = self.auto(gap, min_cells, min_counts, detect, tx_min)
+        sel = np.arange(0, self.n, max(1, self.n // max_pts))
+        pieces = []
+        tv = self._txview.get((round(float(gap), 3), int(min_cells), int(min_counts), "transcripts", int(tx_min))) if detect == "transcripts" else None
+        for c in comps:
+            m = comp == c["id"]
+            if tv is not None and c["id"] in tv["boxes"]:
+                pieces.append({**c, "bbox": [round(v) for v in tv["boxes"][c["id"]]]})              # the box around the piece's transcript bins
+            elif c["id"] > 0 and m.any():
+                pieces.append({**c, "bbox": [round(float(self.x[m].min())), round(float(self.y[m].min())), round(float(self.x[m].max())), round(float(self.y[m].max()))]})
+            else:
+                pieces.append({**c, "bbox": None})
+        return {"n": int(self.n), "bounds": view_bounds(self),
+                "xy": np.column_stack([np.round(self.x[sel]), np.round(self.y[sel])]).astype(np.int32).ravel().tolist(), "comp": comp[sel].astype(int).tolist(), "comps": pieces,
+                "grid": self.tx_payload(gap, min_cells, min_counts, detect, tx_min), "polys": self.thumb_polys(gap, min_cells, min_counts, detect, tx_min, comp, comps)}
 
 
 def _read_annotation(p):
@@ -703,7 +875,384 @@ def _fmt_int(x):
     return int(round(float(x)))
 
 
-def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None, tx_table=None, threads=1):
+def shape_geom(r):
+    """The polygon of a drawn shape: a rectangle {x0,y0,x1,y1}, or a free-hand outline {pts} with optional holes {holes: [ring, ...]} (a tissue box
+    loaded from a GeoJSON can have holes, e.g. a tissue box with another tissue's box cut out of it). Made valid."""
+    from shapely.geometry import box, Polygon
+    from shapely.validation import make_valid
+    if not r.get("pts"):
+        x0, x1 = sorted((float(r["x0"]), float(r["x1"]))); y0, y1 = sorted((float(r["y0"]), float(r["y1"])))
+        return box(x0, y0, x1, y1)
+    rings = [r["pts"]] + list(r.get("holes") or [])
+    if len(rings) > 200:
+        raise importer.ImportError_("a drawn shape has too many holes")
+    arr = []
+    for q in rings:
+        a = np.asarray(q, float)
+        if a.ndim != 2 or a.shape[1] != 2 or len(a) < 3 or len(a) > 5000 or not np.isfinite(a).all():
+            raise importer.ImportError_("a drawn shape needs 3 to 5000 valid points per outline")
+        arr.append(a)
+    return make_valid(Polygon(arr[0], arr[1:]))
+
+
+def _ring_pts(coords):
+    """Shapely ring coordinates -> [[x, y], ...] without the closing point, rounded to 0.1 um."""
+    c = [[round(float(x), 1), round(float(y), 1)] for x, y in list(coords)[:-1]]
+    return c
+
+
+def _poly_shape(q, name, keep):
+    """A shapely Polygon -> a drawn shape: a rectangle when it is an axis-aligned box, else a free-hand outline (with holes), simplified to at most 2000
+    points per outline (tolerance 0.5 um, doubled until it fits)."""
+    x0, y0, x1, y1 = q.bounds
+    if not q.interiors and len(q.exterior.coords) <= 6 and abs(q.area - (x1 - x0) * (y1 - y0)) <= 1e-6 * max(1.0, q.area):
+        return {"x0": round(x0, 1), "y0": round(y0, 1), "x1": round(x1, 1), "y1": round(y1, 1), "name": name, "keep": keep}
+    npts = lambda g: max([len(g.exterior.coords)] + [len(i.coords) for i in g.interiors])
+    g, tol = q, 0.5
+    while npts(g) > 2001:
+        g = q.simplify(tol, preserve_topology=True)
+        tol *= 2
+    r = {"pts": _ring_pts(g.exterior.coords), "name": name, "keep": keep}
+    holes = [_ring_pts(i.coords) for i in g.interiors if len(i.coords) >= 4]
+    if holes:
+        r["holes"] = holes
+    return r
+
+
+def load_tissue_boxes(path, name_col=None):
+    """Read a tissue-box GeoJSON (the <name>_regions.geojson written by write_regions, or any FeatureCollection of polygons in Xenium um) back as the
+    shapes that separate the tissues on the slide. Only for telling tissues apart: nothing here becomes the project's anatomical regions
+    (regions.geojson, the outlines within a tissue). Returns
+    {shapes, tissues: [{name, polys}], name_col, n_tissues, n_removed, n_skipped, source}. Each exported tissue box becomes a kept shape named after the
+    tissue (a tissue of several pieces becomes several shapes of one name); an exported drawn region that was switched off becomes a removal shape;
+    kept drawn regions are skipped (their tissue box already holds them, cut where it met another tissue). A file without tissue features (another
+    tool's) has every polygon loaded as a kept shape, or a removal shape when its "keep" property is false. The import then switches the detected
+    tissues off (spec auto_off), so these shapes define the tissues."""
+    from shapely.geometry import shape as sshape
+    from shapely.validation import make_valid
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise importer.ImportError_(f"not found: {p}")
+    try:
+        gj = json.loads(p.read_text())
+    except (OSError, ValueError) as e:
+        raise importer.ImportError_(f"{p.name} is not a readable GeoJSON file: {e}")
+    feats = gj.get("features") if isinstance(gj, dict) and gj.get("type") == "FeatureCollection" else [gj] if isinstance(gj, dict) and gj.get("type") == "Feature" else None
+    if not feats:
+        raise importer.ImportError_(f"{p.name} is not a GeoJSON FeatureCollection with features")
+    col = (name_col or "").strip() or gj.get("name_column") or "sample_id_unblinded"
+
+    def name_of(props, i):
+        for k in (col, gj.get("name_column"), "sample_id_unblinded", "name", "Name", "label", "id"):
+            if k and props.get(k) not in (None, ""):
+                return str(props[k]).strip()
+        return f"region_{i + 1}"
+
+    def polys(f):
+        try:
+            g = make_valid(sshape(f.get("geometry")))
+        except Exception:
+            return []
+        return [q for q in ([g] if g.geom_type == "Polygon" else getattr(g, "geoms", [])) if q.geom_type == "Polygon" and not q.is_empty and q.area > 0]
+
+    has_tissue = any((f.get("properties") or {}).get("role") == "tissue" for f in feats)
+    keep_shapes, removal, skipped, tissues = [], [], 0, {}
+    for i, f in enumerate(feats):
+        pr = f.get("properties") or {}
+        role, keep = pr.get("role"), pr.get("keep", True) is not False
+        qs = polys(f)
+        if not qs:
+            skipped += 1
+            continue
+        nm = name_of(pr, i)
+        if has_tissue and role == "drawn region" and keep:
+            skipped += 1                                                       # held by its tissue box
+            continue
+        if not keep:
+            removal += [_poly_shape(q, nm, False) for q in qs]
+            continue
+        keep_shapes += [_poly_shape(q, nm, True) for q in qs]
+        tissues.setdefault(nm, []).extend(qs)
+    if not keep_shapes:
+        raise importer.ImportError_(f"{p.name} has no tissue boxes or drawn shapes to load")
+    shapes = keep_shapes + removal                                             # removal shapes last, so they take their cells out of any tissue
+    if len(shapes) > 200:
+        raise importer.ImportError_(f"{p.name} has {len(shapes)} polygons; at most 200 shapes per run can be loaded")
+    tl = [{"name": n, "polys": [[r["pts"]] + r.get("holes", []) if r.get("pts") else [[[r["x0"], r["y0"]], [r["x1"], r["y0"]], [r["x1"], r["y1"]], [r["x0"], r["y1"]]]]
+                                for r in keep_shapes if r["name"] == n]} for n in tissues]
+    return {"shapes": shapes, "tissues": tl, "name_col": col, "n_tissues": len(tissues), "n_removed": len(removal), "n_skipped": skipped, "source": str(p)}
+
+
+def find_tissue_file(folder, run):
+    """The tissue-box file <run>_regions.geojson of a batch run: in `folder`, in folder/<run>/, or one more level down (an output folder of an earlier batch import). None if absent."""
+    d, fn = Path(folder).expanduser(), regions_filename(run)
+    for c in (d / fn, d / run / fn):
+        if c.is_file():
+            return c
+    hits = sorted(d.glob(f"*/{fn}")) + sorted(d.glob(f"*/*/{fn}"))
+    return hits[0] if hits else None
+
+
+def regions_filename(slide):
+    """<slide name>_regions.geojson, the slide name made safe for a file name."""
+    return (re.sub(r"[^A-Za-z0-9._-]+", "_", str(slide)).strip("_") or "slide") + "_regions.geojson"
+
+
+ERODE_UM = 20.0                                 # boxes of neighbouring tissues keep this distance from the cut between them (each is pulled back by it)
+
+
+def _split_overlap(o, xa, ya, xb, yb):
+    """The parts of the overlap polygon `o` that lie nearer to the cells of A and nearer to the cells of B: (part of A, part of B). Done on a pixel grid
+    (20 um or coarser) by the nearest cell, so a cell of either tissue is always on its own side."""
+    import shapely
+    from scipy.spatial import cKDTree
+    from shapely.geometry import box as sbox
+    from shapely.ops import unary_union
+    x0, y0, x1, y1 = o.bounds
+    px = max(20.0, max(x1 - x0, y1 - y0) / 300.0)
+    nx, ny = int(math.ceil((x1 - x0) / px)), int(math.ceil((y1 - y0) / px))
+    gx, gy = np.meshgrid(x0 + (np.arange(nx) + 0.5) * px, y0 + (np.arange(ny) + 0.5) * px, indexing="ij")
+    inside = shapely.contains_xy(o, gx.ravel(), gy.ravel()).reshape(nx, ny)
+    ka, kb = max(1, len(xa) // 60000), max(1, len(xb) // 60000)
+    da = cKDTree(np.column_stack([xa[::ka], ya[::ka]])).query(np.column_stack([gx.ravel(), gy.ravel()]))[0].reshape(nx, ny)
+    db = cKDTree(np.column_stack([xb[::kb], yb[::kb]])).query(np.column_stack([gx.ravel(), gy.ravel()]))[0].reshape(nx, ny)
+    near_a = inside & (da <= db)
+    rects = []
+    for iy in range(ny):                                     # runs of A pixels in every row, as rectangles
+        row = near_a[:, iy]
+        ix = 0
+        while ix < nx:
+            if row[ix]:
+                j = ix
+                while j + 1 < nx and row[j + 1]:
+                    j += 1
+                rects.append(sbox(x0 + ix * px, y0 + iy * px, x0 + (j + 1) * px, y0 + (iy + 1) * px))
+                ix = j + 1
+            else:
+                ix += 1
+    oa = unary_union(rects).intersection(o) if rects else o.difference(o)
+    return oa, o.difference(oa)
+
+
+def _disjoint_boxes(items, erode_um=ERODE_UM):
+    """Make tissue bounding boxes non-overlapping and apart. `items` = [(name, box polygon, x, y)] with the coordinates of the tissue's own cells;
+    returns the geometries in the same order. Where two boxes overlap, the overlap is divided between the two tissues by which one's cells are nearer
+    (each box loses the part that went to the other), and then each box is pulled back by `erode_um` from the other, so the two never touch: a
+    transcript can fall in at most one box. A box may become a rectangle with a notch, or several pieces."""
+    g = [it[1] for it in items]
+    pairs = []
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            o = g[i].intersection(g[j])
+            if o.is_empty or o.area <= 0:
+                continue
+            oa, ob = _split_overlap(o, items[i][2], items[i][3], items[j][2], items[j][3])
+            g[i], g[j] = g[i].difference(ob), g[j].difference(oa)
+            pairs.append((i, j))
+    pre = list(g)
+    for i, j in pairs:
+        g[i] = g[i].difference(pre[j].buffer(erode_um))
+        g[j] = g[j].difference(pre[i].buffer(erode_um))
+    return g
+
+
+
+def _data_bounds(sess):
+    """The extent [x0, y0, x1, y1] of the run's data: all its cells, and its transcript bins when those were read (transcript detection)."""
+    b = [float(sess.x.min()), float(sess.y.min()), float(sess.x.max()), float(sess.y.max())]
+    g = getattr(sess, "_txg", None)
+    if g is not None:
+        ox, oy, H = g
+        b = [min(b[0], float(ox)), min(b[1], float(oy)), max(b[2], float(ox) + H.shape[0] * TX_BIN_UM), max(b[3], float(oy) + H.shape[1] * TX_BIN_UM)]
+    return b
+
+
+# The full Xenium slide, in the frame of the cell coordinates: the largest imaged area seen on 11 real runs (10 kidney runs, Xenium software 3.0 and
+# 4.0, plus one more), 10,867 um wide (51,138 px at 0.2125 um/px, run slidearray0073) by 23,817 um long (112,078 px, run slidearray0140). Each run's own
+# morphology image covers only its scanned region (from 7,862 x 20,208 um to that size), so the image is not read: the same slide is used for every
+# run. Coordinates start at the corner of the area that was exported; some outputs hold only half a slide (the lung preview run: data within
+# 10,816 x 10,128 um), which the coordinates show: all data within half the length (or width).
+XENIUM_SLIDE_UM = (10867.0, 23817.0)
+
+
+def slide_bounds(sess):
+    """The slide's extent [x0, y0, x1, y1] in micrometres, which tissue boxes and drawn shapes are capped at: the Xenium imaged area (XENIUM_SLIDE_UM),
+    each dimension halved when all the data lies within its first half (an output that holds half a slide), and widened if any data lies outside it."""
+    d = _data_bounds(sess)
+    ext = []
+    for k, full in enumerate(XENIUM_SLIDE_UM):
+        ext.append(full / 2 if d[k + 2] <= full / 2 else full)
+    return [min(d[0], 0.0), min(d[1], 0.0), max(d[2], ext[0]), max(d[3], ext[1])]
+
+
+def view_bounds(sess):
+    """What the review canvases show: the data's extent plus room for the largest box growth (200 um), within the slide."""
+    d, sl, m = _data_bounds(sess), slide_bounds(sess), max(DILATE_STEPS_UM)
+    return [max(sl[0], d[0] - m), max(sl[1], d[1] - m), min(sl[2], d[2] + m), min(sl[3], d[3] + m)]
+
+
+DILATE_STEPS_UM = (200.0, 100.0, 50.0, 20.0)    # a detected tissue box grows by the first of these that keeps it clear of every other box
+
+
+def _dilate_boxes(boxes, steps=DILATE_STEPS_UM, keep_um=ERODE_UM, limit=None, fixed=None):
+    """Grow every tissue box on both sides of a dimension, first along its length (longer side), then along its breadth. For each dimension the
+    first of `steps` (200, 100, 50, 20 um) is used whose grown box comes no nearer than `keep_um` to any other box (detected, drawn rectangle or
+    free-hand) than it already was, i.e. makes no new overlap or near-contact; if none does, that dimension keeps its original extent. Growth stops at
+    `limit` = [x0, y0, x1, y1] (the slide). Boxes with fixed[i] true (drawn shapes) are not grown but are obstacles. Boxes are processed in order
+    against the current (possibly already grown) others. Returns new geometries."""
+    from shapely.geometry import box
+    out = list(boxes)
+    for i, b in enumerate(boxes):
+        if fixed and fixed[i]:
+            continue
+        x0, y0, x1, y1 = b.bounds
+        dims = ("x", "y") if (x1 - x0) >= (y1 - y0) else ("y", "x")
+        for d in dims:
+            cur = box(x0, y0, x1, y1).buffer(keep_um)
+            others = [(o, cur.intersection(o).area) for j, o in enumerate(out) if j != i]
+            for st in steps:
+                c = [x0 - st, y0, x1 + st, y1] if d == "x" else [x0, y0 - st, x1, y1 + st]
+                if limit is not None:                       # capped at the slide, but never shrunk below the original box
+                    c = [max(c[0], min(limit[0], x0)), max(c[1], min(limit[1], y0)), min(c[2], max(limit[2], x1)), min(c[3], max(limit[3], y1))]
+                grown = box(*c).buffer(keep_um)
+                if all(grown.intersection(o).area <= a + 1e-6 for o, a in others):
+                    x0, y0, x1, y1 = c
+                    break
+        out[i] = box(x0, y0, x1, y1)
+    return out
+
+
+def _drawn_geoms(spec, limit):
+    """{tissue name: union of its kept drawn shapes, capped at the slide `limit`}."""
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+    by = {}
+    for r in spec.get("rects", []) or []:
+        if not r.get("keep", True):
+            continue
+        n = str(r.get("name") or "region").strip() or "region"
+        g = shape_geom(r).intersection(box(*limit))
+        if not g.is_empty and g.area > 0:
+            by.setdefault(n, []).append(g)
+    return {n: unary_union(gs) for n, gs in by.items()}
+
+
+def tissue_boxes(sess, spec, order, idx):
+    """The bounding box of every tissue after the cell labels in `idx` (index into `order`): [{name, box, geom, n, x, y, cut, outside}], a tissue made by
+    drawn shapes has the drawn outline as its box (not grown); a detected tissue's box is grown by up to 200 um (capped at the slide) where no other box
+    is near (see _dilate_boxes); boxes never overlap (see _disjoint_boxes); with spec cut_off (the default) the switched-off shapes (drawn with "use"
+    unticked) are cut out of the boxes, so nothing in such an area belongs to a tissue box. With transcript detection a box also grows to the transcript bins of its piece. Used by the export and by the review windows, so
+    what is shown is what is written."""
+    import shapely
+    from shapely.geometry import box
+    tis, fixed, tx_boxes, tx_comp = [], [], None, None
+    limit = slide_bounds(sess)
+    drawn = _drawn_geoms(spec, limit)
+    if spec.get("detect") == "transcripts":
+        k = (float(spec.get("gap", 200)), int(spec.get("min_cells", 500)), int(spec.get("min_counts", 1)), "transcripts", int(spec.get("tx_min", 0) or 0))
+        tx_comp, _ = sess.auto(*k)
+        v = sess._txview.get((round(k[0], 3),) + k[1:])
+        tx_boxes = v["boxes"] if v else None
+    for i, n in enumerate(order):
+        m = idx == i
+        if m.any():
+            x, y = sess.x[m], sess.y[m]
+            x0, y0, x1, y1 = float(x.min()), float(y.min()), float(x.max()), float(y.max())
+            if tx_boxes:                                                       # grow the box to the piece's transcript bins (a piece the drawn shapes did not split)
+                for c in np.unique(tx_comp[m]):
+                    if c > 0 and c in tx_boxes and ((tx_comp == c) & m).sum() >= 0.95 * (tx_comp == c).sum():
+                        b = tx_boxes[c]
+                        x0, y0, x1, y1 = min(x0, b[0]), min(y0, b[1]), max(x1, b[2]), max(y1, b[3])
+            if n in drawn:                                                     # a drawn tissue: its box is the outline that was drawn (plus any of its cells outside it)
+                g = drawn[n]
+                rest = ~shapely.intersects_xy(g.buffer(1.0), x, y)
+                if rest.any():
+                    g = g.union(box(float(x[rest].min()), float(y[rest].min()), float(x[rest].max()), float(y[rest].max())))
+                tis.append((n, g, x, y)); fixed.append(True)
+            else:
+                tis.append((n, box(x0, y0, x1, y1), x, y)); fixed.append(False)
+    # grow the detected boxes (200 -> 100 -> 50 -> 20 um, capped at the slide) where that touches no other box, then carve any overlap
+    tis = [(n, b, x, y) for (n, _, x, y), b in zip(tis, _dilate_boxes([t[1] for t in tis], limit=limit, fixed=fixed))]
+    geoms = _disjoint_boxes(tis)
+    if spec.get("cut_off", True):                                          # areas drawn with "use" unticked are cut out of every tissue box
+        from shapely.ops import unary_union
+        off = [shape_geom(r) for r in spec.get("rects", []) or [] if not r.get("keep", True)]
+        if off:
+            off = unary_union(off)
+            geoms = [g.difference(off) for g in geoms]
+    out = []
+    for (n, b, x, y), g in zip(tis, geoms):
+        cut = not g.equals(b)
+        out.append({"name": n, "box": b, "geom": g, "n": int(len(x)), "x": x, "y": y, "cut": cut,
+                    "outside": int((~shapely.intersects_xy(g, x, y)).sum()) if cut else 0})
+    return out
+
+
+def polys_payload(geoms):
+    """For the page: [{name, polys: [[ring, ...], ...]}] with rings as [[x, y], ...] (a tissue may be several polygons)."""
+    out = []
+    for t in geoms:
+        g = t["geom"]
+        parts = [g] if g.geom_type == "Polygon" else [q for q in getattr(g, "geoms", []) if q.geom_type == "Polygon"]
+        out.append({"name": t["name"], "polys": [[[[round(float(a), 1), round(float(b), 1)] for a, b in [*q.exterior.coords]]] + [[[round(float(a), 1), round(float(b), 1)] for a, b in r.coords] for r in q.interiors] for q in parts if not q.is_empty]})
+    return out
+
+
+def write_regions(sess, spec, order, idx, out, log, name_col="sample_id_unblinded", slide="slide", extra_dir=None):
+    """Export the import-time selection as GeoJSON (Xenium micrometre frame, y down, same as the cell table): one Feature per drawn
+    region (switched-off ones too, keep false, so the file can be loaded again) and one bounding box per kept tissue (with spec cut_off, the default,
+    the switched-off shapes are cut out of the boxes). Written to <out>/<slide>_regions.geojson, and also to `extra_dir` when one is given. A rectangle is exported as its box; a free-hand region as the outline that was traced
+    (the same valid polygon that selects the cells), not its convex hull. Tissue boxes never overlap or touch each other (see _disjoint_boxes: the overlap is divided between the two tissues by which one's cells are nearer, and each box is pulled back 20 um from the other). Returns the number of features."""
+    from shapely.geometry import box, mapping, Polygon
+    from shapely.validation import make_valid
+    name_col = (name_col or "").strip() or "sample_id_unblinded"
+    feats = []
+    ok = sess.gene_counts >= int(spec.get("min_counts", 1))
+    slide_box = box(*slide_bounds(sess))
+    for r in spec.get("rects", []) or []:
+        name = str(r.get("name") or "region").strip() or "region"
+        g, kind = shape_geom(r), ("freehand" if r.get("pts") else "rectangle")
+        g = g.intersection(slide_box)                                      # a drawn shape is capped at the slide
+        if g.is_empty:
+            continue
+        feats.append({"type": "Feature", "geometry": mapping(g),
+                      "properties": {name_col: name, "kind": kind, "role": "drawn region", "keep": bool(r.get("keep", True)),
+                                     "n_cells": int((sess._inside(r) & ok).sum()), "area_um2": round(float(g.area), 1)}})
+    for t in tissue_boxes(sess, spec, order, idx):
+        if t["outside"]:
+            log(f"tissue {t['name']}: {t['outside']} of its {t['n']:,} cells lie outside its box after the overlap with a neighbouring tissue was removed")
+        feats.append({"type": "Feature", "geometry": mapping(t["geom"]),
+                      "properties": {name_col: t["name"], "kind": "bounding box", "role": "tissue", "keep": True, "n_cells": t["n"], "switched_off_cut": bool(spec.get("cut_off", True)),
+                                     "area_um2": round(float(t["geom"].area), 1), "overlap_removed": bool(t["cut"]), "cells_outside": t["outside"]}})
+    fc = {"type": "FeatureCollection", "coordinate_unit": "um (Xenium frame, y down)", "name_column": name_col, "features": feats}
+    fn, txt = regions_filename(slide), json.dumps(fc)
+    (out / fn).write_text(txt)
+    where = [str(out / fn)]
+    if extra_dir:
+        d = Path(extra_dir).expanduser()
+        d.mkdir(parents=True, exist_ok=True)
+        (d / fn).write_text(txt)
+        where.append(str(d / fn))
+    log(f"exported {len(feats)} outline(s) (tissue boxes and drawn shapes) to " + " and ".join(where))
+    return len(feats)
+
+
+def export_tissue_boxes(sess, spec, folder, slide, name_col="sample_id_unblinded", overwrite=False):
+    """Write <slide>_regions.geojson (tissue boxes and drawn shapes, as write_regions) into `folder` now, without converting the run. Refuses to replace
+    an existing file unless `overwrite`. Returns the path written."""
+    d = Path(folder).expanduser()
+    f = d / regions_filename(slide)
+    if f.exists() and not overwrite:
+        raise FileExistsError(str(f))
+    d.mkdir(parents=True, exist_ok=True)
+    order, idx, _, _ = sess.labels(spec)
+    if not len(order):
+        raise importer.ImportError_(f"{slide}: no tissue is switched on")
+    write_regions(sess, spec, order, idx, d, lambda m: None, name_col, slide)
+    return str(f)
+
+
+def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None, tx_table=None, threads=1, export_regions=False, regions_name_col="sample_id_unblinded", regions_dir=None):
     """Write the project folder `out`; returns a short report. Refuses to touch a folder that is not a previous import of this kind."""
     out = Path(out).expanduser()
     if out.exists():
@@ -721,6 +1270,8 @@ def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None,
     log(f"{len(kept):,} of {sess.n:,} cells kept; {int((idx == -1).sum()):,} dropped by tissue selection, {int((idx == -2).sum()):,} below the minimum transcript count")
     ids = np.array(sess.ids, dtype=object)[kept]
 
+    slide = (project_name or "").strip() or f"{sess.meta.get('run_name', 'Xenium run')} / {sess.meta.get('region_name', '')}".strip(" /")
+    n_reg = write_regions(sess, spec, order, idx, out, log, regions_name_col, slide, regions_dir) if export_regions else None
     log("writing counts")
     m = sess.m[:, kept].tocoo()
     m = sp.coo_matrix((np.round(m.data).astype(np.int64), (m.row, m.col)), shape=m.shape)
@@ -795,7 +1346,7 @@ def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None,
         except if_image.IFError as e:
             log(f"IF image ignored: {e}")
     meta = sess.meta
-    name = (project_name or "").strip() or f"{meta.get('run_name', 'Xenium run')} / {meta.get('region_name', '')}".strip(" /")
+    name = slide
     manifest = {"name": name, "format_version": 2,
                 "roles": {"cell_id": "cell_id", "x": "x_centroid", "y": "y_centroid", "sample": "tissue", "cell_type": "cell_type", "cell_state": "cell_state"},
                 "norm_scale": 10000.0, "coordinate_unit": "um", "source": "xenium",
@@ -809,4 +1360,4 @@ def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None,
     write_signatures(out, sess.genes, log)
     (out / MARKER).write_text(json.dumps({"spec": spec, "tissues": counts, "n_cells": int(len(kept)), "n_genes": sess.n_genes,
                                           "min_counts_per_cell": int(spec.get("min_counts", 1)), "cells_without_boundary": n_nobnd}, indent=1))
-    return {"n_cells": int(len(kept)), "n_genes": sess.n_genes, "tissues": counts, "cells_without_boundary": n_nobnd, "transcripts": n_tx, "tissue_table": n_tab, "if": n_if}
+    return {"n_cells": int(len(kept)), "n_genes": sess.n_genes, "tissues": counts, "cells_without_boundary": n_nobnd, "transcripts": n_tx, "tissue_table": n_tab, "if": n_if, "regions_exported": n_reg}

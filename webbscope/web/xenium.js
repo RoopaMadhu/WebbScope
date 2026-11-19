@@ -54,7 +54,8 @@ async function loaded() {
   $("#herow").hidden = !i.he;
   if (i.he) { const c = i.he.czi, a = i.he.annotations; $("#hetxt").textContent = `Include the H&E (${c.file}: ${c.scenes.length} scene(s), ${c.px_um.toFixed(3)} µm/pixel` + (a ? `; ${a.n_regions} annotation polygons in ${a.names.filter((n) => n.n_regions).length} annotation names` : "") + "); building the tiles takes about a minute and about 0.5 GB"; }
   for (const s of ["#s2", "#s3", "#s4"]) $(s).hidden = false;
-  X.spec = { gap: +$("#p_gap").value, min_cells: +$("#p_minc").value, min_counts: +$("#p_mint").value, comps: {}, rects: [] };
+  X.sel = null; X.pending = null;
+  X.spec = { gap: +$("#p_gap").value, min_cells: +$("#p_minc").value, min_counts: +$("#p_mint").value, detect: "cells", tx_min: 0, comps: {}, rects: [], cut_off: $("#cutoff").checked }; $("#p_detect").value = "cells"; $("#p_txmin").value = ""; txUi();
   sizeCanvas(); refresh();
 }
 
@@ -69,15 +70,31 @@ const toData = (px, py) => [X.view.x0 + (px - 4) / X.view.s, X.view.y0 + (py - 4
 async function refresh() {
   const tok = ++X.tok;
   const r = await post("/api/xenium/preview", X.spec);
-  if (!r.ok) { $("#cnote").textContent = await r.text(); return; }
+  if (!r.ok) { let m = ""; try { m = JSON.parse(await r.text()).detail; } catch (e) { /* plain text */ } $("#cnote").textContent = m || "preview failed"; if (X.spec.detect === "transcripts") { X.spec.detect = "cells"; $("#p_detect").value = "cells"; txUi(); $("#cnote").textContent += " (back to cell density)"; } return; }
   const d = await r.json(); if (tok !== X.tok) return;
-  X.prev = d; draw(); table();
+  X.prev = d; draw(); table(); xSelBar();
+  if (X.spec.detect === "transcripts") $("#txnote").textContent = `Transcript detection: a bin counts as tissue with at least ${d.tx_threshold ?? "?"} transcripts` + (X.spec.tx_min ? "." : " (chosen automatically).");
+}
+// transcript density: one tinted square per bin (brightness = log count, colour = the tissue of the bin, grey = no tissue), written into the pixels before the cells
+function fillBins(u, W, H, grid, view, colorOf) {
+  const bs = Math.max(1, Math.ceil(grid.bin * view.s)), q = grid.q, bg = [16, 18, 22];
+  for (let i = 0; i < q.length; i += 4) {
+    const col = q[i + 3] > 0 ? colorOf(q[i + 3]) : null, b = q[i + 2] / 255, a = col ? 0.15 + 0.6 * b : 0.05 + 0.3 * b, c = col || [138, 147, 166];
+    const v = (255 << 24) | (((bg[2] + (c[2] - bg[2]) * a) | 0) << 16) | (((bg[1] + (c[1] - bg[1]) * a) | 0) << 8) | ((bg[0] + (c[0] - bg[0]) * a) | 0);
+    const px0 = (4 + (grid.ox + q[i] * grid.bin - view.x0) * view.s) | 0, py0 = (4 + (grid.oy + q[i + 1] * grid.bin - view.y0) * view.s) | 0;
+    for (let y = Math.max(0, py0); y < Math.min(H, py0 + bs); y++) for (let x = Math.max(0, px0); x < Math.min(W, px0 + bs); x++) u[y * W + x] = v;
+  }
 }
 function hex(c) { return [parseInt(c.slice(1, 3), 16), parseInt(c.slice(3, 5), 16), parseInt(c.slice(5, 7), 16)]; }
 function draw() {
   const cv = $("#cv"), ctx = cv.getContext("2d"), W = cv.width, H = cv.height, img = ctx.createImageData(W, H), u = new Uint32Array(img.data.buffer);
   const pal = X.prev.names.map((_, i) => { const [r, g, b] = hex(PAL[i % PAL.length]); return (255 << 24) | (b << 16) | (g << 8) | r; }), grey = (255 << 24) | (85 << 16) | (85 << 8) | 85;
   const L = X.prev.labels, v = X.view;
+  if (X.prev.grid) {                               // transcript density under the cells
+    const rgb = {};
+    for (const c of X.prev.comps) { const e = X.spec.comps[c.id] || {}, k = X.prev.names.indexOf(e.name ?? c.name); rgb[c.id] = (e.keep ?? c.keep) && k >= 0 ? hex(PAL[k % PAL.length]) : null; }
+    fillBins(u, W, H, X.prev.grid, v, (id) => rgb[id]);
+  }
   for (let i = 0; i < L.length; i++) {
     const l = L[i]; if (l === -2) continue;
     const px = (4 + (X.xy[2 * i] - v.x0) * v.s) | 0, py = (4 + (X.xy[2 * i + 1] - v.y0) * v.s) | 0;
@@ -88,38 +105,90 @@ function draw() {
   for (const r of X.spec.rects) {
     ctx.strokeStyle = r.keep ? "#ffffff" : "#ff8a80"; ctx.fillStyle = ctx.strokeStyle;
     if (r.pts) {
-      ctx.beginPath(); r.pts.forEach((q, k) => { const [x, y] = toPx(q[0], q[1]); k ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.closePath(); ctx.stroke();
-      const [x, y] = toPx(r.pts[0][0], r.pts[0][1]); ctx.fillText(r.name + (r.keep ? "" : " (removed)"), x + 3, y - 3);
+      SE.ringsPath(ctx, r, toPx); ctx.stroke();
+      const [x, y] = toPx(r.pts[0][0], r.pts[0][1]); SE.label(ctx, r.name + (r.keep ? "" : " (removed)"), x + 3, y < 14 ? y + 13 : y - 4, ctx.strokeStyle);
     } else {
       const [ax, ay] = toPx(Math.min(r.x0, r.x1), Math.min(r.y0, r.y1)), [bx, by] = toPx(Math.max(r.x0, r.x1), Math.max(r.y0, r.y1));
-      ctx.strokeRect(ax, ay, bx - ax, by - ay); ctx.fillText(r.name + (r.keep ? "" : " (removed)"), ax + 3, ay + 12);
+      ctx.strokeRect(ax, ay, bx - ax, by - ay); SE.label(ctx, r.name + (r.keep ? "" : " (removed)"), ax + 3, ay + 13, ctx.strokeStyle);
     }
   }
+  SE.paintBoxes(ctx, xBoxes(), toPx, xInfo, X.sel, (id, name) => polysByName(X.prev, name)); SE.paintSel(ctx, X.spec.rects, X.sel, toPx);
   ctx.setLineDash([]);
   $("#cnote").textContent = `${fmt(X.prev.n_kept)} cells in ${X.prev.names.length} tissue(s)` + (X.prev.n_below_min ? `; ${fmt(X.prev.n_below_min)} below the transcript minimum are hidden` : "") + "; grey = switched off";
 }
 function table() {
   const tb = $("#ttab tbody"); tb.innerHTML = "";
-  const row = (cls, keep, name, n, onKeep, onName, onDel) => {
-    const tr = document.createElement("tr"); tr.className = cls;
+  const row = (cls, keep, name, n, onKeep, onName, onDel, selected, onSel) => {
+    const tr = document.createElement("tr"); tr.className = cls + (selected ? " selrow" : ""); tr.addEventListener("click", (e) => { if (!e.target.closest("input, .x")) onSel(); });
     tr.innerHTML = `<td></td><td><input type="checkbox" ${keep ? "checked" : ""}></td><td><span class="sw" style="background:${colorOf(name)}"></span> <input type="text" value="${name.replace(/"/g, "&quot;")}"></td><td>${n}</td><td>${onDel ? '<span class="x" title="remove">✕</span>' : ""}</td>`;
     tr.querySelector("input[type=checkbox]").onchange = (e) => onKeep(e.target.checked);
     tr.querySelector("input[type=text]").addEventListener("change", (e) => onName(e.target.value));
-    if (onDel) tr.querySelector(".x").onclick = onDel;
+    if (onDel) tr.querySelector(".x").onclick = () => { X.sel = null; onDel(); };
     tb.appendChild(tr);
   };
   for (const c of X.prev.comps) {
     const e = X.spec.comps[c.id] || {}, name = e.name ?? c.name, keep = e.keep ?? c.keep;
-    row("", keep, name, fmt(c.n), (k) => { (X.spec.comps[c.id] ||= {}).keep = k; refresh(); }, (nm) => { (X.spec.comps[c.id] ||= {}).name = nm; refresh(); });
+    row("", keep, name, fmt(c.n), (k) => { (X.spec.comps[c.id] ||= {}).keep = k; refresh(); }, (nm) => { (X.spec.comps[c.id] ||= {}).name = nm; refresh(); }, undefined, X.sel && X.sel.kind === "comp" && X.sel.id === c.id, () => xSetSel({ kind: "comp", id: c.id }));
   }
-  X.spec.rects.forEach((r, i) => row("rect", r.keep, r.name, r.pts ? "(free-hand)" : "(rectangle)", (k) => { r.keep = k; refresh(); }, (nm) => { r.name = nm; refresh(); }, () => { X.spec.rects.splice(i, 1); refresh(); }));
+  X.spec.rects.forEach((r, i) => row("rect", r.keep, r.name, r.pts ? "(free-hand)" : "(rectangle)", (k) => { r.keep = k; refresh(); }, (nm) => { r.name = nm; refresh(); }, () => { X.spec.rects.splice(i, 1); refresh(); }, X.sel && X.sel.kind === "shape" && X.sel.i === i, () => xSetSel({ kind: "shape", i })));
   $("#tsum").textContent = "Project tissues (samples): " + (Object.entries(X.prev.counts).map(([n, c]) => `${n} (${fmt(c)})`).join(", ") || "none — switch at least one on");
 }
-for (const id of ["p_gap", "p_minc", "p_mint"]) $("#" + id).addEventListener("change", () => {
-  X.spec.gap = +$("#p_gap").value; X.spec.min_cells = +$("#p_minc").value; X.spec.min_counts = +$("#p_mint").value; X.spec.comps = {}; refresh();
+// ---- tissue boxes from a GeoJSON an earlier import exported: they become the shapes that separate the tissues, the detected tissues start switched off.
+// (Only for telling tissues apart on the slide; anatomical regions within a tissue are a different input.)
+$("#tisloadgo").onclick = async () => {
+  const path = $("#tisload").value.trim(), msg = $("#tismsg"); if (!path) { msg.textContent = "Give the path of a .geojson file."; return; }
+  const r = await post("/api/xenium/tissues/load", { path, name_col: "" });
+  if (!r.ok) { let m = "could not load the file"; try { m = JSON.parse(await r.text()).detail; } catch (e) { /* plain text */ } msg.textContent = m; return; }
+  const d = await r.json(), sb = slideB(), shapes = d.shapes.filter((q) => SE.clip(q, sb));
+  X.spec.rects = shapes; X.spec.comps = {}; X.spec.auto_off = true; X.sel = null; X.pending = null; xSelBar();
+  msg.textContent = `Loaded ${d.n_tissues} tissue box(es)` + (d.n_removed ? ` and ${d.n_removed} switched-off shape(s)` : "") + ` from ${d.source.split("/").pop()} (names from “${d.name_col}”)` + (shapes.length < d.shapes.length ? `; ${d.shapes.length - shapes.length} shape(s) off the slide were dropped` : "") + ". The detected tissues are switched off; tick one to use it again.";
+  refresh();
+};
+$("#cutoff").addEventListener("change", () => { X.spec.cut_off = $("#cutoff").checked; refresh(); });
+// ---- export the tissue boxes now (as edited), without converting
+async function tisExport(overwrite) {
+  const msg = $("#tisoutmsg"), folder = $("#tisout").value.trim(); $("#tisover").hidden = true;
+  if (!folder) { msg.textContent = "Choose a folder for the file."; return; }
+  const r = await post("/api/xenium/tissues/export", { spec: X.spec, folder, name: $("#pname").value.trim() || "slide", name_col: $("#regcol").value.trim() || "sample_id_unblinded", overwrite });
+  let d = null; try { d = JSON.parse(await r.text()); } catch (e) { /* not JSON */ }
+  if (r.status === 409) { msg.textContent = (d && d.detail) + ". Overwrite it?"; $("#tisover").hidden = false; return; }
+  if (!r.ok) { msg.textContent = (d && d.detail) || "export failed"; return; }
+  msg.textContent = "Written: " + d.written.join(", ");
+}
+$("#tisexport").onclick = () => tisExport(false); $("#tisover").onclick = () => tisExport(true);
+function txUi() { document.querySelectorAll(".txonly").forEach((e) => (e.hidden = X.spec.detect !== "transcripts")); if (X.spec.detect !== "transcripts") $("#txnote").textContent = ""; }
+for (const id of ["p_gap", "p_minc", "p_mint", "p_detect", "p_txmin"]) $("#" + id).addEventListener("change", () => {
+  X.spec.gap = +$("#p_gap").value; X.spec.min_cells = +$("#p_minc").value; X.spec.min_counts = +$("#p_mint").value;
+  X.spec.detect = $("#p_detect").value; X.spec.tx_min = Math.max(0, Math.round(+$("#p_txmin").value || 0)); X.spec.comps = {}; txUi(); refresh();
 });
+// ---- selecting a box on the slide: drag a drawn shape, drag its handles, Delete removes it; a detected tissue box can be made editable
+const slideB = () => (X.prev && X.prev.slide_bounds) || (X.info && X.info.bounds) || null;   // the slide: shapes are capped at it
+const polysByName = (prev, name) => { const t = prev && prev.tissue_polys && prev.tissue_polys.find((q) => q.name === name); return t ? t.polys : null; };
+const xBoxes = () => (X.prev && X.prev.boxes ? Object.entries(X.prev.boxes).map(([id, b]) => ({ id: +id, bbox: b })) : []);
+function xInfo(id) { const c = X.prev && X.prev.comps.find((q) => q.id === id); if (!c) return null; const e = X.spec.comps[id] || {}; const name = e.name ?? c.name, k = X.prev.names.indexOf(name); return { name, keep: e.keep ?? c.keep, color: k >= 0 ? PAL[k % PAL.length] : "#ffffff" }; }
+function xSetSel(p) { X.sel = p; if (X.prev) { draw(); table(); } xSelBar(); }
+function xSelBar() {
+  const bar = $("#selbar"), sel = X.sel, btn = (t, f) => { const b = document.createElement("button"); b.textContent = t; b.onclick = f; return b; }; bar.replaceChildren();
+  if (!sel) { bar.textContent = "Click a box on the slide to select it. A drawn shape can then be dragged, reshaped by its handles, or removed with Delete; a detected tissue box can be made editable."; return; }
+  if (sel.kind === "shape") { const r = X.spec.rects[sel.i]; if (!r) return; bar.append(`Selected: ${r.name} (${r.pts ? "free-hand" : "rectangle"}): drag it to move, drag a handle to reshape.`, btn("Remove", () => { X.spec.rects.splice(sel.i, 1); X.sel = null; refresh(); })); return; }
+  const i = xInfo(sel.id); if (!i) return;
+  bar.append(`Selected detected tissue ${i.name}${i.keep ? "" : " (off)"}.`,
+    btn("Make editable", () => {          // a rectangle copy of the box takes its place: the tissue is switched off, the shape keeps its name
+      const b = X.prev.boxes[sel.id]; (X.spec.comps[sel.id] ||= {}).keep = false; X.spec.rects.push({ x0: b[0], y0: b[1], x1: b[2], y1: b[3], name: i.name, keep: true }); X.sel = { kind: "shape", i: X.spec.rects.length - 1 }; refresh();
+    }),
+    btn("Replace with rectangle", () => xReplace(sel.id, "rect")), btn("Replace with free-hand", () => xReplace(sel.id, "free")),
+    btn(i.keep ? "Switch off" : "Switch on", () => { (X.spec.comps[sel.id] ||= {}).keep = !i.keep; refresh(); }));
+}
+// replace a detected tissue by a new shape that takes its name: the tissue is switched off, the next shape drawn is named like it (cancelling the tool puts the tissue back)
+function xReplace(id, tool) {
+  const i = xInfo(id), e = (X.spec.comps[id] ||= {}); X.pending = { id, name: i.name, prevKeep: e.keep };
+  e.keep = false; X.sel = null; X.draw = null; setTool(tool); refresh();
+}
+function xCancelPending() { const p = X.pending; X.pending = null; if (!p) return; const e = (X.spec.comps[p.id] ||= {}); if (p.prevKeep === undefined) delete e.keep; else e.keep = p.prevKeep; refresh(); }
+function xNewName() { if (X.pending) { const nm = X.pending.name; X.pending = null; return nm; } return "region_" + (X.spec.rects.length + 1); }
+SE.attach($("#cv"), { tool: () => X.draw, view: () => X.view, bounds: () => slideB(), shapes: () => X.spec.rects, boxes: xBoxes, getSel: () => X.sel, setSel: xSetSel, redraw: draw, commit: () => refresh(), active: () => !$("#s2").hidden, offComp: (id) => { (X.spec.comps[id] ||= {}).keep = false; refresh(); } });
 function setTool(t) {
-  X.draw = X.draw === t ? null : t;
+  X.draw = X.draw === t ? null : t; if (X.draw) X.sel = null; else if (X.pending) xCancelPending();
   $("#draw").textContent = X.draw === "rect" ? "Rectangle: drag on the slide (click to cancel)" : "Rectangle";
   $("#drawfree").textContent = X.draw === "free" ? "Free-hand: trace on the slide (click to cancel)" : "Free-hand";
 }
@@ -147,12 +216,13 @@ function simplify(pts, tol) {                    // Douglas-Peucker on the scree
     const done = () => { setTool(X.draw); refresh(); };
     if (a) {
       const b = pos(e), p0 = toData(a[0], a[1]), p1 = toData(b[0], b[1]); a = null;
-      if (Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) > 50) { X.spec.rects.push({ x0: p0[0], y0: p0[1], x1: p1[0], y1: p1[1], name: "region_" + (X.spec.rects.length + 1), keep: true }); done(); } else draw();
+      if (Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) > 50) { { const r = { x0: p0[0], y0: p0[1], x1: p1[0], y1: p1[1], name: xNewName(), keep: true }; if (SE.clip(r, slideB())) { X.spec.rects.push(r); done(); } else draw(); } } else draw();
     } else if (path) {
       let far = 0, fd = -1; path.forEach((q, i) => { const d = Math.hypot(q[0] - path[0][0], q[1] - path[0][1]); if (d > fd) { fd = d; far = i; } });   // the path is a closed loop: split it at the point farthest from the start
       const pts = (fd < 3 ? [] : simplify(path.slice(0, far + 1), 1.2).slice(0, -1).concat(simplify(path.slice(far).concat([path[0]]), 1.2).slice(0, -1))).map((p) => toData(p[0], p[1])); path = null;
+      { const cr = { pts }; if (pts.length >= 3 && SE.clip(cr, slideB())) pts.splice(0, pts.length, ...cr.pts); else pts.length = 0; }   // capped at the slide
       let ar = 0; pts.forEach((p, i) => { const q = pts[(i + 1) % pts.length]; ar += p[0] * q[1] - q[0] * p[1]; });
-      if (pts.length >= 3 && Math.abs(ar) / 2 > 2500) { X.spec.rects.push({ pts, name: "region_" + (X.spec.rects.length + 1), keep: true }); done(); } else draw();
+      if (pts.length >= 3 && Math.abs(ar) / 2 > 2500) { X.spec.rects.push({ pts, name: xNewName(), keep: true }); done(); } else draw();
     }
   });
 })();
@@ -190,7 +260,7 @@ $("#go").onclick = async () => {
   if (!Object.keys(X.prev.counts).length) { $("#err2").textContent = "No tissue is switched on."; return; }
   $("#go").disabled = true; $("#log2").textContent = "";
   const r = await post("/api/xenium/convert", { spec: X.spec, output: $("#outdir").value.trim(), name: $("#pname").value.trim(), annotation: ann || {}, transcripts: !!(X.info.has_transcripts && $("#wanttx").checked), he: !!(X.info.he && $("#wanthe").checked),
-    he_reg_folder: $("#f_hereg").value.trim(), he_reg_index: $("#f_heregidx").value.trim(), imc_file: $("#f_imc").value.trim() });
+    he_reg_folder: $("#f_hereg").value.trim(), he_reg_index: $("#f_heregidx").value.trim(), imc_file: $("#f_imc").value.trim(), export_regions: $("#wantreg").checked, regions_name_col: $("#regcol").value.trim() || "sample_id_unblinded", regions_dir: $("#regdir").value.trim() });
   if (!r.ok) { $("#err2").textContent = (JSON.parse(await r.text()).detail) || "failed"; $("#go").disabled = false; return; }
   pollConv();
 };

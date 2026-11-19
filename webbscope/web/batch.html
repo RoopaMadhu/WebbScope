@@ -4,7 +4,7 @@
 <div id="xbox">
   <h1>Import a folder of Xenium runs</h1>
   <p class="sub">Every run in the folder is converted in turn (tissues are found automatically, as in the single-run import), each into its own project, and then all tissues are merged into one project to browse together,
-    grouped by run folder instead of disease subtype. Tissues are named <code>&lt;folder&gt;_tissue_N</code>; cell types are <code>&lt;folder&gt;_tissue_N: Cluster K</code> (10x clusters are not comparable between runs), and cells start grey.
+    grouped by run folder instead of disease subtype. Tissues are named <code>&lt;folder&gt;_T0</code>, <code>&lt;folder&gt;_T1</code> …; cell types are <code>&lt;folder&gt;_T0: Cluster K</code> (10x clusters are not comparable between runs), and cells start grey.
     The input is never modified. <a href="/welcome">← open an existing project</a> · <a href="/xenium">import a single run</a></p>
 
   <section id="s1">
@@ -16,7 +16,17 @@
   <section id="s2" hidden>
     <h2>2 · Runs</h2>
     <p class="sub" id="runsum"></p>
-    <style>#ttab td{vertical-align:top}</style><table id="ttab"><thead><tr><th>use</th><th>name</th><th>kind</th><th class="hecol" hidden>H&amp;E scan</th><th class="hecol" hidden>annotations</th></tr></thead><tbody></tbody></table>
+    <style>#ttab td{vertical-align:top}</style><table id="ttab"><thead><tr><th>use</th><th>name</th><th>kind</th><th>drawn regions</th><th class="hecol" hidden>H&amp;E scan</th><th class="hecol" hidden>annotations</th></tr></thead><tbody></tbody></table>
+    <div class="row"><button id="galopen" class="primary">Review all slides…</button><span class="sub">thumbnails of every ticked run with its detected tissue boxes; click one to edit it</span></div>
+    <details id="tisbox"><summary><b>Tissue boxes from GeoJSON</b> (optional): the <code>&lt;run&gt;_regions.geojson</code> files an earlier import exported</summary>
+      <p class="sub">To separate the tissues on each slide the same way as before. Give the folder that holds the files: the output folder of the earlier batch import (each run's file is in the run's folder there) or the folder they were also saved in. Each run's file is found by its name (<code>&lt;run&gt;_regions.geojson</code>, in the folder or one or two levels down). Its tissue boxes become the run's shapes (a shape that was switched off is loaded switched off), and the detected tissues of that run are switched off (switch one on again in the drawing window). Runs without a file keep their detected tissues. These files only tell the tissues apart; they are not anatomical regions within a tissue.</p>
+      <div class="row"><input id="tisfolder" placeholder="/path/to/folder with the &lt;run&gt;_regions.geojson files"><button id="tisfind">Load for all runs</button></div>
+      <div id="tismsg" class="sub"></div>
+    </details>
+    <label class="rad"><input type="checkbox" id="cutoff" checked> Cut the switched-off shapes (drawn with “use” unticked) out of the tissue boxes, as shown and exported; the shapes themselves stay in the exported files, switched off</label>
+    <div class="row"><input id="tisout" placeholder="/path/to/folder for the &lt;run&gt;_regions.geojson files"><button id="tisexport">Export tissue boxes of the ticked runs</button><button id="tisover" hidden>Overwrite</button></div>
+    <div class="sub" id="tisoutmsg">Writes one <code>&lt;run&gt;_regions.geojson</code> per ticked run into this folder, with the tissue boxes as they are now (including edits to loaded ones), without converting the data. Each run is read for this if it was not already (from a .tar.gz or .zip that takes a while).</div>
+    <p class="sub">Optional: <b>Draw…</b> (or click a slide in the review) a rectangle or free-hand shape on a run (as in the single-run import) to split a tissue, join pieces, or cut an area out (untick “use” in the drawing window). You can also rename a detected tissue or switch it off there without drawing anything. Runs without edits keep their automatically detected tissues.</p>
     <details id="hebox"><summary><b>H&amp;E scans</b> (optional): a folder with one <code>.czi</code> or <code>.ome.tif</code> / <code>.ome.tiff</code> per slide</summary>
       <p class="sub">Give a folder holding the H&amp;E scans (and, if you have them, the ImageScope <code>.annotations</code> files; sub-folders up to two levels are searched). Each run is matched to a scan
         by the numbers in the names (for example <code>…__chip0073__…</code> and <code>Chip-0073_….czi</code> (or <code>.ome.tif</code>)); a run that matches nothing, or several scans equally, is left empty so you can choose.
@@ -26,7 +36,7 @@
       <div id="hemsg" class="sub"></div>
     </details>
     <details id="hereg"><summary><b>Registered H&amp;E images</b> (optional): one <code>.ome.tif</code> / <code>.ome.tiff</code> per tissue, already in the Xenium frame</summary>
-      <p class="sub">Shown under or beside the cells (the <b>Images</b> button) in the merged project. Each image goes to the sample whose name is the image's file name (without <code>_warped_he.ome.tif</code>); the merged samples are called <code>&lt;run&gt;_tissue_1</code>, <code>&lt;run&gt;_tissue_2</code> …, so an <code>index.json</code> that maps image names to those sample ids is usually needed. Images that match nothing are listed in the log. Needs the merge option.</p>
+      <p class="sub">Shown under or beside the cells (the <b>Images</b> button) in the merged project. Each image goes to the sample whose name is the image's file name (without <code>_warped_he.ome.tif</code>); the merged samples are called <code>&lt;run&gt;_T0</code>, <code>&lt;run&gt;_T1</code> …, so an <code>index.json</code> that maps image names to those sample ids is usually needed. Images that match nothing are listed in the log. Needs the merge option.</p>
       <div class="row"><input id="hereg_folder" placeholder="/path/to/folder with the registered H&amp;E OME-TIFFs"></div>
       <div class="row"><input id="hereg_index" placeholder="/path/to/index.json (optional): image name → sample id"></div>
     </details>
@@ -35,7 +45,10 @@
         <label>Merge pieces closer than (µm)<input id="p_gap" type="number" value="200" min="0" step="50"></label>
         <label>Minimum cells per tissue<input id="p_minc" type="number" value="500" min="1" step="100"></label>
         <label>Minimum transcripts per cell<input id="p_mint" type="number" value="1" min="0"></label>
-      </div></details>
+      </div>
+      <div class="grid"><label>Detect tissues from</label><select id="p_detect"><option value="cells">cell density (cells per 50 µm bin)</option><option value="transcripts">transcript density (transcripts per 100 µm bin; reads each run's transcripts.parquet)</option></select>
+        <label class="txonly" hidden>Minimum transcripts per 100 µm bin (empty = automatic)</label><input id="p_txmin" class="txonly" type="number" min="1" step="5" placeholder="automatic" hidden></div>
+      <p class="sub txonly" hidden>Transcript density needs <code>transcripts.parquet</code> of every run (for a .tar.gz or .zip it is extracted first, about 1 GB per run). It is read in a stream, about 0.4 GB and a few seconds per run, and is not imported into the project unless you tick the transcripts option below.</p></details>
   </section>
 
   <section id="s3" hidden>
@@ -46,11 +59,30 @@
     <label class="rad"><input type="checkbox" id="wanttab"> Write <code>transcript_tissue.parquet</code> in each run's folder: one row per transcript of <code>transcripts.parquet</code> that belongs to a tissue, with its row number, <code>transcript_id</code> (if the file has it), tissue and the sample name in the merged project, to join to the raw file. About 5 bytes per transcript on test data (~100 MB for 20 million transcripts); real transcript ids may compress worse. Needs <code>transcripts.parquet</code>, and from a .tar.gz or .zip the archive has to be read further.</label>
     <label class="rad"><input type="checkbox" id="wanttx"> Include the transcripts (<code>transcripts.parquet</code> of each run; a few hundred MB per run, and from a .tar.gz or .zip the archive has to be read further). Browsing is not slowed down: points are read from disk only for the genes you type. The merged project reads them from each run&#39;s own folder, so keep the output folder together.</label>
     <label class="rad"><input type="checkbox" id="wantif"> Include each run's IF (morphology) image: <code>morphology_focus.ome.tif</code> (else <code>morphology_mip.ome.tif</code>), if the run has one. Nothing is converted or copied: the project records where each file is, so keep the runs where they are. From a .tar.gz or .zip the image is extracted once (about 1 GB per run) into the staging folder, and the project points there.</label>
+    <label class="rad"><input type="checkbox" id="wantreg"> Export the drawn regions and tissue bounding boxes of each run as <code>&lt;run&gt;_regions.geojson</code> (one file per run, in the run's folder; Xenium µm coordinates). A rectangle is exported as its box and a free-hand region as the outline you traced, not a convex hull.</label>
+    <div class="grid"><label>Name of the column that holds each box's name</label><input id="regcol" value="sample_id_unblinded">
+      <label>Also save the files in this folder (optional)</label><input id="regdir" placeholder="/path/to/folder (created if needed); empty = only the run folders"></div>
     <div class="grid"><label>Cores to use (parallel runs)</label><input id="workers" type="number" min="0" max="256" placeholder="automatic" style="width:8em"></div>
     <div class="sub">Empty = automatic: up to 4 runs at a time, fewer if the cores or the memory run out (one run with transcripts can need 12&ndash;19 GB, so the number is capped by the memory that is free). 1 = one run at a time. The log says what was chosen.</div>
     <div class="row"><button id="go" class="primary">Convert all and open</button></div>
     <pre id="log2"></pre><div id="err2"></div>
   </section>
 </div>
+<div id="gal" hidden><div id="gbox">
+  <div class="row"><b>Review slides</b><span id="gpage" class="sub"></span><button id="gprev">‹ prev</button><button id="gnext">next ›</button>
+    <label class="sub">slides per page <select id="gper"><option>10</option><option selected>20</option><option>30</option></select></label><span style="flex:1"></span><span id="gmsg" class="sub"></span><button id="gclose" class="primary">Close</button></div>
+  <p class="sub">Cells are coloured by detected tissue (with transcript detection: the transcript density per 100 µm bin, brighter = more, tinted by tissue); coloured outlines are the tissues' boxes (red = switched off; for a run whose tissue boxes were loaded from a GeoJSON, those boxes), yellow outlines are shapes you drew or loaded. Click a slide to rename or switch off its tissues, or to draw shapes.</p>
+  <div id="ggrid"></div></div></div>
+<div id="dlg" hidden><div id="dbox">
+  <div class="row"><b id="dtitle"></b><span style="flex:1"></span><button id="ddone" class="primary">Done</button></div>
+  <div id="tiss">
+    <div id="cwrap"><canvas id="cv"></canvas><div id="cnote"></div></div>
+    <div id="side">
+      <table id="dtab"><thead><tr><th>use</th><th>name (same name = merged)</th><th>shape</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="row"><button id="draw">Rectangle</button><button id="drawfree">Free-hand</button><span class="sub">free-hand: hold the mouse button and trace</span></div>
+      <div id="dsum" class="sub"></div><div id="dsel"></div><div id="derr"></div>
+    </div>
+  </div></div></div>
+<script src="/static/shapeedit.js"></script>
 <script src="/static/batch.js"></script>
 </body></html>

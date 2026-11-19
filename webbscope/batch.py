@@ -4,7 +4,7 @@ A folder of Xenium runs -> one project per run, plus one merged project holding 
 Each run goes through the same code as the single-run import (xenium.Session / xenium.convert) with automatic tissue detection and the
 default settings, one run at a time, so only one run's counts are in memory while converting. The merged project is a normal project folder
 (`<out>/_merged`) that the viewer opens like any other:
-  sample         = "<run folder>_<tissue>"         (tissues are tissue_1 .. tissue_n, ordered left to right on the slide)
+  sample         = "<run folder>_<tissue>"         (tissues are T0 .. Tn-1, ordered left to right on the slide)
   disease_subtype= the run folder name            (so the viewer's "by disease subtype" grouping is by run)
   cell_type/state= "<run folder>_<tissue>: Cluster N"   (10x graph clusters of that run; not comparable between runs, hence the prefix)
   genes          = those present in every run (reported if any were dropped)
@@ -333,17 +333,22 @@ def attach_he(out_root, merged, he_map, run_names, log, cores=1):
     return scans
 
 
-def _convert_one(run, out, spec, log, transcripts=False, tx_table=False, threads=1, ifimg=False):
+def _convert_one(run, out, spec, log, transcripts=False, tx_table=False, threads=1, ifimg=False, reg=None):
     """Write the run's own project folder; return what the merge needs (counts of the kept cells, genes, cell table, boundaries)."""
-    src = xenium.resolve_sources(run["path"], {}, log, want_tx=transcripts or tx_table, want_if=ifimg)
+    src = xenium.resolve_sources(run["path"], {}, log, want_tx=transcripts or tx_table or spec.get("detect") == "transcripts", want_if=ifimg)
     if ifimg and not any(k.startswith("if_") for k in src):
         log(f"{run['name']}: no morphology_focus / morphology_mip .ome.tif found; this run will have no IF image")
     if (transcripts or tx_table) and "tx" not in src:
         log(f"{run['name']}: no transcripts.parquet found; this run will have no transcript points" + (" and no transcript_tissue.parquet" if tx_table else ""))
+    reg = reg or {}
+    # shapes drawn / tissues renamed for this run (none = automatic tissues); auto_off: tissue boxes loaded from a GeoJSON, the detected pieces start switched off
+    spec = {**spec, "rects": reg.get("rects", {}).get(run["name"], []), "comps": reg.get("comps", {}).get(run["name"], {}),
+            "auto_off": bool(reg.get("auto_off", {}).get(run["name"])), "cut_off": bool(reg.get("cut_off", True))}
     sess = xenium.Session(src, log)
     _, idx, _, _ = sess.labels(spec)
     kept = np.flatnonzero(idx >= 0)
-    rep = xenium.convert(sess, spec, out, run["name"], None, log, transcripts, None, run["name"] if tx_table else None, threads)
+    rep = xenium.convert(sess, spec, out, run["name"], None, log, transcripts, None, run["name"] if tx_table else None, threads,
+                        export_regions=bool(reg.get("export")), regions_name_col=reg.get("col") or "sample_id_unblinded", regions_dir=reg.get("dir"))
     m = sess.m[:, kept].tocsr()
     m.data = np.round(m.data).astype(np.int32)
     sess_ctrl_n = dict(sess.ctrl_n)
@@ -511,19 +516,19 @@ def _init_worker(q):
     _Q = q
 
 
-def _worker(i, run, out, spec, transcripts, tx_table, threads, ifimg):
+def _worker(i, run, out, spec, transcripts, tx_table, threads, ifimg, reg=None):
     """One run converted in a worker process: (index, piece or None, error text or None). Log lines go to the parent through the queue."""
     def log(m):
         _Q.put((run["name"], m))
     try:
-        return i, _convert_one(run, out, spec, log, transcripts, tx_table, threads, ifimg), None
+        return i, _convert_one(run, out, spec, log, transcripts, tx_table, threads, ifimg, reg), None
     except Exception as e:
         if not isinstance(e, importer.ImportError_):
             traceback.print_exc()
         return i, None, str(e)
 
 
-def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, he=None, tx_table=False, workers=0, ifimg=False, he_reg=None):
+def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, he=None, tx_table=False, workers=0, ifimg=False, he_reg=None, reg=None):
     """Convert every run (a failing run is logged and skipped), then merge. `workers` = runs converted at once (0 = automatic, 1 = one by one).
     Returns {done, failed, merged, first}."""
     spec = {**SPEC, **(spec or {})}
@@ -547,7 +552,7 @@ def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, 
         log(f"=== [{i + 1}/{len(runs)}] {run['name']}")
         out = out_root / safe_name(run["name"])
         try:
-            done(i, _load_project(run, log, transcripts) if run.get("kind") == "project" else _convert_one(run, out, spec, log, transcripts, tx_table, threads, ifimg))
+            done(i, _load_project(run, log, transcripts) if run.get("kind") == "project" else _convert_one(run, out, spec, log, transcripts, tx_table, threads, ifimg, reg))
         except Exception as e:
             if not isinstance(e, importer.ImportError_):
                 traceback.print_exc()
@@ -580,7 +585,7 @@ def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, 
                 for i, run in enumerate(runs):
                     if run.get("kind") != "project":
                         log(f"=== [{i + 1}/{len(runs)}] {run['name']} queued")
-                        futs[ex.submit(_worker, i, run, out_root / safe_name(run["name"]), spec, transcripts, tx_table, threads, ifimg)] = i
+                        futs[ex.submit(_worker, i, run, out_root / safe_name(run["name"]), spec, transcripts, tx_table, threads, ifimg, reg)] = i
                 for f in as_completed(futs):
                     i = futs[f]
                     try:

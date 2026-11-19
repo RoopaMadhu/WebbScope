@@ -18,3 +18,12 @@ button.primary{background:#2b5fb8;border-color:#3a74d6}button.primary:hover{back
 code{background:#262a33;padding:0 4px;border-radius:3px}
 .pick{display:flex;gap:6px}.pick input{flex:1;min-width:0}
 [hidden]{display:none !important}
+#dlg{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:50;overflow:auto}#dbox{max-width:1000px;margin:4vh auto;background:#1b1e25;border:1px solid #2c313d;border-radius:8px;padding:14px 18px}
+#dtab{width:100%;border-collapse:collapse;margin:10px 0;font-size:13px}#dtab th{font-weight:500;color:#8f9bb0;text-align:left;font-size:11px;padding:2px 4px}#dtab td{padding:2px 4px}#dtab input[type=text]{width:100%;padding:3px 6px}
+#derr{color:#ff8a80;white-space:pre-wrap;font-size:12px}
+#gal{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:40;overflow:auto}#gbox{max-width:1400px;margin:3vh auto;background:#1b1e25;border:1px solid #2c313d;border-radius:8px;padding:14px 18px}
+#ggrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}.gcard{border:1px solid #2c313d;border-radius:6px;padding:6px;cursor:pointer;background:#16181e}.gcard:hover{border-color:#3a74d6}
+.gcard canvas{width:100%;height:auto;display:block;border-radius:3px}.gname{font-size:11px;color:#cfd7e6;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#gbox .row,#dbox .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0}
+.selrow{background:#2a3347}#dsel,#selbar{font-size:12px;color:#9fb0cc;margin:6px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#dtab td:nth-child(2){display:flex;align-items:center;gap:6px}

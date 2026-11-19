@@ -70,7 +70,7 @@ Optional additions to the main input.
 |---|---|---|
 | Transcripts | `transcripts.parquet` inside the raw Xenium output. | **Yes** |
 | IF (morphology) image | The run's `morphology_focus` files (`.ome.tif`, one per channel or one file), read from the folder, the bundle or a path you give; not copied. | **Yes**, read from each run |
-| Registered H&E | A folder of `.ome.tif` / `.ome.tiff`, one per tissue, already in the Xenium frame; optional `index.json` mapping image names to sample ids. | **Yes.** Images are matched to `<run>_tissue_N` by file name. |
+| Registered H&E | A folder of `.ome.tif` / `.ome.tiff`, one per tissue, already in the Xenium frame; optional `index.json` mapping image names to sample ids. | **Yes.** Images are matched to `<run>_T<i>` by file name. |
 | H&E slide scan (not registered) | `.czi`, `.ome.tif` or `.ome.tiff`; optional ImageScope `.annotations` files. | **Yes.** A folder of scans, matched to the runs by the numbers in the names. |
 | IMC slide (imaging mass cytometry) | An `.mcd` file of the slide (all its ROIs and channels). Converted once into the cache; the file is never changed. See [IMC slide](#imc-slide-mcd). | **No.** Single-run import page, open-project page or the Images menu. |
 | ROI object (ROI heterogeneity) | A `region_heterogeneity` object: `.rds` (or `.qs2`, converted through R). | **No.** |
@@ -100,7 +100,7 @@ Tick **Write `transcript_tissue.parquet`** to get, in each run's folder, a table
 |---|---|
 | `row` | 0-based row number in the raw `transcripts.parquet` (always present) |
 | `transcript_id` | the raw file's `transcript_id`, when the file has that column |
-| `tissue` | tissue within the run (`tissue_1`, …) |
+| `tissue` | tissue within the run (`T0`, …) |
 | `sample` | `<run folder>_<tissue>`, the sample name in the merged project |
 | `assignment` | `cell` or `nearest_cell` |
 

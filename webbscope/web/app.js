@@ -1179,9 +1179,9 @@ async function renderGallery() {
 }
 // ---------------------------------------------------------------- slide: every tissue of one slide (run) at its true position, each in a labelled box
 // Tissues of a slide share one coordinate frame (the run's), so they are grouped by run (= disease subtype / run name in imported projects).
-function tissueName(s, grp) {   // "<run>_tissue_2" -> "tissue_2": the slide name is dropped, the window is already one slide
+function tissueName(s, grp) {   // "<run>_T1" -> "T1": the slide name is dropped, the window is already one slide
   let n = String(s.id); if (n.startsWith(grp + "_")) return n.slice(grp.length + 1);
-  const m = /(tissue_\d+|small_piece_\d+)$/.exec(n); return m ? m[1] : n;
+  const m = /(?:^|_)((?:T|S)\d+|tissue_\d+|small_piece_\d+)$/.exec(n); return m ? m[1] : n;
 }
 let slideTok = 0, slideObs = null;
 const slideGroups = () => [...new Set(S.meta.samples.map(subtypeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));

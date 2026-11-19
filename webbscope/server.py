@@ -1235,11 +1235,11 @@ def xenium_info():
     name = f"{m.get('run_name', 'Xenium run')} / {m.get('region_name', '')}".strip(" /")
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_") or "xenium_project"
     return {"name": name, "n_cells": s.n, "n_genes": s.n_genes, "feature_types": s.feature_types,
-            "bounds": [float(s.x.min()), float(s.y.min()), float(s.x.max()), float(s.y.max())],
+            "bounds": xenium.view_bounds(s),
             "has_clusters": s.clusters is not None, "n_clusters": int(s.clusters.nunique()) if s.clusters is not None else 0,
             "has_umap": "umap" in s.emb, "has_pca": "pca" in s.emb,
             "panel": {k: m.get(k) for k in ("panel_name", "panel_organism", "panel_tissue_type", "preservation_method", "slide_id")},
-            "zero_count_cells": int((s.gene_counts == 0).sum()), "has_transcripts": "tx" in s.src, "he": XST.he,
+            "zero_count_cells": int((s.gene_counts == 0).sum()), "has_transcripts": "tx" in s.src, "has_tx_density": "tx" in s.src or "tx_probe" in s.src, "he": XST.he,
             "default_output": str(Path.home() / ".webbscope" / "projects" / safe)}
 
 
@@ -1254,19 +1254,93 @@ class XSpec(BaseModel):
     min_counts: int = 1
     comps: dict = {}
     rects: list = []
+    detect: str = "cells"           # tissue detection from "cells" (cell density) or "transcripts" (transcript density)
+    tx_min: int = 0                 # transcripts per 50 um bin that count as tissue (transcripts mode); 0 = automatic
+    auto_off: bool = False          # tissue boxes loaded from a GeoJSON define the tissues: the detected pieces start switched off
+    cut_off: bool = True            # cut the switched-off shapes out of the tissue boxes (shown and exported)
 
 
-@app.post("/api/xenium/preview", response_class=ORJSONResponse)
-def xenium_preview(sp: XSpec):
-    s = _xs()
-    if not (0 <= sp.gap <= 5000 and 1 <= sp.min_cells <= 10**7 and 0 <= sp.min_counts <= 10**6 and len(sp.rects) <= 200):
+def _preview(s, sp):
+    if not (0 <= sp.gap <= 5000 and 1 <= sp.min_cells <= 10**7 and 0 <= sp.min_counts <= 10**6 and len(sp.rects) <= 200
+            and sp.detect in ("cells", "transcripts") and 0 <= sp.tx_min <= 10**7):
         raise HTTPException(400, "parameter out of range")
     try:
         names, idx, comps, counts = s.labels(sp.model_dump())
     except importer.ImportError_ as e:
         raise HTTPException(400, str(e))
     return {"names": names, "labels": idx.tolist(), "comps": comps, "counts": counts,
-            "n_kept": int((idx >= 0).sum()), "n_below_min": int((idx == -2).sum())}
+            "n_kept": int((idx >= 0).sum()), "n_below_min": int((idx == -2).sum()), "tx_threshold": getattr(s, "tx_threshold", None) if sp.detect == "transcripts" else None,
+            "grid": s.tx_payload(sp.gap, sp.min_cells, sp.min_counts, sp.detect, sp.tx_min),
+            "boxes": s.piece_boxes(sp.gap, sp.min_cells, sp.min_counts, sp.detect, sp.tx_min),
+            "tissue_polys": xenium.polys_payload(xenium.tissue_boxes(s, sp.model_dump(), names, idx)), "slide_bounds": xenium.slide_bounds(s)}
+
+
+@app.post("/api/xenium/preview", response_class=ORJSONResponse)
+def xenium_preview(sp: XSpec):
+    return _preview(_xs(), sp)
+
+
+class TissueLoadReq(BaseModel):
+    path: str                       # a tissue-box GeoJSON (<name>_regions.geojson written by an earlier import)
+    name_col: str = ""              # property holding each tissue's name ("" = the file's name_column, else sample_id_unblinded)
+
+
+@app.post("/api/xenium/tissues/load", response_class=ORJSONResponse)
+def xenium_tissues_load(r: TissueLoadReq):
+    """The shapes separating the tissues (and their outlines, for display) that a tissue-box GeoJSON holds; the page puts them in the spec with auto_off.
+    Not the anatomical regions within a tissue (regions.geojson): those are a different input."""
+    try:
+        return xenium.load_tissue_boxes(r.path, r.name_col)
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+
+
+class TissueExportReq(BaseModel):
+    spec: XSpec
+    folder: str                     # where to write <name>_regions.geojson
+    name: str                       # the file is <name>_regions.geojson (the project name)
+    name_col: str = "sample_id_unblinded"
+    overwrite: bool = False
+
+
+@app.post("/api/xenium/tissues/export", response_class=ORJSONResponse)
+def xenium_tissues_export(r: TissueExportReq):
+    """Write the run's tissue boxes (as edited now) to a GeoJSON without converting; 409 when the file exists and overwrite is not set."""
+    if not r.folder.strip():
+        raise HTTPException(400, "choose a folder for the file")
+    try:
+        return {"written": [xenium.export_tissue_boxes(_xs(), r.spec.model_dump(), r.folder, r.name.strip() or "slide", r.name_col.strip() or "sample_id_unblinded", r.overwrite)]}
+    except FileExistsError as e:
+        raise HTTPException(409, f"{e} exists")
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+
+
+class BTissueReq(BaseModel):
+    folder: str                     # where the tissue-box files <run>_regions.geojson are (e.g. the output folder of an earlier batch import)
+    runs: list                      # run names
+    name_col: str = ""
+
+
+@app.post("/api/xenium/batch/tissues", response_class=ORJSONResponse)
+def xenium_batch_tissues(r: BTissueReq):
+    """{found: {run: load_tissue_boxes(...)}, missing: [run], errors: {run: message}} for the batch page."""
+    d = Path(r.folder).expanduser()
+    if not d.is_dir():
+        raise HTTPException(400, f"not a folder: {d}")
+    if len(r.runs) > 500:
+        raise HTTPException(400, "too many runs")
+    found, missing, errors = {}, [], {}
+    for n in [str(x) for x in r.runs]:
+        f = xenium.find_tissue_file(d, n)
+        if f is None:
+            missing.append(n)
+            continue
+        try:
+            found[n] = xenium.load_tissue_boxes(f, r.name_col)
+        except importer.ImportError_ as e:
+            errors[n] = str(e)
+    return {"found": found, "missing": missing, "errors": errors}
 
 
 class XAnnReq(BaseModel):
@@ -1293,6 +1367,21 @@ class XConvertReq(BaseModel):
     he_reg_folder: str = ""
     he_reg_index: str = ""
     imc_file: str = ""              # IMC slide (.mcd), optional: converted into the cache after the project opens
+    regions_name_col: str = "sample_id_unblinded"   # property that holds each box's name in drawn_regions.geojson
+    regions_dir: str = ""           # extra folder for the regions file (besides the project folder), optional
+    export_regions: bool = False    # also write drawn_regions.geojson (drawn shapes as traced + tissue bounding boxes)
+
+
+def _regions_dir(txt):
+    """Extra folder for the regions GeoJSON files (None = only the project folder); created now so a bad path fails before the conversion."""
+    if not (txt or "").strip():
+        return None
+    d = Path(txt.strip()).expanduser()
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(400, f"cannot use the regions folder {d}: {e}")
+    return str(d)
 
 
 @app.post("/api/xenium/convert", response_class=ORJSONResponse)
@@ -1313,7 +1402,7 @@ def xenium_convert(r: XConvertReq):
 
     def prepare():
         _log("converting the Xenium output to a project folder")
-        rep = xenium.convert(s, r.spec.model_dump(), out, r.name, r.annotation or None, _log, r.transcripts, XST.he["paths"] if (r.he and XST.he) else None)
+        rep = xenium.convert(s, r.spec.model_dump(), out, r.name, r.annotation or None, _log, r.transcripts, XST.he["paths"] if (r.he and XST.he) else None, export_regions=r.export_regions, regions_name_col=r.regions_name_col, regions_dir=_regions_dir(r.regions_dir) if r.export_regions else None)
         if hreg:
             try:
                 he_registered.run(hreg["folder"], hreg["index"], out, _log)
@@ -1362,6 +1451,172 @@ def xenium_batch_he(r: BHeReq):
     return d
 
 
+# ---- slide gallery and drawing on the runs of a batch: runs are read without their counts (xenium.Light), thumbnails in the background
+class BLight:
+    lock = threading.Lock()
+    cache = {}                  # run name -> xenium.Light, the 6 most recently used
+    order = []
+    thumbs = {}                 # (run, gap, min_cells, min_counts) -> {state: pending | ready | error, d | error}
+    pool = None
+
+
+BL = BLight()
+
+
+def _light(run, tx=False):
+    """The Light session of one run (read once; the last 6 are kept). tx = the transcripts file must be reachable (transcript-density detection)."""
+    if run.get("kind") == "project" or not (run.get("name") and run.get("path")):
+        raise HTTPException(400, "shapes can only be drawn on Xenium output runs, not on projects that were already imported")
+    with BL.lock:
+        s = BL.cache.get(run["name"])
+        if s is not None and tx and not ("tx" in s.src or "tx_probe" in s.src):
+            s = None                                    # read before without the transcripts (an archive): read it again with them
+        if s is not None:
+            BL.order.remove(run["name"]); BL.order.append(run["name"])
+            return s
+    try:
+        s = xenium.Light(xenium.resolve_sources(str(run["path"]), {}, lambda m: None, want_tx=tx))
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    with BL.lock:
+        BL.cache[run["name"]] = s
+        BL.order[:] = [n for n in BL.order if n != run["name"]] + [run["name"]]
+        while len(BL.order) > 6:
+            BL.cache.pop(BL.order.pop(0), None)
+    return s
+
+
+class BThumbReq(BaseModel):
+    runs: list                      # [{name, path, kind}] to make thumbnails for
+    gap: float = 200
+    min_cells: int = 500
+    min_counts: int = 1
+    detect: str = "cells"
+    tx_min: int = 0
+
+
+@app.post("/api/xenium/batch/thumbs", response_class=ORJSONResponse)
+def xenium_batch_thumbs(r: BThumbReq):
+    """Start thumbnails for these runs (a few at a time, in the background) and return {run: {state, d | error}} for what is known now."""
+    if ST.state == "importing":
+        raise HTTPException(409, "an import is running")
+    if not (0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6 and len(r.runs) <= 100
+            and r.detect in ("cells", "transcripts") and 0 <= r.tx_min <= 10**7):
+        raise HTTPException(400, "parameter out of range")
+    from concurrent.futures import ThreadPoolExecutor
+    out = {}
+    for run in r.runs:
+        if not isinstance(run, dict) or not run.get("name") or run.get("kind") == "project":
+            continue
+        key = (run["name"], round(r.gap, 3), r.min_cells, r.min_counts, r.detect, r.tx_min)
+        with BL.lock:
+            if BL.pool is None:
+                BL.pool = ThreadPoolExecutor(3)
+            e = BL.thumbs.get(key)
+            if e is None:
+                e = BL.thumbs[key] = {"state": "pending"}
+
+                def job(run=run, key=key, e=e):
+                    try:
+                        e["d"] = _light(run, key[4] == "transcripts").thumb(key[1], key[2], key[3], detect=key[4], tx_min=key[5])
+                        e["state"] = "ready"
+                    except HTTPException as ex:
+                        e["error"], e["state"] = ex.detail, "error"
+                    except Exception as ex:
+                        traceback.print_exc()
+                        e["error"], e["state"] = f"cannot read this run: {ex}", "error"
+                BL.pool.submit(job)
+        out[run["name"]] = {"state": e["state"], "d": e.get("d"), "error": e.get("error")}
+    return out
+
+
+class BDrawReq(BaseModel):
+    run: dict                       # {name, path, kind} as returned by the scan
+    detect: str = "cells"           # "transcripts": the run's transcripts must be reachable
+
+
+@app.post("/api/xenium/batch/draw/open", response_class=ORJSONResponse)
+def xenium_batch_draw_open(r: BDrawReq):
+    """Open one run for editing its shapes and tissues (the same preview as the single-run page)."""
+    if ST.state == "importing":
+        raise HTTPException(409, "an import is running")
+    s = _light(r.run, r.detect == "transcripts")
+    return {"n_cells": s.n, "bounds": xenium.view_bounds(s)}
+
+
+def _bd(name):
+    with BL.lock:
+        s = BL.cache.get(name)
+    if s is None:
+        raise HTTPException(409, "this run is not open for drawing")
+    return s
+
+
+@app.get("/api/xenium/batch/draw/xy")
+def xenium_batch_draw_xy(run: str):
+    return raw(_bd(run).xy32)
+
+
+class BPrevReq(BaseModel):
+    run: str
+    spec: XSpec
+
+
+@app.post("/api/xenium/batch/draw/preview", response_class=ORJSONResponse)
+def xenium_batch_draw_preview(r: BPrevReq):
+    return _preview(_bd(r.run), r.spec)
+
+
+class BTissueExportReq(BaseModel):
+    runs: list                      # [{name, path, kind}] whose tissue boxes to write
+    folder: str                     # one <run>_regions.geojson per run goes here
+    gap: float = 200
+    min_cells: int = 500
+    min_counts: int = 1
+    detect: str = "cells"
+    tx_min: int = 0
+    regions: dict = {}              # {run: [drawn shapes]}
+    comps: dict = {}                # {run: {piece id: {name, keep}}}
+    auto_off: dict = {}             # {run: true} for runs whose tissue boxes were loaded from a GeoJSON
+    cut_off: bool = True
+    name_col: str = "sample_id_unblinded"
+    overwrite: bool = False
+
+
+@app.post("/api/xenium/batch/tissues/export", response_class=ORJSONResponse)
+def xenium_batch_tissues_export(r: BTissueExportReq):
+    """Write <run>_regions.geojson for every given run into one folder, from the edits made on the batch page, without converting. Nothing is written
+    when a file exists and overwrite is not set (409 lists them). Returns {written: [path], errors: {run: message}}."""
+    if ST.state == "importing":
+        raise HTTPException(409, "an import is running")
+    if not r.folder.strip():
+        raise HTTPException(400, "choose a folder for the files")
+    if not (0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6 and r.detect in ("cells", "transcripts") and 0 <= r.tx_min <= 10**7):
+        raise HTTPException(400, "parameter out of range")
+    runs = [x for x in r.runs if isinstance(x, dict) and x.get("name") and x.get("kind") != "project"]
+    if not runs or len(runs) > 500:
+        raise HTTPException(400, "no runs to export")
+    d = Path(r.folder).expanduser()
+    exist = [str(d / xenium.regions_filename(x["name"])) for x in runs if (d / xenium.regions_filename(x["name"])).exists()]
+    if exist and not r.overwrite:
+        raise HTTPException(409, f"{len(exist)} file(s) exist: " + ", ".join(Path(e).name for e in exist))
+    written, errors = [], {}
+    for x in runs:
+        n = str(x["name"])
+        spec = {"gap": r.gap, "min_cells": r.min_cells, "min_counts": r.min_counts, "detect": r.detect, "tx_min": r.tx_min,
+                "rects": (r.regions or {}).get(n) or [], "comps": (r.comps or {}).get(n) or {}, "auto_off": bool((r.auto_off or {}).get(n)), "cut_off": r.cut_off}
+        if len(spec["rects"]) > 200:
+            errors[n] = "too many drawn shapes"
+            continue
+        try:
+            written.append(xenium.export_tissue_boxes(_light(x, r.detect == "transcripts"), spec, d, n, r.name_col.strip() or "sample_id_unblinded", True))
+        except HTTPException as e:
+            errors[n] = e.detail
+        except Exception as e:
+            errors[n] = str(e)
+    return {"written": written, "errors": errors}
+
+
 class BRunReq(BaseModel):
     runs: list                      # [{name, path, kind}] as returned by the scan, minus the ones the user switched off
     output: str
@@ -1375,7 +1630,16 @@ class BRunReq(BaseModel):
     gap: float = 200
     min_cells: int = 500
     min_counts: int = 1
+    detect: str = "cells"           # tissue detection from cell density or transcript density
+    tx_min: int = 0                 # transcripts per 50 um bin (transcripts mode); 0 = automatic
     he: dict = {}                   # {run name: {czi, annotations}} from the H&E folder step
+    export_regions: bool = False    # write <run>_regions.geojson per run
+    regions_name_col: str = "sample_id_unblinded"
+    regions_dir: str = ""           # extra folder for those files, optional
+    regions: dict = {}              # {run name: [drawn shapes]} as drawn in the batch page
+    comps: dict = {}                # {run name: {piece id: {name, keep}}}: tissues renamed / switched off in the batch page
+    auto_off: dict = {}             # {run name: true}: tissue boxes were loaded from a GeoJSON for this run, its detected pieces start switched off
+    cut_off: bool = True            # cut the switched-off shapes out of the exported tissue boxes
 
 
 @app.post("/api/xenium/batch/run", response_class=ORJSONResponse)
@@ -1386,10 +1650,11 @@ def xenium_batch_run(r: BRunReq):
         raise HTTPException(400, "choose an output folder")
     if not r.runs or len(r.runs) > 500 or not all(isinstance(x, dict) and x.get("name") and x.get("path") for x in r.runs):
         raise HTTPException(400, "no runs selected")
-    if not (0 <= r.workers <= 256 and 0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6):
+    if not (0 <= r.workers <= 256 and 0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6
+            and r.detect in ("cells", "transcripts") and 0 <= r.tx_min <= 10**7):
         raise HTTPException(400, "parameter out of range")
     out = Path(r.output).expanduser()
-    spec = {"gap": r.gap, "min_cells": r.min_cells, "min_counts": r.min_counts}
+    spec = {"gap": r.gap, "min_cells": r.min_cells, "min_counts": r.min_counts, "detect": r.detect, "tx_min": r.tx_min}
     runs = [{"name": str(x["name"]), "path": str(x["path"]), "kind": str(x.get("kind", ""))} for x in r.runs]
     he = {str(k): {"czi": str(Path(v.get("czi") or "").expanduser()), "annotations": str(Path(v["annotations"]).expanduser()) if v.get("annotations") else ""} for k, v in (r.he or {}).items() if isinstance(v, dict) and v.get("czi")}
     for v in he.values():
@@ -1397,9 +1662,16 @@ def xenium_batch_run(r: BRunReq):
             raise HTTPException(400, f"H&E file not found: {v['czi'] if not Path(v['czi']).expanduser().is_file() else v['annotations']}")
 
     hreg = _he_reg_args(r.he_reg_folder, r.he_reg_index)
+    rects = {str(k): v for k, v in (r.regions or {}).items() if isinstance(v, list) and v}
+    if any(len(v) > 200 for v in rects.values()):
+        raise HTTPException(400, "too many drawn shapes in one run")
+    with BL.lock:                                       # free the runs that were read for the gallery
+        BL.cache.clear(); BL.order.clear(); BL.thumbs.clear()
+    comps = {str(k): v for k, v in (r.comps or {}).items() if isinstance(v, dict) and v}
+    reg = {"comps": comps, "auto_off": {str(k): bool(v) for k, v in (r.auto_off or {}).items()}, "cut_off": r.cut_off, "export": r.export_regions, "col": r.regions_name_col, "dir": _regions_dir(r.regions_dir) if r.export_regions else None, "rects": rects}
 
     def prepare():
-        rep = batch.run_batch(runs, out, _log, spec, r.merge, r.transcripts, he, r.tx_table, r.workers, r.ifimg, hreg)
+        rep = batch.run_batch(runs, out, _log, spec, r.merge, r.transcripts, he, r.tx_table, r.workers, r.ifimg, hreg, reg)
         keep = rep["merged"] or rep["first"]
         if keep is None:
             raise importer.ImportError_("no run could be converted; see the log above")
