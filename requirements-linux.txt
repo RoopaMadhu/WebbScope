@@ -9,6 +9,7 @@ scipy
 shapely
 pillow
 pylibCZIrw
+h5py
 pydantic
 pyinstaller
 readimc

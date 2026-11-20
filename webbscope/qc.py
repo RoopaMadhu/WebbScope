@@ -328,10 +328,10 @@ def qv_plot(hist41, title, w=230, h=125):
     return c.svg()
 
 
-def rank_plot(totals, title, w=230, h=150):
+def rank_plot(totals, title, w=230, h=150, ylab="total counts"):
     t = np.sort(np.asarray(totals, float))[::-1]
     pos = t[t > 0]
-    c = Chart(w, h, title, "gene rank", "total counts", ml=44)
+    c = Chart(w, h, title, "gene rank", ylab, ml=44)
     if len(pos) < 2:
         return c.svg()
     ly = np.log10(pos)
@@ -339,12 +339,12 @@ def rank_plot(totals, title, w=230, h=150):
     c.axes(xt=_ticks(0, len(t), 3), yt=[k for k in range(math.ceil(ly.min()), math.floor(ly.max()) + 1)] or None, yfmt=_pow_fmt)
     pts = " ".join(f"{c.sx(i):.1f},{c.sy(v):.1f}" for i, v in enumerate(ly))
     c.parts.append(f'<polyline points="{pts}" fill="none" stroke="{ACC}" stroke-width="1.2"/>')
-    c.parts.append(f'<text x="{c.w - c.mr}" y="{c.mt + 9}" font-size="8" fill="{MUTED}" text-anchor="end">{int((t == 0).sum())} of {len(t)} genes have no counts</text>')
+    c.parts.append(f'<text x="{c.w - c.mr}" y="{c.mt + 9}" font-size="8" fill="{MUTED}" text-anchor="end">{int((t == 0).sum())} of {len(t)} genes are not detected</text>')
     return c.svg()
 
 
-def gene_scatter(mean_pc, det_pc, title, w=230, h=150):
-    c = Chart(w, h, title, "mean counts per cell", "% cells detecting", ml=40)
+def gene_scatter(mean_pc, det_pc, title, w=230, h=150, xlab="mean counts per cell"):
+    c = Chart(w, h, title, xlab, "% cells detecting", ml=40)
     ok = mean_pc > 0
     if ok.sum() < 3:
         return c.svg()
@@ -558,7 +558,10 @@ def report_html(S, sample, TX=None, project_name="", marker=None, nav=True):
     row2 = box(hist(area, f"Cell area ({'µm²' if unit == 'um' else unit})", "area", mark=m.get("median_area"))) if area is not None else box("<h2>Cell area</h2><div class='note'>no cell-area column in this project</div>")
     row2 += box(hbars(items, "Segmentation / nuclei")) if items else box("<h2>Segmentation</h2><div class='note'>no segmentation columns in this project</div>")
     row2 += box(density2d(area, lib, "Transcripts vs cell area", "cell area", "transcripts", logx=True, logy=True)) if (area is not None and lib is not None) else box("")
-    row3 = '<div>' + box(rank_plot(tot, "Genes ranked by counts")) + '<div style="height:8px"></div>' + box(gene_scatter(tot / n, det / n * 100, "Detection vs expression")) + '</div>'   # the two gene plots stacked in the first column
+    if not S.has_counts:                                                # log-normalised values only: there are no counts to sum
+        row3 = '<div>' + box(rank_plot(tot, "Genes ranked by summed expression", ylab="sum of log-normalised values")) + '<div style="height:8px"></div>' + box(gene_scatter(tot / n, det / n * 100, "Detection vs expression", xlab="mean log-normalised value")) + '</div>'
+    else:
+        row3 = '<div>' + box(rank_plot(tot, "Genes ranked by counts")) + '<div style="height:8px"></div>' + box(gene_scatter(tot / n, det / n * 100, "Detection vs expression")) + '</div>'   # the two gene plots stacked in the first column
     nc_box = ""
     if TX is not None and sample in TX.loc:
         _tq2 = tx_qc(S, TX, sample)                                      # per-gene average QV recorded at import (every quality, transcripts assigned to this tissue's cells)

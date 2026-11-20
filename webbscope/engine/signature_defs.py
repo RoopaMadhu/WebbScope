@@ -6,7 +6,7 @@ single-cell atlases); they are NOT derived from this dataset, so review them bef
 # Genes removed from EVERY signature and every multi-gene score / analysis (excluded by the user: CCL5 is an unreliable gene here).
 EXCLUDED_GENES = frozenset({"CCL5"})
 # Older / newer HGNC symbols: the panel may use either, so a candidate is looked up under both.
-ALT_SYMBOLS = {"WARS1": "WARS", "STING1": "TMEM173", "SEPTIN4": "SEPT4", "PLAAT4": "RARRES3", "EPRS1": "EPRS", "CGAS": "MB21D1", "TNFSF13B": "BAFF"}
+ALT_SYMBOLS = {"WARS1": "WARS", "STING1": "TMEM173", "SEPTIN4": "SEPT4", "PLAAT4": "RARRES3", "EPRS1": "EPRS", "CGAS": "MB21D1", "TNFSF13B": "BAFF", "RIGI": "DDX58", "KIRREL1": "NEPH1"}
 ALT_SYMBOLS.update({v: k for k, v in list(ALT_SYMBOLS.items())})
 ALIASES = {"CTGF": "CCN2", "WARS": "WARS1", "HLA-DRA": "HLA-DRA", "NKG2D": "KLRK1", "PD1": "PDCD1", "PDL1": "CD274", "IL28RA": "IFNLR1",
            "SERPINH1": "SERPINH1", "MARCKS": "MARCKS", "TMEM173": "STING1", "LGALS3BP": "LGALS3BP", "IFNB": "IFNB1"}
@@ -107,3 +107,8 @@ SIGNATURES = [
     dict(id="apoptosis", group="Kidney programmes", name="Apoptosis / cell death",
          desc="Apoptosis and regulated cell-death genes.", genes=["CASP3", "CASP7", "CASP8", "CASP9", "BAX", "BAK1", "BCL2", "BCL2L1", "MCL1", "BID", "BAD", "FAS", "FASLG", "TNFRSF10A", "TNFRSF10B", "TNFSF10", "TP53", "PMAIP1", "BBC3", "GSDMD", "MLKL", "RIPK1", "RIPK3", "XIAP", "BIRC2", "BIRC3"], note=""),
 ]
+
+# Curated lists hidden from every signature picker until further notice (their sources were never recorded; they are under review). They can
+# still be looked up by id, so saved views and links keep working. The SLE ISG-amplification list (user-provided) stays visible.
+SHOWN_CURATED = ("isg_amp_sle",)
+HIDDEN_CURATED = frozenset(s["id"] for s in SIGNATURES if s["id"] not in SHOWN_CURATED)

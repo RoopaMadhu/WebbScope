@@ -1174,6 +1174,7 @@ def tissue_boxes(sess, spec, order, idx):
     # grow the detected boxes (200 -> 100 -> 50 -> 20 um, capped at the slide) where that touches no other box, then carve any overlap
     tis = [(n, b, x, y) for (n, _, x, y), b in zip(tis, _dilate_boxes([t[1] for t in tis], limit=limit, fixed=fixed))]
     geoms = _disjoint_boxes(tis)
+    raw = list(geoms)                                                      # before the switched-off shapes are cut out (the batch page's geometry-only export cuts them itself)
     if spec.get("cut_off", True):                                          # areas drawn with "use" unticked are cut out of every tissue box
         from shapely.ops import unary_union
         off = [shape_geom(r) for r in spec.get("rects", []) or [] if not r.get("keep", True)]
@@ -1181,9 +1182,9 @@ def tissue_boxes(sess, spec, order, idx):
             off = unary_union(off)
             geoms = [g.difference(off) for g in geoms]
     out = []
-    for (n, b, x, y), g in zip(tis, geoms):
+    for (n, b, x, y), g, g0 in zip(tis, geoms, raw):
         cut = not g.equals(b)
-        out.append({"name": n, "box": b, "geom": g, "n": int(len(x)), "x": x, "y": y, "cut": cut,
+        out.append({"name": n, "box": b, "geom": g, "raw": g0, "n": int(len(x)), "x": x, "y": y, "cut": cut,
                     "outside": int((~shapely.intersects_xy(g, x, y)).sum()) if cut else 0})
     return out
 
@@ -1250,6 +1251,62 @@ def export_tissue_boxes(sess, spec, folder, slide, name_col="sample_id_unblinded
         raise importer.ImportError_(f"{slide}: no tissue is switched on")
     write_regions(sess, spec, order, idx, d, lambda m: None, name_col, slide)
     return str(f)
+
+
+def _polygonal(g):
+    """Only the polygon parts of a geometry (a cut or make_valid can leave lines or points behind)."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
+    if g.geom_type in ("Polygon", "MultiPolygon"):
+        return g
+    parts = [q for q in getattr(g, "geoms", []) if q.geom_type in ("Polygon", "MultiPolygon")]
+    return unary_union(parts) if parts else Polygon()
+
+
+def _polys_geom(polys):
+    """A tissue outline as the page holds it, [[outer ring, hole, ...], ...] with rings as [[x, y], ...], -> one valid geometry."""
+    from shapely.ops import unary_union
+    if not isinstance(polys, list) or not polys or len(polys) > 200:
+        raise importer.ImportError_("a tissue outline needs 1 to 200 parts")
+    return _polygonal(unary_union([shape_geom({"pts": p[0], "holes": p[1:]}) for p in polys if isinstance(p, list) and p]))
+
+
+def write_tissue_geometry(folder, slide, shapes, tissues=None, cut_off=True, name_col="sample_id_unblinded"):
+    """Write <slide>_regions.geojson into `folder` from geometry alone: no cells or transcripts are read. One Feature per tissue: its outline
+    (`tissues` = [{name, polys}] as already built on the batch page, or, when None, the union of the kept shapes of each name, e.g. tissue boxes
+    loaded from a GeoJSON), with the switched-off shapes cut out when `cut_off`; and one Feature per switched-off shape (keep false, so the file
+    loads back with it switched off). Properties: the tissue name (under `name_col`) and the slide. Tissues are not made disjoint here: overlapping
+    ones are written as they are and reported. Returns (path, [[name, name], ...] of overlapping tissues, [names left empty by the cut])."""
+    from shapely.geometry import mapping
+    from shapely.ops import unary_union
+    nm = lambda r: str(r.get("name") or "region").strip() or "region"
+    shapes = [r for r in (shapes or []) if isinstance(r, dict)]
+    by = {}
+    if tissues is None:
+        for r in shapes:
+            if r.get("keep", True):
+                by.setdefault(nm(r), []).append(shape_geom(r))
+    else:
+        for t in tissues:
+            if isinstance(t, dict):
+                by.setdefault(nm(t), []).append(_polys_geom(t.get("polys")))
+    geoms = {n: _polygonal(unary_union(gs)) for n, gs in by.items()}
+    off = [r for r in shapes if not r.get("keep", True)]
+    if cut_off and off:
+        cut = unary_union([shape_geom(r) for r in off])
+        geoms = {n: _polygonal(g.difference(cut)) for n, g in geoms.items()}
+    empty = [n for n, g in geoms.items() if g.is_empty or g.area <= 0]
+    geoms = {n: g for n, g in geoms.items() if n not in empty}
+    if not geoms:
+        raise importer.ImportError_("no tissue is switched on" if not empty else "nothing is left of the tissues after the switched-off shapes were cut out")
+    names = list(geoms)
+    overlaps = [[a, b] for i, a in enumerate(names) for b in names[i + 1:] if geoms[a].intersection(geoms[b]).area > 1e-6]
+    feats = [{"type": "Feature", "geometry": mapping(g), "properties": {name_col: n, "slide": slide}} for n, g in geoms.items()]
+    feats += [{"type": "Feature", "geometry": mapping(_polygonal(shape_geom(r))), "properties": {name_col: nm(r), "slide": slide, "keep": False}} for r in off]
+    fc = {"type": "FeatureCollection", "coordinate_unit": "um (Xenium frame, y down)", "name_column": name_col, "features": feats}
+    f = Path(folder).expanduser() / regions_filename(slide)
+    f.write_text(json.dumps(fc))
+    return str(f), overlaps, empty
 
 
 def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None, tx_table=None, threads=1, export_regions=False, regions_name_col="sample_id_unblinded", regions_dir=None):

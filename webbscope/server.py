@@ -13,7 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from .engine.store import Store
 from .engine.smooth import Smoother, SCOPES, MAX_SIGMA
-from .engine.signature_defs import EXCLUDED_GENES
+from .engine.signature_defs import EXCLUDED_GENES, HIDDEN_CURATED
 from .engine.neighbors import Neighbors
 from .engine import sigstats, violin
 from .engine.glomhet import GlomHet
@@ -56,6 +56,14 @@ class ExprReq(BaseModel):
     within: str = "tissue"
 
 
+def _layer(layer):
+    """HTTP 400 unless the layer is logcpx, or counts in a project that has raw counts."""
+    if layer not in ("logcpx", "counts"):
+        raise HTTPException(400, "layer must be 'logcpx' or 'counts'")
+    if layer == "counts" and S is not None and not S.has_counts:
+        raise HTTPException(400, "this project holds log-normalised values, not raw counts")
+
+
 def _expr(specs):
     """Validate gene / signature filters and return them as plain dicts (hashable once repr'd)."""
     out = []
@@ -68,8 +76,9 @@ def _expr(specs):
         bad = [g for g in genes if g not in S.gene_index]
         if bad:
             raise HTTPException(404, f"genes not in panel: {bad[:5]}")
-        if e.op not in ("gt", "le") or e.layer not in ("logcpx", "counts") or e.scope not in SCOPES or not 0 <= e.sigma <= MAX_SIGMA:
-            raise HTTPException(400, "bad op, layer, scope or sigma")
+        _layer(e.layer)
+        if e.op not in ("gt", "le") or e.scope not in SCOPES or not 0 <= e.sigma <= MAX_SIGMA:
+            raise HTTPException(400, "bad op, scope or sigma")
         try:
             SM.check_within(e.within)
         except ValueError as ex:
@@ -189,9 +198,12 @@ _sig_cache: dict = {}
 
 def _genes_of(sig_id, genes):
     if sig_id:
-        if sig_id not in S.sig_by_id:
+        sg = S.sig(sig_id)
+        if sg is None:
             raise HTTPException(404, f"unknown signature {sig_id!r}")
-        return list(S.sig_by_id[sig_id]["genes"])
+        if not sg["genes"]:
+            raise HTTPException(400, f"none of the genes of {sg['name']!r} are on this panel")
+        return list(sg["genes"])
     bad = [g for g in genes or [] if g not in S.gene_index]
     if not genes or bad:
         raise HTTPException(400, f"give a signature id or panel genes (not on the panel: {bad[:5]})")
@@ -200,8 +212,20 @@ def _genes_of(sig_id, genes):
 
 @app.get("/api/signatures", response_class=ORJSONResponse)
 def signatures():
-    """Curated signatures (genes present on the panel, genes missing, coherence checks) + subtype order used by the analyses."""
-    return {**S.signatures, "subtype_order": sigstats.SUBTYPE_ORDER}
+    """What the signature pickers offer: the shown curated signatures in full (genes on the panel, genes missing, coherence checks; the curated
+    lists under review are left out, see signature_defs.HIDDEN_CURATED), and the GO / Reactome gene sets with at least genesets.MIN_GENES genes
+    on the panel as [id, name, n genes] (the full record of one comes from /api/signature/{id}); + the subtype order used by the analyses."""
+    shown = [x for x in S.signatures["signatures"] if x["id"] not in HIDDEN_CURATED]
+    return {**S.signatures, "signatures": shown, "genesets": S.genesets.listing(), "subtype_order": sigstats.SUBTYPE_ORDER}
+
+
+@app.get("/api/signature/{sid}", response_class=ORJSONResponse)
+def signature_one(sid: str):
+    """The full record of one signature (curated or GO / Reactome): name, description, genes on the panel, genes missing."""
+    sg = S.sig(sid)
+    if sg is None:
+        raise HTTPException(404, f"unknown signature {sid!r}")
+    return sg
 
 
 class SigSummaryReq(BaseModel):
@@ -273,8 +297,7 @@ def violin_api(req: ViolinReq):
         raise HTTPException(400, "choose 1-8 features and 1-12 cell types")
     if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
         raise HTTPException(400, "bad scope or sigma")
-    if req.layer not in ("logcpx", "counts"):
-        raise HTTPException(400, "layer must be logcpx or counts")
+    _layer(req.layer)
     if req.unit not in ("sample", "subtype", "type"):
         raise HTTPException(400, "unit must be sample, subtype or type")
     if req.level not in ("cell_type", "cell_state"):
@@ -285,7 +308,7 @@ def violin_api(req: ViolinReq):
     feats = []
     for f in req.features:
         if f.sig:
-            feats.append({"label": S.sig_by_id[f.sig]["name"] if f.sig in S.sig_by_id else f.sig, "genes": _genes_of(f.sig, None)})
+            feats.append({"label": (S.sig(f.sig) or {}).get("name", f.sig), "genes": _genes_of(f.sig, None)})
         elif f.gene:
             feats.append({"label": f.gene, "genes": _genes_of(None, [f.gene])})
         else:
@@ -305,12 +328,13 @@ def violin_hist(req: ViolinReq):
     """Histograms of the per-cell values behind the violins (all donors pooled), so the plotted scale can be checked."""
     if not req.features or len(req.features) > 8 or not req.cell_types or len(req.cell_types) > 12:
         raise HTTPException(400, "choose 1-8 features and 1-12 cell types")
-    if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA or req.layer not in ("logcpx", "counts"):
-        raise HTTPException(400, "bad scope, sigma or layer")
+    _layer(req.layer)
+    if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
+        raise HTTPException(400, "bad scope or sigma")
     nct = len(S.cats["cell_type"]["levels"])
     if any(c < -1 or c >= nct for c in req.cell_types) or req.unit not in ("sample", "subtype", "type"):
         raise HTTPException(400, "unknown cell type or unit")
-    feats = [{"label": S.sig_by_id[f.sig]["name"] if f.sig in S.sig_by_id else f.sig, "genes": _genes_of(f.sig, None)} if f.sig else {"label": f.gene, "genes": _genes_of(None, [f.gene])}
+    feats = [{"label": (S.sig(f.sig) or {}).get("name", f.sig), "genes": _genes_of(f.sig, None)} if f.sig else {"label": f.gene, "genes": _genes_of(None, [f.gene])}
              for f in req.features if f.sig or f.gene]
     key = ("viohist", tuple((x["label"], tuple(x["genes"])) for x in feats), tuple(req.cell_types), req.sigma, req.scope, req.nonzero_only, req.layer, req.unit)
     if key not in _sig_cache:
@@ -390,8 +414,9 @@ def glomhet_cellscore(req: GlomCellScoreReq):
     bad = [x for x in req.genes if x not in S.gene_index]
     if not req.genes or bad:
         raise HTTPException(400, f"give panel genes (not on the panel: {bad[:5]})")
-    if req.layer not in ("logcpx", "counts") or req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
-        raise HTTPException(400, "bad layer, scope or sigma")
+    _layer(req.layer)
+    if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
+        raise HTTPException(400, "bad scope or sigma")
     try:
         v = g.cell_score(req.genes, req.layer, req.sigma, req.scope, req.within)
     except ValueError as e:
@@ -568,8 +593,7 @@ def expr(sample: str, genes: str, layer: str = "logcpx", sigma: float = 0.0, sco
     bad = [g for g in gl if g not in S.gene_index]
     if bad:
         raise HTTPException(404, f"genes not in panel: {bad[:5]}")
-    if layer not in ("logcpx", "counts"):
-        raise HTTPException(400, "layer must be 'logcpx' or 'counts'")
+    _layer(layer)
     if scope not in SCOPES:
         raise HTTPException(400, f"scope must be one of {SCOPES}")
     if not 0 <= sigma <= MAX_SIGMA:
@@ -585,8 +609,7 @@ def gene(sample: str, gene: str, layer: str = "logcpx"):
     a, b = sl(sample)
     if gene not in S.gene_index:
         raise HTTPException(404, f"gene {gene!r} not in panel")
-    if layer not in ("logcpx", "counts"):
-        raise HTTPException(400, "layer must be 'logcpx' or 'counts'")
+    _layer(layer)
     key = (sample, gene, layer)
     if key not in _gene_cache:
         if len(_gene_cache) > 400:
@@ -636,15 +659,8 @@ def cell(sample: str, i: int, top: int = 40):
     row = S.df.iloc[gi]
     md = {k: (None if (isinstance(v, float) and np.isnan(v)) else (v.item() if hasattr(v, "item") else v))
           for k, v in row.items()}
-    # expression of one cell needs a column of the gene-major CSR: scan genes (4k) with searchsorted
-    out = []
-    for g, name in enumerate(S.genes):
-        p0, p1 = int(S.indptr[g]), int(S.indptr[g + 1])
-        j = np.searchsorted(S.indices[p0:p1], gi)
-        if j < p1 - p0 and S.indices[p0 + j] == gi:
-            c = float(S.data[p0 + j])
-            out.append({"gene": name, "counts": c, "logcpx": float(np.log1p(c / max(S.lib[gi], 1) * S.norm_scale))})
-    out.sort(key=lambda r: -r["counts"])
+    out = S.cell_expression(gi)                 # one column of the gene-major CSR: a search per gene
+    out.sort(key=lambda r: -r["counts"] if r["counts"] is not None else -r["logcpx"])
     return {"metadata": md, "expression": out, "n_genes_detected": len(out)}
 
 
@@ -997,7 +1013,7 @@ def _load(cache_dir, project):
             _log(f"transcripts ignored: {e}")
 
 
-def open_project(path, force=False, prepare=None, roi_object=None, if_path=None, cols=None, he_reg=None, imc_path=None):
+def open_project(path, force=False, prepare=None, roi_object=None, if_path=None, cols=None, he_reg=None, imc_path=None, save_pj=False):
     """Import (if needed) and load a project folder, in a background thread."""
     global S
     if ST.state == "importing":
@@ -1013,13 +1029,24 @@ def open_project(path, force=False, prepare=None, roi_object=None, if_path=None,
                     p = Path(prepare()).expanduser()
             else:
                 p = Path(path).expanduser()
+            p, h5name = _split_path(p)                 # the path to an .h5ad opens that file alone (its folder's files are not read)
+            c = {**(cols or {}), "h5ad": h5name, "file_only": True} if h5name else cols
             if not p.is_dir():
-                raise importer.ImportError_(f"not a folder: {p}")
+                raise importer.ImportError_(f"not a folder or an .h5ad file: {p}")
             with PROF.step("import into the cache (skipped when current)"):
-                cdir = importer.ensure_cache(p, _log, force, roi_object, cols)
+                cdir = importer.ensure_cache(p, _log, force, roi_object, c)
+            if save_pj and not h5name:
+                try:
+                    _log(f"saved the choices as {importer.save_project_json(p, cdir, roi_object)}")
+                except (OSError, ValueError, KeyError) as e:
+                    _log(f"project.json not saved ({e}); the choices are kept in the cache instead")
             S = None                                  # until the new project is fully loaded
             _log("loading")
-            _load(cdir, p)
+            root = p
+            if h5name:                                # file only: H&E, IF, IMC, transcripts are looked for in an empty folder, not next to the file
+                root = Path(cdir) / "file_only"
+                root.mkdir(exist_ok=True)
+            _load(cdir, root)
             if if_path:
                 _user_if(if_path)
             if he_reg:
@@ -1100,6 +1127,13 @@ class OpenReq(BaseModel):
     imc_file: str = ""             # IMC slide (.mcd), optional: converted into the cache in the background
     sample_col: str | None = None  # cell-table column that identifies the samples (None = project.json / found by name)
     donor_col: str | None = None   # cell-table column that identifies the donors ("" = there is none, None = found by name)
+    roles: dict | None = None      # other columns chosen when opening {role: column, "" = none} (cell_id, x, y, cell_type, cell_state, region_lvl1-3, lib_size)
+    values: str | None = None      # matrix.mtx / .npz: "counts" or "lognorm" (already log-normalised)
+    counts_matrix: str | None = None   # .h5ad: the matrix with the raw counts (X, layers/<name>, raw/X; "" = none)
+    lognorm_matrix: str | None = None  # .h5ad: the matrix with log-normalised values ("" = none)
+    genes: str | None = None       # .h5ad: the var column with the gene names ("" = the var index)
+    save_project_json: bool = False    # write the choices into the folder as project.json
+    norm_scale: str | None = None  # raw counts: the scale of log1p(counts / total x scale) ("" = the median total counts per cell)
 
 
 @app.get("/api/status", response_class=ORJSONResponse)
@@ -1107,38 +1141,151 @@ def status():
     return {"state": ST.state, "log": ST.log[-40:], "error": ST.error, "project": ST.project, "open": S is not None}
 
 
+def _split_path(path):
+    """A project path as (folder, name of the .h5ad or None): the path to an .h5ad file opens that file in its folder."""
+    p = Path(path).expanduser()
+    if p.is_file() and p.suffix.lower() == ".h5ad":
+        return p.parent, p.name
+    return p, None
+
+
+# The columns asked for when opening a project without project.json: (role, label, required, words in likely names, likely names, text of "none")
+ROLE_Q = [("cell_id", "Cell ID", True, ["cell", "barcode"], ["cell_id", "cell", "barcode", "CellID", "obs_names"], None),
+          ("x", "x coordinate (µm)", True, [], ["x", "x_centroid", "X", "center_x", "centroid_x", "x_location", "spatial_x", "X_spatial_x"], None),
+          ("y", "y coordinate (µm)", True, [], ["y", "y_centroid", "Y", "center_y", "centroid_y", "y_location", "spatial_y", "X_spatial_y"], None),
+          ("sample", "Sample ID", True, ["sample", "tissue", "section", "fov"], [], None),
+          ("donor", "Donor ID", False, ["donor", "patient", "subject", "individual"], [], "(none: use the sample id)"),
+          ("cell_type", "Cell type", False, ["type", "cluster", "leiden", "louvain", "annotation"], [], "(none: every cell 'unlabelled')"),
+          ("cell_state", "Cell state (finer)", False, ["state", "subtype", "fine", "subcluster"], [], "(none: the same as the cell type)"),
+          ("region_lvl1", "Region, level 1", False, ["region", "niche", "domain", "annotation"], [], "(none)"),
+          ("region_lvl2", "Region, level 2", False, ["region", "niche", "domain", "annotation"], [], "(none)"),
+          ("region_lvl3", "Region, level 3", False, ["region", "niche", "domain", "annotation"], [], "(none)"),
+          ("lib_size", "Total counts per cell", False, ["count", "total", "lib"], ["lib_size", "total_counts", "transcript_counts", "nCount_Xenium", "nCount_RNA", "nCount_Spatial", "n_counts"], "(none)")]
+
+
 @app.get("/api/columns", response_class=ORJSONResponse)
 def project_columns(path: str):
-    """Columns of a project folder's cell table, with the ones that look like the sample id and the donor id (by name), for the question asked when opening.
-    ask = False for projects this app wrote itself (their columns are known)."""
+    """What to ask when opening a project: the columns of its cell table with likely candidates for each role, and for a project without
+    project.json (or an .h5ad) also the matrix, whether it holds raw counts or log-normalised values, and the normalisation scale.
+    ask = False for projects this app wrote itself (their columns are known). Defaults: the choices of the last opening, else project.json,
+    else found by name."""
     import pyarrow.parquet as pq, pyarrow.compute as pc
     from .engine.config import find_columns, suggest
-    p = Path(path).expanduser()
-    f = p / "cells.parquet"
-    if not f.is_file():
-        raise HTTPException(400, "this folder has no cells.parquet: it is not a project folder")
-    names = pq.ParquetFile(f).schema_arrow.names
-    roles = {}
-    if (p / "project.json").is_file():
+    p, h5name = _split_path(path)
+    if not p.is_dir():
+        raise HTTPException(400, f"not a folder or an .h5ad file: {p}")
+    try:
+        h5 = importer.source_of(p, {"h5ad": h5name} if h5name else None)
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    try:
+        tables = importer.has_tables(p)
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    if h5 is None and not tables:
+        raise HTTPException(400, "this folder is not a project: it needs one .h5ad file, or a matrix (counts.mtx or matrix.mtx, and/or counts_logcpx.mtx; also .mtx.gz or .npz) with features.tsv.gz, barcodes.tsv.gz and the cell metadata (cells_metadata.parquet or cells.parquet)")
+    man, pjf = {}, p / "project.json"
+    if pjf.is_file() and not h5name:                            # a file alone: its folder's project.json is not used
         try:
-            roles = json.loads((p / "project.json").read_text()).get("roles") or {}
+            man = json.loads(pjf.read_text())
         except ValueError:
             pass
+    roles = man.get("roles") or {}
+    _, mem = importer.known_choices(p, h5name, file_only=bool(h5name))   # project.json's saved choices (not for a file alone), then those remembered in the cache
+    full = h5 is not None or not pjf.is_file() or "choices" in man
+    file_only = bool(h5name)
+    out = {"ask": not (p / xenium.MARKER).is_file(), "full": full, "h5ad": h5.name if h5 is not None else None, "remembered": bool(mem),
+           "known": bool(mem),                                  # answers exist: the open page opens directly (with a link to change them)
+           "file_only": file_only,                             # an .h5ad file was given: only it is read, nothing is saved next to it
+           "project_json": {"exists": pjf.is_file() and not file_only, "ours": "choices" in man, "writable": os.access(p, os.W_OK) and not file_only}}
+    frame, uniq = None, {}
+    if h5 is not None:
+        import h5py
+        from . import h5ad
+        try:
+            with h5py.File(h5, "r") as f:
+                frame, idcol, _ = h5ad.obs(f)
+                names = list(frame.columns)
+                roles = {**roles, "cell_id": idcol}
+                mats = h5ad.matrices(f)
+                if not mats:
+                    raise HTTPException(400, f"{h5.name} has no matrix of cells x genes (X, layers or raw/X)")
+                for m in mats:
+                    m.update(h5ad.peek(f, m["key"]))
+                gcols = {}
+                for m in mats:
+                    k = "raw/var" if m["key"] == "raw/X" else "var"
+                    if k not in gcols:
+                        cs = h5ad.gene_columns(f, m["key"])
+                        gcols[k] = {"columns": cs, "examples": {c: h5ad.gene_names(f, m["key"], c)[:3] for c in [""] + cs}}
+                    m["var"] = k
+        except importer.ImportError_ as e:
+            raise HTTPException(400, str(e))
+        except OSError as e:
+            raise HTTPException(400, f"cannot read {h5.name} as an .h5ad (HDF5) file: {e}")
+        keys = [m["key"] for m in mats]
+        with h5py.File(h5, "r") as f:
+            ck, lk = h5ad.guess(f, mats)
+        if "counts_matrix" in mem or "lognorm_matrix" in mem:
+            ck = mem.get("counts_matrix") if mem.get("counts_matrix") in keys else None
+            lk = mem.get("lognorm_matrix") if mem.get("lognorm_matrix") in keys else None
+        det = None
+        gdef = {}
+        for k, g in gcols.items():                      # gene names: the var index, unless it holds Ensembl ids and a symbol column exists
+            ex = g["examples"][""]
+            sym = next((c for c in ("gene_symbols", "gene_symbol", "feature_name", "gene_name", "gene_names", "symbol", "Symbol") if c in g["columns"]), None)
+            gdef[k] = sym if (ex and all(str(x).startswith("ENS") for x in ex) and sym) else ""
+        if "genes" in mem and (mem["genes"] == "" or any(mem["genes"] in g["columns"] for g in gcols.values())):
+            gdef = {k: mem["genes"] for k in gdef}
+        out.update(matrices=mats, counts_matrix=ck or "", lognorm_matrix=lk or "", genes={"options": gcols, "default": gdef})
+    else:
+        cf = importer.cells_file(p)
+        names = pq.ParquetFile(cf).schema_arrow.names
+        out["files"] = {k: (v.name if v else None) for k, v in importer.matrix_files(p).items()} | {"cells": cf.name}
+        det = None
+    out["columns"] = names
+
+    def nunique(c):
+        if c in uniq:
+            return uniq[c]
+        try:
+            uniq[c] = int(frame[c].nunique(dropna=True)) if frame is not None else int(pc.count_distinct(pq.read_table(importer.cells_file(p), columns=[c])[c]).as_py())
+        except Exception:
+            uniq[c] = None
+        return uniq[c]
+
     sug = suggest(names)
-    out = {"columns": names, "ask": not (p / xenium.MARKER).is_file()}
-    tb = None
-    for role in ("sample", "donor"):
-        cand = find_columns(names, role)
-        dflt = roles.get(role) if roles.get(role) in names else sug.get(role)
+    out["roles"] = []
+    for role, label, req, words, likely, none in ROLE_Q:
+        if not full and role not in ("sample", "donor"):
+            continue
+        cand = [c for c in likely if c in names]
+        for w in words:
+            cand += [c for c in find_columns(names, w) if c not in cand]
+        if role in ("x", "y"):
+            cand += [c for c in names if c not in cand and (c.lower().endswith("_" + role) or c.lower().startswith(role + "_"))]
+        if role in mem and (mem[role] in names or (mem[role] == "" and not req)):
+            dflt = mem[role]
+        elif roles.get(role) in names:
+            dflt = roles[role]
+        elif sug.get(role):
+            dflt = sug[role]
+        elif req or role == "cell_type":
+            dflt = cand[0] if cand else ("" if not req else names[0])
+        else:
+            dflt = ""
         if dflt and dflt not in cand:
             cand = [dflt] + cand
-        n = {}
-        for c in cand[:8]:
-            try:
-                n[c] = int(pc.count_distinct(pq.read_table(f, columns=[c])[c]).as_py())
-            except Exception:
-                n[c] = None
-        out[role] = {"default": dflt, "candidates": cand, "n_unique": n}
+        info = {"role": role, "label": label, "required": req, "none": none, "default": dflt, "candidates": cand,
+                "n_unique": {c: nunique(c) for c in cand[:8]} if role not in ("x", "y", "lib_size") else {}}
+        out["roles"].append(info)
+        if role in ("sample", "donor"):
+            out[role] = info                                 # the two questions of a project with project.json (and of older pages)
+    vdef = mem.get("values") if mem.get("values") in ("counts", "lognorm") else man.get("values") if man.get("values") in ("counts", "lognorm") else \
+        ("lognorm" if det and not det.get("integer", True) else "counts")
+    out["values"] = {"default": vdef, "detected": det, "show": False}     # told by the file names (counts.mtx / matrix.mtx, counts_logcpx.mtx) or chosen per .h5ad matrix
+    ns = mem.get("norm_scale") if mem.get("norm_scale") not in (None, "") else man.get("norm_scale")
+    out["norm_scale"] = "" if ns is None else str(ns)
     return out
 
 
@@ -1157,12 +1304,21 @@ def open_(r: OpenReq):
         if not ifp.exists():
             raise HTTPException(400, f"IF image not found: {ifp}")
     cols = {k: v.strip() for k, v in (("sample", r.sample_col), ("donor", r.donor_col)) if v is not None and (k == "donor" or v.strip())}
+    for k, v in (r.roles or {}).items():
+        if k in importer.ROLES and k not in ("sample", "donor") and isinstance(v, str):
+            cols[k] = v.strip()
+    for k in ("values", "counts_matrix", "lognorm_matrix", "genes", "norm_scale"):
+        v = getattr(r, k)
+        if v is not None:
+            cols[k] = str(v).strip()
+    if cols.get("values") not in (None, "counts", "lognorm"):
+        raise HTTPException(400, "values must be 'counts' or 'lognorm'")
     imp = None
     if r.imc_file.strip():
         imp = Path(r.imc_file.strip()).expanduser()
         if not imp.is_file() or imp.suffix.lower() != ".mcd":
             raise HTTPException(400, f"IMC file not found or not an .mcd file: {imp}")
-    open_project(r.path, r.force, roi_object=roi, if_path=ifp, cols=cols or None, he_reg=_he_reg_args(r.he_reg_folder, r.he_reg_index), imc_path=imp)
+    open_project(r.path, r.force, roi_object=roi, if_path=ifp, cols=cols or None, he_reg=_he_reg_args(r.he_reg_folder, r.he_reg_index), imc_path=imp, save_pj=r.save_project_json)
     return {"ok": True}
 
 
@@ -1268,11 +1424,13 @@ def _preview(s, sp):
         names, idx, comps, counts = s.labels(sp.model_dump())
     except importer.ImportError_ as e:
         raise HTTPException(400, str(e))
+    tb = xenium.tissue_boxes(s, sp.model_dump(), names, idx)
     return {"names": names, "labels": idx.tolist(), "comps": comps, "counts": counts,
             "n_kept": int((idx >= 0).sum()), "n_below_min": int((idx == -2).sum()), "tx_threshold": getattr(s, "tx_threshold", None) if sp.detect == "transcripts" else None,
             "grid": s.tx_payload(sp.gap, sp.min_cells, sp.min_counts, sp.detect, sp.tx_min),
             "boxes": s.piece_boxes(sp.gap, sp.min_cells, sp.min_counts, sp.detect, sp.tx_min),
-            "tissue_polys": xenium.polys_payload(xenium.tissue_boxes(s, sp.model_dump(), names, idx)), "slide_bounds": xenium.slide_bounds(s)}
+            "tissue_polys": xenium.polys_payload(tb), "slide_bounds": xenium.slide_bounds(s),
+            "tissue_polys_raw": xenium.polys_payload([{"name": t["name"], "geom": t["raw"]} for t in tb])}   # before the switched-off shapes are cut out
 
 
 @app.post("/api/xenium/preview", response_class=ORJSONResponse)
@@ -1568,53 +1726,53 @@ def xenium_batch_draw_preview(r: BPrevReq):
 
 
 class BTissueExportReq(BaseModel):
-    runs: list                      # [{name, path, kind}] whose tissue boxes to write
+    runs: list                      # [{name, shapes: [drawn shapes], tissues: [{name, polys}] | null}]: the geometry the page holds; tissues null = the kept shapes are the tissues
     folder: str                     # one <run>_regions.geojson per run goes here
-    gap: float = 200
-    min_cells: int = 500
-    min_counts: int = 1
-    detect: str = "cells"
-    tx_min: int = 0
-    regions: dict = {}              # {run: [drawn shapes]}
-    comps: dict = {}                # {run: {piece id: {name, keep}}}
-    auto_off: dict = {}             # {run: true} for runs whose tissue boxes were loaded from a GeoJSON
-    cut_off: bool = True
+    cut_off: bool = True            # cut the switched-off shapes out of the tissues
     name_col: str = "sample_id_unblinded"
     overwrite: bool = False
 
 
 @app.post("/api/xenium/batch/tissues/export", response_class=ORJSONResponse)
 def xenium_batch_tissues_export(r: BTissueExportReq):
-    """Write <run>_regions.geojson for every given run into one folder, from the edits made on the batch page, without converting. Nothing is written
-    when a file exists and overwrite is not set (409 lists them). Returns {written: [path], errors: {run: message}}."""
-    if ST.state == "importing":
-        raise HTTPException(409, "an import is running")
+    """Write <run>_regions.geojson for every given run into one folder from the geometry the batch page already holds (no run is read; see
+    xenium.write_tissue_geometry). Nothing is written when a file exists and overwrite is not set (409 lists them). Returns
+    {written: [path], errors: {run: message}, overlaps: {run: [[tissue, tissue], ...]}, empty: {run: [tissue]}}."""
     if not r.folder.strip():
         raise HTTPException(400, "choose a folder for the files")
-    if not (0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6 and r.detect in ("cells", "transcripts") and 0 <= r.tx_min <= 10**7):
-        raise HTTPException(400, "parameter out of range")
-    runs = [x for x in r.runs if isinstance(x, dict) and x.get("name") and x.get("kind") != "project"]
+    runs = [x for x in r.runs if isinstance(x, dict) and x.get("name")]
     if not runs or len(runs) > 500:
         raise HTTPException(400, "no runs to export")
     d = Path(r.folder).expanduser()
     exist = [str(d / xenium.regions_filename(x["name"])) for x in runs if (d / xenium.regions_filename(x["name"])).exists()]
     if exist and not r.overwrite:
         raise HTTPException(409, f"{len(exist)} file(s) exist: " + ", ".join(Path(e).name for e in exist))
-    written, errors = [], {}
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(400, f"cannot create {d}: {e}")
+    written, errors, overlaps, empty = [], {}, {}, {}
+    col = r.name_col.strip() or "sample_id_unblinded"
     for x in runs:
-        n = str(x["name"])
-        spec = {"gap": r.gap, "min_cells": r.min_cells, "min_counts": r.min_counts, "detect": r.detect, "tx_min": r.tx_min,
-                "rects": (r.regions or {}).get(n) or [], "comps": (r.comps or {}).get(n) or {}, "auto_off": bool((r.auto_off or {}).get(n)), "cut_off": r.cut_off}
-        if len(spec["rects"]) > 200:
-            errors[n] = "too many drawn shapes"
+        n, shapes, tissues = str(x["name"]), x.get("shapes") or [], x.get("tissues")
+        if not isinstance(shapes, list) or len(shapes) > 200 or (tissues is not None and (not isinstance(tissues, list) or len(tissues) > 500)):
+            errors[n] = "too many shapes or tissues"
             continue
         try:
-            written.append(xenium.export_tissue_boxes(_light(x, r.detect == "transcripts"), spec, d, n, r.name_col.strip() or "sample_id_unblinded", True))
-        except HTTPException as e:
-            errors[n] = e.detail
-        except Exception as e:
+            path, ov, em = xenium.write_tissue_geometry(d, n, shapes, tissues, r.cut_off, col)
+        except importer.ImportError_ as e:
             errors[n] = str(e)
-    return {"written": written, "errors": errors}
+            continue
+        except Exception as e:
+            traceback.print_exc()
+            errors[n] = str(e)
+            continue
+        written.append(path)
+        if ov:
+            overlaps[n] = ov
+        if em:
+            empty[n] = em
+    return {"written": written, "errors": errors, "overlaps": overlaps, "empty": empty}
 
 
 class BRunReq(BaseModel):

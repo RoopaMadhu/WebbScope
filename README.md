@@ -60,7 +60,7 @@ The main input is **one** of the two rows of the first table. *Batch import* say
 | Input | Formats | Batch import |
 |---|---|---|
 | **1. Raw Xenium output** (cells, boundaries, counts, clusters) | An extracted folder, a `.tar.gz` / `.tar` bundle or a `.zip` bundle. Files read: `cell_feature_matrix/` (the `matrix.mtx.gz` form; `.h5` is not read), `cells.parquet`, `cell_boundaries.parquet`, `experiment.xenium` and the 10x analysis files. The Atera `.zarr.zip` layout is not supported. | **Yes.** A folder holding many runs; all folders or all bundles, not a mix. |
-| **2. Project folder** (counts + cell table, for data that did not come from Xenium output) | A folder with `project.json`, `matrix.mtx.gz` + `features.tsv.gz` + `barcodes.tsv.gz` (or `matrix.npz`), `cells.parquet` and `cell_boundaries.parquet`; optional embeddings, regions, signatures. See [Project folder format](#project-folder-format). | **No.** |
+| **2. Project folder** (a matrix + cell table, for data that did not come from Xenium output) | A folder with `features.tsv.gz` + `barcodes.tsv.gz`, the cell metadata (`cells_metadata.parquet` or `cells.parquet`) and the matrix: `counts.mtx` or `matrix.mtx` (raw counts) and/or `counts_logcpx.mtx` (log-normalised values); each also as `.mtx.gz` or a sparse `.npz`. **Or** one AnnData `.h5ad` file: give its folder to also read the folder's cell outlines and other extras, or the file itself (**Browse .h5ad…**) to read that file alone. Optional: `project.json`, `cell_boundaries.parquet` (without it cells are drawn as dots), embeddings, regions, signatures. See [Project folder format](#project-folder-format). | **No.** |
 
 ### Auxiliary information
 
@@ -79,7 +79,7 @@ Optional additions to the main input.
 ## Quick start
 
 1. Start the app (see above). Either click **Browse…** and choose a project folder, or import a Xenium output from the links on the first page.
-2. For a project folder, the app asks which columns of the cell table are the **sample id** and the **donor id**. It suggests the columns whose names contain "sample" and "donor"; correct them if needed and press **Open** again. Projects this app wrote itself are opened without the question.
+2. For a project folder, the app asks which columns of the cell table are the **sample id** and the **donor id**. It suggests the columns whose names contain "sample" and "donor"; correct them if needed and press **Open** again. A folder without `project.json`, or an `.h5ad`, gets a longer form (see [Project folder format](#project-folder-format)). Projects this app wrote itself are opened without the question.
 3. Pick **Colour by** in the left panel, type a gene, open **Slide**, **Gallery** or **QC report** from the toolbar.
 
 ### Import your own Xenium data
@@ -119,6 +119,10 @@ Imports write a project folder (default `~/.webbscope/projects/<run>`). The view
 
 In the Mac app window, **QC report**, **Profile** and the validation-report link open in your default browser (the window itself cannot open a new tab); in a browser they open in a new tab.
 
+### Gene signatures
+
+Every signature picker lists the SLE ISG-amplification list, then **GO** and **Reactome**: click either to open its gene sets, or type in the search box to search all of them. The GO and Reactome sets come from [MSigDB](https://www.gsea-msigdb.org/) release 2026.2 (human gene symbols; GO biological process, cellular component and molecular function, and Reactome pathways), bundled in `webbscope/engine/data/genesets.json.gz` and rebuilt with `tools/build_genesets.py`. Only the sets with at least 5 genes on the project's panel are listed. MSigDB is distributed under [CC BY 4.0](https://www.gsea-msigdb.org/gsea/msigdb_license_terms.jsp) (Liberzon et al. 2011, *Bioinformatics*; Gene Ontology Consortium 2023, *Genetics*; Milacic et al. 2024, *Nucleic Acids Res*). The older hand-curated signatures are hidden while they are reviewed.
+
 
 
 ## H&E next to the cells
@@ -147,7 +151,35 @@ WebbScope [project] [--port N] [--host ADDR] [--browser] [--headless] [--window]
 
 ## Project folder format
 
-A project is a folder with `project.json`, a count matrix (`matrix.mtx.gz` + `features.tsv.gz` + `barcodes.tsv.gz`, or `matrix.npz`), `cells.parquet` and `cell_boundaries.parquet`. Embeddings, regions, signatures, transcripts and H&E tiles are optional. The full table is in [docs/NOTES.md](docs/NOTES.md#project-folder-format).
+A project is a folder with `features.tsv.gz`, `barcodes.tsv.gz`, the cell metadata and a matrix, or with one AnnData `.h5ad` file. The names are WebbScope's own; 10x's names are accepted too, so a `cell_feature_matrix` and `cells.parquet` taken from a Xenium output work as they are.
+
+| File | Holds | Accepted names |
+|---|---|---|
+| raw counts | whole numbers | `counts.mtx` or `matrix.mtx` (10x's name) |
+| log-normalised values | log1p of normalised counts | `counts_logcpx.mtx` |
+| cell metadata | one row per cell: id, x, y, sample and any other columns | `cells_metadata.parquet` or `cells.parquet` (Xenium's name) |
+
+Give the raw counts, the log-normalised values or both (see below). Each matrix can also be `.mtx.gz`, or `.npz` written by `scipy.sparse.save_npz` (sparse; compressed by default, the smallest and fastest to read; a dense array is refused); genes x cells or cells x genes, with the genes and cells of `features.tsv.gz` / `barcodes.tsv.gz`. Only one file of each kind may be in the folder (for example not both `counts.mtx` and `matrix.mtx`). `project.json`, `cell_boundaries.parquet`, embeddings, regions, signatures, transcripts and H&E tiles are optional. The full table is in [docs/NOTES.md](docs/NOTES.md#project-folder-format).
+
+**Without `project.json`** (and for an `.h5ad`) the open page asks which column is which: cell id, x, y and sample (needed), donor, cell type, cell state, three region levels and total counts per cell (optional), suggested from the column names. With no cell type every cell is "unlabelled"; with no cell state the cell type is used. *Save these choices as project.json in the folder* (ticked by default) writes them into the folder, so they travel with the data to another computer; untick it (or if the folder is read-only) and they are kept in WebbScope's cache only. Either way the next opening goes straight in; **Change columns…** under the path asks again.
+
+Example: `sample_project_h5ad/` is the sample project as an `.h5ad` (`sample.h5ad`: raw counts in `X`, the cell metadata in `obs`, coordinates in `obsm["spatial"]`) with its `cell_boundaries.parquet` next to it as GeoParquet (an `.h5ad` has no place for outlines; they are matched to the cells by cell id).
+
+**Cell outlines** (`cell_boundaries.parquet`, optional) can be in either layout:
+- one row per outline point: `cell_id`, `vertex_x`, `vertex_y` (as Xenium writes it; `sample_project/` uses it);
+- one row per cell: a cell-id column and the outline in a `geometry`, `shape` or `geom` column, as GeoParquet (WKB; what geopandas and `sf` + `arrow` write) or as WKT text (`POLYGON ((x y, ...))`). The cell-id column is the one whose values match the project's cells. Of a multipolygon the largest part is drawn, holes are left out, and an empty or non-polygon outline leaves the cell as a dot; the log counts each.
+
+`tools/export_cell_boundaries.R` writes the per-cell layout from an R object (`.qs`, `.qs2` or `.rds`) whose table (default the list's `metadata` element) has a cell id and an `sf` geometry column: `Rscript tools/export_cell_boundaries.R OBJECT cell_boundaries.parquet [--element metadata] [--id cell_id] [--cells cells.parquet] [--wkt]`. Rebuild it with `python tools/make_sample_h5ad.py` (needs `pip install anndata`).
+
+**Folder or file.** Given the folder, the `.h5ad` is read together with the folder's other files (`cell_boundaries.parquet`, `regions.geojson`, `project.json` …), and the choices can be saved there as `project.json`. Given the `.h5ad` file itself, only that file is read (the cells are drawn as dots, since an `.h5ad` holds no outlines) and the choices are kept in WebbScope's cache. A folder with several `.h5ad` files can only be opened file by file.
+
+**`.h5ad`**: read with `h5py` (anndata itself is not needed; files from anndata 0.7 or later). Choose the matrix with the raw counts and/or the one with log-normalised values (`X`, a layer such as `layers/counts`, or `raw/X`; suggested from the values; when `raw/X` has more genes than `X`, the genes of `X` are used) and the gene names (the gene table's index, or a column such as `gene_symbols` when the index holds Ensembl ids). The cell table is `obs` plus its index; coordinates come from `obs` columns or an `obsm` array named like `spatial` (offered as `spatial_x` / `spatial_y`). `obsm["X_umap"]` and `obsm["X_pca"]` (or their `_harmony` versions) fill the Embeddings window.
+
+**Raw counts, log-normalised values, or both.**
+- *Raw counts only*: WebbScope computes log1p(counts / total counts of the cell × scale). The scale comes from `project.json`, else it can be typed when opening; empty = the median total counts per cell. (Xenium imports write 10,000 into their `project.json`.)
+- *Log-normalised values only*: stored and shown as they are, never recalculated. There is no "raw counts" layer, single-gene violins have no raw-count histogram, and the QC report's gene plots sum the log-normalised values; transcripts per cell appear only if a total-counts column is chosen.
+- *Both*: the log-normalised values are shown as they are; the counts give the "raw counts" layer, the raw-count histograms and the QC numbers. When the two have the same non-zero entries only the values are stored twice (about a third more cache).
+- Scaled or z-scored values (with negative numbers) are refused.
 
 ## Build from source
 

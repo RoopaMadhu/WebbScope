@@ -115,7 +115,7 @@ def histograms(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_o
     label_of = {d: (sigstats.subtype_of(SM, m[0]) if unit == "subtype" else SM.info[m[0]]["disease_type"]) for d, m in donors.items()} if unit != "sample" else {}
     out = []
     for f in feats:
-        genes = tuple(f["genes"]); single = len(genes) == 1
+        genes = tuple(f["genes"]); single = len(genes) == 1 and S.has_counts     # raw-count histogram: only when the project has raw counts
         vec = {s: SM.expression(s, genes, layer, sigma, scope) for s in S.samples}
         raw = {s: SM.expression(s, genes, "counts", 0.0, "none") for s in S.samples} if single else None
         for ct in cell_types:
@@ -133,7 +133,7 @@ def histograms(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_o
                     if single:
                         c = raw[s][keep]
                         rs.append(c)
-                        if layer == "logcpx" and sigma == 0 and scope == "none":
+                        if layer == "logcpx" and sigma == 0 and scope == "none" and not S.ln_given:   # check: plotted = log1p(count / total x scale)
                             es.append(np.abs(v[keep] - np.log1p(c / np.maximum(S.lib[a:b][keep], 1.0) * S.norm_scale)))
                 per[d] = (np.concatenate(xs), np.concatenate(rs) if single else None)
             x = np.concatenate([p[0] for p in per.values()])

@@ -120,7 +120,12 @@ const geneVec = (g) => S.genes[gkey([g])];
 async function init() {
   loading(true);
   S.meta = await jget("/api/meta");
-  if (S.meta.default_grey) { S.grey = true; $("greycells").checked = true; }   // merged batch projects: cell types are per tissue, so start uncoloured
+  if (S.meta.default_grey) { S.grey = true; $("greycells").checked = true; }
+  if (S.meta.ln_given) $("layer").querySelector("option[value=logcpx]").textContent = "log-normalised (as given in the input)";   // shown as they are
+  if (S.meta.has_counts === false) {   // log-normalised values only: no raw-counts layer
+    for (const id of ["layer", "ghexl"]) { const o = $(id) && $(id).querySelector("option[value=counts]"); if (o) o.remove(); }
+    S.layer = "logcpx";
+  }   // merged batch projects: cell types are per tissue, so start uncoloured
   const m = S.meta; buildStateInfo(); rgnInit();
   for (const x of m.samples) if (!x.donor) x.donor = String(x.id).replace(/_fragment[-_]?\d+$/, "");   // older servers do not send the donor: derive it from the sample id
   $("dsinfo").textContent = `${fmt(m.n_cells)} Xenium cells (QC'ed) · ${fmt(m.n_genes)} genes · ${donTxt(nDonors(m.samples))} · matrix ${m.matrix.orientation}`;
@@ -178,6 +183,8 @@ function buildFilterUI() {
 const exprPass = (e, x) => (e.op === "gt" ? x > e.thr : x <= e.thr);   // NaN (outside the "compute over" subset) fails both
 const exprSpec = (e) => ({ name: e.name, genes: e.genes, op: e.op, thr: e.thr, layer: e.layer, sigma: e.sigma, scope: e.scope, within: e.within });   // each filter carries its own transform
 const exprSpecs = () => S.exprFilters.map(exprSpec);
+// How the log-normalised values were made: computed here from raw counts, or given already log-normalised (no raw counts in the project).
+const normLabel = (short) => S.meta.ln_given ? "log-normalised (as given)" : short ? `log1p(CP${fmt(S.meta.norm_scale)})` : `log1p(counts/total×${fmt(S.meta.norm_scale)})`;
 const exprDesc = (e) => { const t = [e.layer === "counts" ? "raw counts" : "", e.sigma > 0 ? `σ ${e.sigma} µm` : "", e.scope !== "none" ? "z-score" : "", e.within !== "tissue" ? "compute-over subset" : ""].filter(Boolean).join(", ");
   return `${e.name} ${e.op === "gt" ? "positive" : "negative"} (score ${e.op === "gt" ? ">" : "≤"} ${e.thr}${t ? "; " + t : ""})`; };
 function exprGroupHTML() {
@@ -185,7 +192,7 @@ function exprGroupHTML() {
     <input id="xfgenes" list="genelist" placeholder="gene, or several genes (mean = signature)…" autocomplete="off">
     <select id="xfpreset" title="use a built-in signature instead"><option value="">— or a built-in signature —</option></select>
     <div class="xfrow"><select id="xfop"><option value="gt">positive: score &gt;</option><option value="le">negative: score ≤</option></select><input id="xfthr" type="number" step="any" value="0" title="threshold on the score; 0 on the raw layers means detected"><button id="xfadd" class="sm">Add</button></div>
-    <div class="xfrow"><label class="small">Layer</label><select id="xflayer"><option value="logcpx">log-normalised</option><option value="counts">raw counts</option></select></div>
+    <div class="xfrow"><label class="small">Layer</label><select id="xflayer"><option value="logcpx">log-normalised</option>${S.meta.has_counts === false ? "" : '<option value="counts">raw counts</option>'}</select></div>
     <div class="xfrow"><label class="small">Smooth σ</label><input type="range" id="xfsigma" min="0" max="100" step="5" value="0"><span id="xfsigmalab" class="small">off</span></div>
     <div class="xfrow"><label class="small">Z-score</label><select id="xfscope"><option value="none">none (raw values)</option><option value="sample">within each donor</option><option value="subtype">across samples of the same disease subtype</option><option value="type">across samples of the same disease type</option><option value="all">across all samples</option><option value="nocontrol">across all non-control samples</option></select></div>
     <div class="xfrow"><label class="small">Compute over</label><select id="xfwithin"><option value="tissue">the whole tissue</option><option value="glom">glomeruli only</option><option value="region">the region chosen in the Regions window</option></select></div>
@@ -206,7 +213,7 @@ async function addExprFilter() {
   if (S.exprFilters.length >= 6) { msg.textContent = "At most 6 gene / signature filters."; return; }
   let genes, name;
   try {
-    if (preset) { await loadSigList(); const sg = SIG.byId[preset]; genes = [...sg.genes]; name = sg.name; }
+    if (preset) { await loadSigList(); const sg = await sigFull(preset); genes = [...sg.genes]; name = sg.name; }
     else {
       const names = $("xfgenes").value.split(/[\s,;]+/).filter(Boolean);
       if (!names.length) { msg.textContent = "Enter a gene (or several), or choose a signature."; return; }
@@ -827,7 +834,7 @@ async function showCell(i) {
     const r = await jget(`/api/cell/${encodeURIComponent(S.sample)}/${i}`);
     const md = r.metadata;
     const core = Object.entries(md).filter(([k, v]) => v !== null && v !== "").map(([k, v]) => `<tr><td class="muted">${k}</td><td>${typeof v === "number" ? +v.toFixed(3) : v}</td></tr>`).join("");
-    const ex = r.expression.map((e) => `<tr class="g"><td>${e.gene}</td><td>${e.counts}</td><td>${e.logcpx.toFixed(2)}</td></tr>`).join("");
+    const ex = r.expression.map((e) => `<tr class="g"><td>${e.gene}</td><td>${e.counts == null ? "–" : e.counts}</td><td>${e.logcpx.toFixed(2)}</td></tr>`).join("");
     el.innerHTML = `<div><b>${S.ids[i]}</b></div><div class="small muted">x=${S.xy[i * 2].toFixed(1)} µm, y=${S.xy[i * 2 + 1].toFixed(1)} µm</div>
       <details open><summary>Metadata</summary><table class="expr">${core}</table></details>
       <details open><summary>Expression (${r.n_genes_detected} genes detected)</summary><input placeholder="filter genes…" id="gfilt">
@@ -876,7 +883,7 @@ function updateStats() {
   rows.push(["Genes available", fmt(S.meta.n_genes)]);
   for (const [g, v] of geneList()) {
     let e = 0, sum = 0, nv = 0; for (const i of S.visIdx) { if (v[i] > 0) e++; if (v[i] === v[i]) { sum += v[i]; nv++; } }
-    const lay = S.layer === "counts" ? "raw counts" : `log1p(CP${fmt(S.meta.norm_scale)})`;
+    const lay = S.layer === "counts" ? "raw counts" : normLabel(true);
     if (transformed()) {
       const n = Math.max(1, nv), mu = sum / n; let ss = 0; for (const i of S.visIdx) if (v[i] === v[i]) ss += (v[i] - mu) ** 2;
       rows.push([`${g}: mean ± sd, ${withinSpec() !== "tissue" ? `${fmt(nv)} of ${fmt(S.visIdx.length)} filtered cells (those inside the subset)` : "filtered cells"}`, `${mu.toFixed(3)} ± ${Math.sqrt(ss / n).toFixed(3)} <span class="muted">${S.zscope !== "none" ? "z" : lay}</span>`]); continue;
@@ -888,7 +895,7 @@ function updateStats() {
 }
 
 function scaleLegendHTML(ci) {  // legend for continuous scales (gene / two genes / signature / numeric)
-  const lay = S.layer === "counts" ? "raw counts" : `log1p(counts/total×${fmt(S.meta.norm_scale)})`;
+  const lay = S.layer === "counts" ? "raw counts" : normLabel(false);
   const grad = (L) => `<div class="grad" style="background:linear-gradient(90deg,${L.filter((_, i) => i % 32 === 0).map((c) => `rgb(${c})`).join(",")})"></div>`;
   const note = transformed() ? `<div class="small muted">${transformNote()}</div>` : "";
   if (ci.type === "gene" && ci.cont) return `<div>${ci.label} — ${ci.sig ? "mean of " : ""}${lay}</div>${grad(ci.div ? DIVL : LUT)}${tickRowHTML(scaleTicks(ci))}
@@ -1888,7 +1895,7 @@ function pngLegend(x, info, items, X, Y, W, u = 1, maxLines = 3) {
   x.fillStyle = gr; x.fillRect(X, Y - 11 * u, bw, 12 * u); x.fillStyle = "#d7dde6";
   for (const k of scaleTicks(info)) { x.textAlign = k.t === 0 ? "left" : k.t === 1 ? "right" : "center"; x.fillText(fmtTick(k.v), X + bw * k.t, Y + 20 * u); }
   x.textAlign = "left";
-  const lay = S.layer === "counts" ? "raw counts" : `log1p(CP${fmt(S.meta.norm_scale)})`;
+  const lay = S.layer === "counts" ? "raw counts" : normLabel(true);
   x.fillStyle = "#8b95a5";  // description goes under the bar (one or two lines) so it can never run off the figure
   x.fillText(info.type === "num" ? `${labelOf(mode)}${info.log ? " (log scale)" : ""} · ends: ${info.autoLo ? "p1" : "set by you"} / ${info.autoHi ? "p99" : "set by you"}` : `${info.label} — ${info.sig ? "mean of " : ""}${lay}${info.type === "gene" && !info.div ? " · 0 = gray: not detected" : ""}${info.type === "gene" ? " · top = p" + S.clip : ""}`, X, Y + 42 * u);
   if (info.type !== "num" && transformed()) { x.fillText(transformNote(), X, Y + 62 * u); return 70 * u; }
@@ -2177,8 +2184,8 @@ async function saveGalleryZip() {
 
 // ---------------------------------------------------------------- signatures window
 // Curated gene signatures (server: signatures.json) -> explorer (genes, change across disease subtypes, smoothed maps) and type I vs II localisation.
-const SIG = { list: null, byId: {}, sel: "ifn1", sig2: "", group: "subtype", tab: "explore", sigma: 25, scope: "all", useFilters: false, view: "plot", a: "ifn1", b: "ifn2", locSigma: 25, locQ: 10, locSub: "", mapSample: null, tok: 0 };
-const SIG_GROUPS = ["Interferon", "Fibrosis", "Immune & inflammation", "Kidney programmes"];
+const SIG = { list: null, gs: null, byId: {}, open: { GO: false, Reactome: false }, sel: "", sig2: "", group: "subtype", tab: "explore", sigma: 25, scope: "all", useFilters: false, view: "plot", a: "", b: "", defA: "", defB: "", locSigma: 25, locQ: 10, locSub: "", mapSample: null, tok: 0 };
+const SIG_COLLS = ["GO", "Reactome"], SIG_MAX = 300;   // GO / Reactome gene sets (MSigDB) listed for this panel; at most SIG_MAX rows are drawn per collection
 const mk = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
 const svgEl = (tag, attrs = {}, parent) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (parent) parent.append(e); return e; };
 const fmtP = (p) => (p == null ? "n/a" : p < 0.001 ? "<0.001" : p.toFixed(3));
@@ -2187,30 +2194,89 @@ const fmtN = (v, d = 2) => (v == null || Number.isNaN(v) ? "–" : (v > 0 ? "+" 
 const sigLabel = () => (S.sigName ? S.sigName : `Signature (${S.sigGenes.length} genes)`);
 const sigLabel2 = () => (S.sigName2 ? S.sigName2 : `Signature B (${S.sigGenes2.length} genes)`);
 async function postJSON(url, body) { const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!r.ok) throw new Error((await r.text()).slice(0, 200)); return r.json(); }
+// Signatures offered: the shown curated ones in full (SIG.list; e.g. the SLE ISG-amplification list) and the GO / Reactome gene sets with enough genes
+// on this panel (SIG.gs, as [id, name, n genes]; a set's genes are fetched when it is chosen, see sigFull).
 async function loadSigList() {
-  if (SIG.list) return; const d = await jget("/api/signatures"); SIG.list = d.signatures; SIG.order = d.subtype_order; SIG.byId = Object.fromEntries(d.signatures.map((x) => [x.id, x]));
-  for (const sel of [$("sigpreset"), $("sigpreset2"), $("xfpreset")]) if (sel && sel.options.length < 2) for (const g of SIG_GROUPS) { const og = document.createElement("optgroup"); og.label = g;
-    d.signatures.filter((x) => x.group === g).forEach((x) => { const o = document.createElement("option"); o.value = x.id; o.textContent = `${x.name} (${x.genes.length})`; og.append(o); }); sel.append(og); }
+  if (SIG.list) return; const d = await jget("/api/signatures"); SIG.list = d.signatures; SIG.gs = d.genesets || null; SIG.order = d.subtype_order;
+  SIG.byId = Object.fromEntries(d.signatures.map((x) => [x.id, x]));
+  for (const c of SIG_COLLS) for (const [id, name, n] of SIG.gs?.collections?.[c] || []) SIG.byId[id] = { id, name, group: c, n };
+  const pick = (...ids) => ids.find((i) => SIG.byId[i]) || (SIG.list[0] && SIG.list[0].id) || "";
+  SIG.defA = pick("go:GOBP_RESPONSE_TO_TYPE_I_INTERFERON", "reactome:REACTOME_INTERFERON_ALPHA_BETA_SIGNALING");
+  SIG.defB = pick("go:GOBP_RESPONSE_TO_TYPE_II_INTERFERON", "reactome:REACTOME_INTERFERON_GAMMA_SIGNALING");
+  if (!SIG.byId[SIG.sel]) SIG.sel = pick("isg_amp_sle"); if (!SIG.byId[SIG.a]) SIG.a = SIG.defA; if (!SIG.byId[SIG.b]) SIG.b = SIG.defB;
+  for (const id of ["sigpreset", "sigpreset2", "xfpreset", "viosig", "ghsig", "ghsig2"]) if ($(id)) sigPicker($(id));
+}
+const sigCount = () => (SIG.list ? SIG.list.length : 0) + SIG_COLLS.reduce((a, c) => a + (SIG.gs?.collections?.[c]?.length || 0), 0);
+// the full record (genes on the panel, genes missing, description) of a signature; a GO / Reactome set is fetched once
+async function sigFull(id) {
+  if (!id) return null; const x = SIG.byId[id]; if (x && x.genes) return x;
+  const r = await jget("/api/signature/" + encodeURIComponent(id)); SIG.byId[id] = r; return r;
+}
+const sigNameOf = (id) => (SIG.byId[id] ? SIG.byId[id].name : id);
+const sigMatch = (t) => (id, name) => !t || name.toLowerCase().includes(t) || id.toLowerCase().replace(/_/g, " ").includes(t);
+// The rows of a signature list: the shown curated signatures, then GO and Reactome, each opened by clicking its label (a search opens the ones
+// with matches). row(id, name, n) makes one row; returns the elements.
+function sigListRows(t, row, exclude, head) {
+  const out = [], m = sigMatch(t), cur = (SIG.list || []).filter((x) => x.id !== exclude && m(x.id, x.name + " " + (x.desc || "")));
+  if (cur.length) { out.push(head("Signatures", null)); cur.forEach((x) => out.push(row(x.id, x.name, x.genes.length, x))); }
+  for (const c of SIG_COLLS) {
+    const all = SIG.gs?.collections?.[c] || [], hits = t ? all.filter((x) => x[0] !== exclude && m(x[0], x[1])) : all.filter((x) => x[0] !== exclude), open = t ? hits.length > 0 : SIG.open[c];
+    out.push(head(`${open ? "▾" : "▸"} ${c} (${t ? hits.length + " of " : ""}${all.length})`, t ? null : c));
+    if (open) { hits.slice(0, SIG_MAX).forEach((x) => out.push(row(x[0], x[1], x[2], null))); if (hits.length > SIG_MAX) out.push(mk("div", "spmore", `${hits.length - SIG_MAX} more: type in the search box to narrow the list`)); }
+  }
+  if (SIG.gs) { const n = SIG_COLLS.reduce((a, c) => a + (SIG.gs.n_small?.[c] || 0), 0); out.push(mk("div", "spmore", `GO and Reactome from MSigDB ${SIG.gs.release} (CC BY 4.0). Only sets with at least ${SIG.gs.min_genes} genes on this panel are listed; ${n.toLocaleString()} smaller sets are left out.`)); }
+  return out;
+}
+// A <select> of signatures becomes a button that opens a searchable panel (see sigListRows). The select stays, hidden, and holds the value, so code
+// that reads .value or listens for "change" works as before; the chosen signature's genes are fetched before "change" fires.
+const SIGPOP = { el: null };
+function closeSigPop() { if (SIGPOP.el) { SIGPOP.el.remove(); SIGPOP.el = null; } }
+document.addEventListener("click", closeSigPop);
+function sigPicker(sel, o = {}) {
+  if (sel._picker) { sel._picker.label(); return sel._picker; }
+  const first = sel.options[0], ph = o.placeholder || (first && !first.value ? first.textContent : "— pick a signature —"), none = o.none ?? (first && !first.value ? first.textContent : null);
+  const btn = mk("button", "sigpick"); btn.type = "button"; sel.hidden = true; sel.after(btn);
+  const d = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+  const ensure = (v) => { if (v && ![...sel.options].some((op) => op.value === v)) { const op = document.createElement("option"); op.value = v; op.textContent = sigNameOf(v); sel.append(op); } };
+  const label = () => { const v = d.get.call(sel); btn.textContent = (v ? sigNameOf(v) : ph) + " ▾"; btn.title = v ? (SIG.byId[v]?.msigdb_name || v) : ""; };
+  Object.defineProperty(sel, "value", { configurable: true, get() { return d.get.call(sel); }, set(v) { ensure(v); d.set.call(sel, v); label(); } });
+  const choose = async (id) => {
+    if (id) { btn.textContent = "loading…"; try { await sigFull(id); } catch (e) { label(); alert("Could not load that signature: " + e.message); return; } }
+    sel.value = id; sel.dispatchEvent(new Event("change", { bubbles: true }));
+  };
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation(); if (SIGPOP.el && SIGPOP.el._btn === btn) { closeSigPop(); return; } closeSigPop();
+    const pop = mk("div"); pop.id = "sigpop"; pop._btn = btn; const q = mk("input"); q.placeholder = "search signatures, GO, Reactome…"; q.autocomplete = "off"; const body = mk("div"); pop.append(q, body); document.body.append(pop);
+    const r = btn.getBoundingClientRect(), below = innerHeight - r.bottom; pop.style.left = Math.max(4, Math.min(r.left, innerWidth - 444)) + "px";
+    if (below > 300 || below > r.top) { pop.style.top = r.bottom + 2 + "px"; pop.style.maxHeight = below - 10 + "px"; } else { pop.style.bottom = innerHeight - r.top + 2 + "px"; pop.style.maxHeight = r.top - 10 + "px"; }
+    const pickId = (id) => { closeSigPop(); choose(id); };
+    const row = (id, name, n) => { const it = mk("div", "sprow" + (id === sel.value ? " sel" : "")); it.append(mk("span", "nm", name), mk("span", "ct", n === "" ? "" : `${n} genes`)); it.title = id; it.addEventListener("click", () => pickId(id)); return it; };
+    const head = (txt, coll) => { const h = mk("div", "spgrp" + (coll ? " tog" : ""), txt); if (coll) h.addEventListener("click", () => { SIG.open[coll] = !SIG.open[coll]; draw(); }); return h; };
+    const draw = () => { const t = q.value.trim().toLowerCase(); body.replaceChildren(...(none != null && !t ? [row("", none, "")] : []), ...sigListRows(t, row, o.exclude, head)); };
+    pop.addEventListener("click", (ev) => ev.stopPropagation());
+    q.addEventListener("input", debounce(draw, 120));
+    q.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeSigPop(); if (ev.key === "Enter") { const f = body.querySelector(".sprow"); if (f) f.click(); } });
+    SIGPOP.el = pop; draw(); q.focus();
+  });
+  sel._picker = { label, set exclude(v) { o.exclude = v; } }; label(); return sel._picker;
 }
 async function openSig() {
   closeAllWindows();
   try { await loadSigList(); } catch (e) { alert("Signatures not available: " + e.message); return; }
-  if (!SIG.list.length) { alert("This project has no signature definitions (signatures.json), so the Signatures window has nothing to show. You can still filter by any gene or gene list under Filters → Gene / signature positive."); return; }
+  if (!sigCount()) { alert("This project has no signatures to show (no signatures.json, and no GO / Reactome set has enough genes on its panel), so the Signatures window has nothing to show. You can still filter by any gene or gene list under Filters → Gene / signature positive."); return; }
   $("sigwin").hidden = false; renderSigList(); renderSigPane();
 }
 function closeSig() { $("sigwin").hidden = true; }
 function renderSigList() {
-  const q = $("sigsearch").value.toLowerCase(), box = $("sigitems"); box.replaceChildren();
-  for (const g of SIG_GROUPS) {
-    const items = SIG.list.filter((x) => x.group === g && (x.name + " " + x.desc).toLowerCase().includes(q)); if (!items.length) continue;
-    box.append(mk("div", "sgrp", g));
-    for (const x of items) {
-      const it = mk("div", "sitem" + (x.id === SIG.sel ? " sel" : "")), nm = mk("span", "nm", x.name); nm.title = x.desc;
-      const weak = x.coherence_bin != null && x.coherence_bin < 0.10, ct = mk("span", "ct" + (weak ? " weak" : ""), `${x.genes.length} genes${weak ? " · weak" : ""}`);
-      if (weak) ct.title = "genes barely co-vary at tissue scale; interpret with caution";
-      it.append(nm, ct); it.addEventListener("click", () => { SIG.sel = x.id; renderSigList(); if (SIG.tab === "explore") renderSigPane(); }); box.append(it);
-    }
-  }
+  const t = $("sigsearch").value.trim().toLowerCase(), box = $("sigitems");
+  const row = (id, name, n, x) => {
+    const it = mk("div", "sitem" + (id === SIG.sel ? " sel" : "")), nm = mk("span", "nm", name); nm.title = x ? x.desc : id;
+    const weak = x && x.coherence_bin != null && x.coherence_bin < 0.10, ct = mk("span", "ct" + (weak ? " weak" : ""), `${n} genes${weak ? " · weak" : ""}`);
+    if (weak) ct.title = "genes barely co-vary at tissue scale; interpret with caution";
+    it.append(nm, ct); it.addEventListener("click", async () => { try { await sigFull(id); } catch (e) { alert("Could not load that signature: " + e.message); return; } SIG.sel = id; renderSigList(); if (SIG.tab === "explore") renderSigPane(); }); return it;
+  };
+  const head = (txt, coll) => { const h = mk("div", "sgrp" + (coll ? " tog" : ""), txt); if (coll) h.addEventListener("click", () => { SIG.open[coll] = !SIG.open[coll]; renderSigList(); }); return h; };
+  box.replaceChildren(...sigListRows(t, row, null, head));
 }
 function renderSigPane() { $("sigtab-explore").classList.toggle("on", SIG.tab === "explore"); $("sigtab-loc").classList.toggle("on", SIG.tab === "loc"); $("siglist").style.display = SIG.tab === "explore" ? "" : "none"; SIG.tab === "explore" ? renderExplorer() : renderLoc(); }
 const subtypeRank = (t) => { const o = SIG.order || []; return o.includes(t) ? o.indexOf(t) : 99; };
@@ -2252,8 +2318,9 @@ function scopeWarning() {   // z-scoring inside a group removes the differences 
 }
 const scopeNote = () => (SIG.scope === "nocontrol" ? "The mean and SD for the z-score come from the non-control samples only (No LN and LN, all their cells); every sample, Control included, is then scored against that reference. Differences between groups are kept, and Control samples show up as below the disease average." : "");
 async function renderExplorer() {
+  try { await sigFull(SIG.sel); if (SIG.sig2) await sigFull(SIG.sig2); } catch (e) { $("sigpane").textContent = "Could not load the signature: " + e.message; return; }
   const pane = $("sigpane"), sg = SIG.byId[SIG.sel], tok = ++SIG.tok; if (SIG.sig2 === SIG.sel) SIG.sig2 = ""; const sg2 = SIG.sig2 ? SIG.byId[SIG.sig2] : null; pane.replaceChildren();
-  const info = (g, color, tag) => { const box = mk("div"); const h = mk("div", "sh2", (tag ? tag + " " : "") + g.name); h.style.marginTop = tag ? "14px" : "0"; if (color) h.style.borderBottomColor = color; box.append(h, mk("div", "sdesc", g.desc)); if (g.note) box.append(mk("div", "snote", "Note: " + g.note));
+  const info = (g, color, tag) => { const box = mk("div"); const h = mk("div", "sh2", (tag ? tag + " " : "") + g.name); h.style.marginTop = tag ? "14px" : "0"; if (color) h.style.borderBottomColor = color; box.append(h, mk("div", "sdesc", g.desc)); if (g.url) { const a = mk("a", "", "MSigDB page for this set"); a.href = g.url; a.target = "_blank"; a.rel = "noopener"; const dl = mk("div", "snote"); dl.append(a); box.append(dl); } if (g.note) box.append(mk("div", "snote", "Note: " + g.note));
     const cov = mk("div", "snote", `${g.genes.length} of ${g.n_defined} candidate genes are on the panel. ` + (g.coherence_bin != null ? `Coherence: ${g.coherence_bin.toFixed(2)} across 100 µm tissue bins, ${g.coherence_cell.toFixed(2)} per cell after removing cell-type means. ` : "")
       + (g.coherence_bin != null && g.coherence_bin < 0.10 ? "The genes barely co-vary at tissue scale, so treat this score with caution. " : "") + "Dashed genes co-vary weakly with the rest (r < 0.05)."); cov.style.marginTop = "6px"; box.append(cov);
     const chips = mk("div", "chips"); chips.style.marginTop = "6px"; for (const gn of g.genes) { const r = g.gene_r_bin?.[gn], c = mk("span", "chip2" + (r != null && r < 0.05 ? " weak" : ""), gn); c.title = `mean correlation with the other genes (100 µm bins): ${r == null ? "n/a" : r.toFixed(2)}`; chips.append(c); } box.append(chips);
@@ -2263,7 +2330,7 @@ async function renderExplorer() {
   const ctl = mk("div", "sctl"), sl = mk("input"); sl.type = "range"; sl.min = 0; sl.max = 100; sl.step = 5; sl.value = SIG.sigma; const sv = mk("span", "", SIG.sigma ? SIG.sigma + " µm" : "off"); const l1 = mk("label"); l1.append("Smoothing σ ", sl, sv);
   const sc = mk("select"); sc.innerHTML = Object.entries(SCOPE_TXT).map(([k, t]) => `<option value="${k}">z-score ${k === "none" ? t : t}</option>`).join("").replace("z-score none (smoothed raw score)", "no z-score (smoothed raw score)"); sc.value = SIG.scope; const l2 = mk("label"); l2.append("Score ", sc);
   const gb = mk("select"); gb.innerHTML = `<option value="subtype">disease subtype (5 groups)</option><option value="type">disease type (Control / No LN / LN)</option>`; gb.value = SIG.group; const l4 = mk("label"); l4.append("Group by ", gb);
-  const s2 = mk("select"); s2.innerHTML = `<option value="">— none —</option>` + SIG_GROUPS.map((g) => `<optgroup label="${g}">${SIG.list.filter((x) => x.group === g && x.id !== SIG.sel).map((x) => `<option value="${x.id}">${x.name}</option>`).join("")}</optgroup>`).join(""); s2.value = SIG.sig2 || ""; const l5 = mk("label"); l5.append("Add a second signature ", s2);
+  const s2 = mk("select"); s2.innerHTML = `<option value="">— none —</option>`; const l5 = mk("label"); l5.append("Add a second signature ", s2); sigPicker(s2, { exclude: SIG.sel }); s2.value = SIG.sig2 || "";
   const fl = mk("input"); fl.type = "checkbox"; fl.checked = SIG.useFilters; const l3 = mk("label"); l3.append(fl, "only cells passing the current filters");
   const tv = mk("button", "", SIG.view === "plot" ? "Table" : "Plot"), tovw = mk("button", "", sg2 ? "Show both signatures in the main viewer" : "Colour the main viewer by this signature");
   ctl.append(l1, l2, l4, l5, l3, tv, tovw); ctl.classList.add("stickyctl"); pane.prepend(ctl);   // controls stay at the top of the pane
@@ -2381,8 +2448,8 @@ async function renderLoc() {
   const pane = $("sigpane"), tok = ++SIG.tok; pane.replaceChildren();
   pane.append(Object.assign(mk("div", "sh2", "Do two signatures localise to different regions of the tissue?"), { style: "margin-top:0" }));
   pane.append(mk("div", "sdesc", "Both signatures are smoothed within each tissue piece and z-scored within each donor, so each has mean 0 and SD 1 and their difference is in SD units. The test compares the two maps (correlation, overlap of their hottest cells) and asks, region by region and cell type by cell type, whether one signature is systematically higher than the other. Samples are the unit of replication."));
-  const ctl = mk("div", "sctl"), opts = (cur) => SIG_GROUPS.map((g) => `<optgroup label="${g}">${SIG.list.filter((x) => x.group === g).map((x) => `<option value="${x.id}" ${x.id === cur ? "selected" : ""}>${x.name}</option>`).join("")}</optgroup>`).join("");
-  const sa = mk("select"), sb = mk("select"); sa.innerHTML = opts(SIG.a); sb.innerHTML = opts(SIG.b); const la = mk("label"), lb = mk("label"); la.append("A ", sa); lb.append("B ", sb);
+  const ctl = mk("div", "sctl");
+  const sa = mk("select"), sb = mk("select"); const la = mk("label"), lb = mk("label"); la.append("A ", sa); lb.append("B ", sb); sigPicker(sa, { none: null }); sigPicker(sb, { none: null }); sa.value = SIG.a; sb.value = SIG.b;
   const sl = mk("input"); sl.type = "range"; sl.min = 0; sl.max = 100; sl.step = 5; sl.value = SIG.locSigma; const sv = mk("span", "", SIG.locSigma ? SIG.locSigma + " µm" : "off"); const l1 = mk("label"); l1.append("Smoothing σ ", sl, sv);
   const q = mk("input"); q.type = "number"; q.min = 5; q.max = 30; q.step = 5; q.value = SIG.locQ; q.style.width = "56px"; const lq = mk("label"); lq.append("Hotspot = top ", q, "%");
   const ss = mk("select"); ss.innerHTML = `<option value="">all donors</option>` + (SIG.order || []).map((t) => `<option value="${t}" ${t === SIG.locSub ? "selected" : ""}>${t} only</option>`).join(""); const ls = mk("label"); ls.append("Samples ", ss);
@@ -2458,9 +2525,7 @@ const vioKey = (f) => (f.sig ? "s:" + f.sig : "g:" + f.gene), vioName = (f) => (
 async function openVio() {
   closeAllWindows();
   try { await loadSigList(); } catch (e) { /* signatures optional */ }
-  const sel = $("viosig"); if (sel.options.length < 2 && SIG.list) for (const g of SIG_GROUPS) { const og = document.createElement("optgroup"); og.label = g;
-    SIG.list.filter((x) => x.group === g).forEach((x) => { const o = document.createElement("option"); o.value = x.id; o.textContent = `${x.name} (${x.genes.length})`; og.append(o); }); sel.append(og); }
-  if (!VIO.feats.length) { if (SIG.byId?.ifn1) VIO.feats.push({ sig: "ifn1" }); else { const l = await jget("/api/genes/search?q="); if (l.length) VIO.feats.push({ gene: l[0] }); } }   // projects without signatures.json: start from the first panel gene
+  if (!VIO.feats.length) { const d0 = SIG.byId?.isg_amp_sle ? "isg_amp_sle" : SIG.defA; if (d0) VIO.feats.push({ sig: d0 }); else { const l = await jget("/api/genes/search?q="); if (l.length) VIO.feats.push({ gene: l[0] }); } }   // projects without signatures.json: start from the first panel gene
   $("vio").hidden = false; vioControls(); renderVio();
 }
 function closeVio() { $("vio").hidden = true; }
@@ -2548,14 +2613,14 @@ async function renderVioHist(tok, cts) {
         box.append(hist(p.raw.counts, rl, 900, 150, "#d9a441", true, "raw transcript counts per cell")); }
       else box.append(mk("div", "snote", `Orange = the same cells' raw counts of ${p.feature} (integers; pooled max ${fmt(p.raw.max)}).`));
       box.append(mk("div", "snote", p.check_max_abs_diff != null ? `Check: for all ${fmt(p.n)} cells the plotted value equals log1p(raw count / total counts × ${fmt(d.norm_scale)}); largest absolute difference = ${p.check_max_abs_diff.toExponential(1)}.`
-        : p.layer === "counts" ? "Layer = raw counts: the plotted values are these integer counts." : "Smoothing / z-scoring is applied, so the plotted values are no longer a direct function of the raw counts."));
-    } else box.append(mk("div", "snote", "Signature score = mean of the genes' values on the chosen layer" + (S.layer === "counts" ? " (raw counts)" : ", each log1p(counts / total counts × " + fmt(d.norm_scale) + ")") + (VIO.scope !== "none" ? ", then z-scored" : "") + "."));
+        : p.layer === "counts" ? "Layer = raw counts: the plotted values are these integer counts." : S.meta.ln_given ? "The plotted values are the log-normalised values given with the project, not computed from these counts." : "Smoothing / z-scoring is applied, so the plotted values are no longer a direct function of the raw counts."));
+    } else box.append(mk("div", "snote", "Signature score = mean of the genes' values on the chosen layer" + (S.layer === "counts" ? " (raw counts)" : S.meta.ln_given ? ", the log-normalised values as given in the input" : ", each log1p(counts / total counts × " + fmt(d.norm_scale) + ")") + (VIO.scope !== "none" ? ", then z-scored" : "") + "."));
     body.append(box);
   }
   const note = mk("div", "snote", (VIO.unit === "sample" ? "Histograms pool all donors (choose “disease subtype” or “disease type” under “One violin per” for donor-averaged histograms per group)" : "Histograms are averaged over donors") + "; they ignore the cell-state option. Cell types, score, z-score and expressing-cells options are the same as for the violins."); note.style.maxWidth = "900px"; body.append(note);
 }
 function vioYLabel() {   // follows the main viewer's expression layer; z-scores say which scope they use
-  const lay = S.layer === "counts" ? "raw counts" : `log1p(counts/total×${fmt(S.meta.norm_scale)})`;
+  const lay = S.layer === "counts" ? "raw counts" : normLabel(false);
   const zl = { sample: "within each donor", subtype: "within disease subtype", type: "within disease type", all: "across all samples", nocontrol: "vs non-control samples" }[VIO.scope];
   return VIO.scope === "none" ? lay : `z-score of ${lay} (${zl})`;
 }
@@ -2637,8 +2702,7 @@ async function openGH() {
     GH.info.cluster_cols.forEach((c, i) => $("ghclr").append(opt(c, c.replace("cluster_res", "")))); $("ghclr").value = GH.info.cluster_cols[Math.min(2, GH.info.cluster_cols.length - 1)];
   }
   try { await loadSigList(); } catch (e) { /* optional */ }
-  for (const [id, def] of [["ghsig", "ifn1"], ["ghsig2", "ifn2"]]) { const sel = $(id); if (!sel.options.length && SIG.list) { for (const g of SIG_GROUPS) { const og = document.createElement("optgroup"); og.label = g;
-    SIG.list.filter((x) => x.group === g).forEach((x) => { const o = document.createElement("option"); o.value = x.id; o.textContent = `${x.name} (${x.genes.length})`; og.append(o); }); sel.append(og); } if (SIG.byId[def]) sel.value = def; } }
+  for (const [id, def] of [["ghsig", SIG.defA], ["ghsig2", SIG.defB]]) { const sel = $(id); if (SIG.list && !sel.value && def) { sigPicker(sel, { none: null }); sel.value = def; } }
   syncTransformUI();
   $("ghet").hidden = false; renderGH();
 }
@@ -3420,8 +3484,8 @@ function bindUI() {
   $("sample").addEventListener("change", (e) => loadSample(e.target.value));
   $("colorby").addEventListener("change", async (e) => {
     S.colorBy = e.target.value;
-    if (S.colorBy === "__sigdual" && !S.sigGenes.length && !S.sigGenes2.length) {   // nothing chosen yet: start with the two interferon signatures
-      try { await loadSigList(); const a = SIG.byId.ifn1, b = SIG.byId.ifn2;
+    if (S.colorBy === "__sigdual" && !S.sigGenes.length && !S.sigGenes2.length) {   // nothing chosen yet: start with the type I and type II interferon responses (GO)
+      try { await loadSigList(); const a = await sigFull(SIG.defA), b = await sigFull(SIG.defB);
         S.sigGenes = [...a.genes]; S.sigName = a.name; S.sigKey = ""; $("sigtext").value = a.genes.join(" "); $("sigstatus").textContent = `${a.genes.length} genes of "${a.name}" loaded`;
         S.sigGenes2 = [...b.genes]; S.sigName2 = b.name; S.sigKey2 = ""; $("sigtext2").value = b.genes.join(" "); $("sigstatus2").textContent = `${b.genes.length} genes of "${b.name}" loaded`; } catch (err) { /* signatures not available */ }
     }
@@ -3494,7 +3558,7 @@ function bindUI() {
   $("umapbtn").style.display = S.meta.umaps?.length ? "" : "none";
   if (S.meta.has_gloms === false) $("ghbtn").style.display = "none";   // no region_heterogeneity object in this project
   txInit(); hesInit(); greyInit();
-  if (S.meta.embedding_label) $("umemb").querySelector("option[value=pca]").textContent = "PCA (10x, not batch-corrected)";   // projects whose embeddings are not Harmony-corrected (Xenium import)
+  if (S.meta.embedding_label) $("umemb").querySelector("option[value=pca]").textContent = S.meta.embedding_label.startsWith("10x") ? "PCA (10x, not batch-corrected)" : `PCA (${S.meta.embedding_label})`;   // projects whose embeddings are not Harmony-corrected (Xenium import)
   $("glombtn").addEventListener("click", openGlom);
   $("glomclose").addEventListener("click", closeGlom);
   $("umapbtn").addEventListener("click", () => toggleUmap()); $("umx").addEventListener("click", () => toggleUmap(false)); $("umclear").addEventListener("click", clearHighlight);
@@ -3611,7 +3675,7 @@ async function ghPush() {
     if (hit && hit.toLowerCase() === v.toLowerCase()) { $(id).value = hit; return hit; } msg.textContent = `“${v}” is not on the panel`; return ""; };
   const sigOf = async (selId, txtId) => { const t = $(txtId).value.split(/[\s,;]+/).filter(Boolean);
     if (t.length) { const r = await jget("/api/genes/resolve?names=" + encodeURIComponent(t.join(","))); if (r.missing.length) msg.textContent = `not on the panel: ${r.missing.join(", ")}`; return { genes: r.found, name: "" }; }
-    const sg = SIG.byId[$(selId).value]; return sg ? { genes: [...sg.genes], name: sg.name } : { genes: [], name: "" }; };
+    const sg = await sigFull($(selId).value); return sg ? { genes: [...sg.genes], name: sg.name } : { genes: [], name: "" }; };
   try {
     if (mode === "gene" || mode === "dual") { S.geneA = await geneOf("ghgene"); if (mode === "dual") S.geneB = await geneOf("ghgene2"); }
     else { const a = await sigOf("ghsig", "ghsigtxt"); S.sigGenes = a.genes; S.sigName = a.name; S.sigKey = "";

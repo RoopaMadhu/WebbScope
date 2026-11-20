@@ -254,3 +254,15 @@ table.ghtab th.sorted{color:#fff}table.ghtab th{text-align:center}#ghhm .sctl la
 #heimgsmenu .imcadd { display: flex; gap: 4px; margin-top: 6px; } #heimgsmenu .imcadd input { width: 200px; } #heimgsmenu .imcadd[hidden] { display: none; }
 #heimgsmenu #imcstat { max-width: 260px; white-space: normal; margin-top: 4px; }
 #scanrow { flex-wrap: wrap; } #scanrow #scansel { flex: 1 1 100%; min-width: 0; }
+/* signature picker (sigPicker in app.js): a button in place of the select, and a searchable panel with the curated signatures, GO and Reactome */
+.sigpick{width:100%;text-align:left;padding:4px 6px;border:1px solid var(--bd);border-radius:4px;font:inherit;background:#fff;color:#1d2733;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+label .sigpick{width:auto;max-width:340px;display:inline-block;vertical-align:middle}
+#sigpop{position:fixed;z-index:10000;width:440px;max-width:calc(100vw - 8px);display:flex;flex-direction:column;background:#fff;color:#1d2733;border:1px solid #c9d0d8;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.25);padding:6px;font-size:12.5px}
+#sigpop input{width:100%;margin-bottom:4px;padding:4px 6px;border:1px solid #c9d0d8;border-radius:4px;font:inherit;background:#fff;color:inherit}
+#sigpop>div{overflow-y:auto;min-height:0}
+#sigpop .spgrp{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:#6b7785;margin:8px 2px 2px}
+#sigpop .sprow{padding:4px 6px;border-radius:4px;cursor:pointer;display:flex;justify-content:space-between;gap:8px;align-items:baseline}
+#sigpop .sprow:hover{background:#eef3fb}#sigpop .sprow.sel{background:#dce8fb}
+#sigpop .sprow .nm{overflow:hidden;text-overflow:ellipsis}#sigpop .sprow .ct{color:#6b7785;font-size:11px;white-space:nowrap}
+.spgrp.tog,.sgrp.tog{cursor:pointer;user-select:none}.spgrp.tog:hover,.sgrp.tog:hover{color:#2a6fdb}
+.spmore{font-size:11px;color:#8b95a5;margin:6px 2px}

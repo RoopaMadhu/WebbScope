@@ -171,7 +171,8 @@ def project_samples(project):
     role = json.loads((project / "project.json").read_text()).get("roles", {}).get("sample")
     if not role:
         raise ImportError_("project.json has no sample role")
-    return {str(s) for s in pq.read_table(project / "cells.parquet", columns=[role]).column(0).unique().to_pylist()}
+    from .importer import cells_file
+    return {str(s) for s in pq.read_table(cells_file(project) or project / "cells.parquet", columns=[role]).column(0).unique().to_pylist()}
 
 
 def match(images, index):

@@ -1,7 +1,8 @@
 "use strict";
 const $ = (s) => document.querySelector(s);
 const post = (u, b) => fetch(u, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(b) });
-let REG = {}, COMPS = {}, THUMB = {}, EDITPOLY = {}, AUTOOFF = {}, IMPORTED = {};   // AUTOOFF / IMPORTED: runs whose tissue boxes were loaded from a GeoJSON -> true / [{name, polys}]
+let REG = {}, COMPS = {}, THUMB = {}, EDITPOLY = {}, EDITRAW = {}, AUTOOFF = {}, IMPORTED = {};   // EDITRAW: the editor's tissue outlines before the switched-off shapes are cut out (for the export)
+// AUTOOFF / IMPORTED: runs whose tissue boxes were loaded from a GeoJSON -> true / [{name, polys}]
 //   // run name -> drawn shapes; -> {piece id: {name, keep}} edits of the detected tissues; -> thumbnail data of the gallery
 let RUNS = [], PARENT_MERGED = null, HE = null;   // HE = {czi: [{name, path}], annotations: [...], match: {run: {czi, annotations, why}}} once an H&E folder was matched
 async function detail(r) { try { return JSON.parse(await r.text()).detail; } catch (e) { return "failed"; } }
@@ -13,11 +14,11 @@ $("#find").onclick = async () => {
   RUNS = d.runs; PARENT_MERGED = d.merged || null;
   if (!RUNS.length) { $("#err").textContent = "No Xenium runs found directly inside this folder (looked for Xenium output sub-folders with cell_feature_matrix/, cells and cell_boundaries, .tar.gz or .zip bundles, and project folders already written by this app)." + (d.skipped.length ? " Skipped sub-folders: " + d.skipped.join(", ") : ""); return; }
   $("#runsum").textContent = `${RUNS.length} run(s)` + (d.skipped.length ? `; ${d.skipped.length} sub-folder(s) skipped because they are not Xenium outputs: ${d.skipped.join(", ")}` : "");
-  REG = {}; COMPS = {}; THUMB = {}; EDITPOLY = {}; AUTOOFF = {}; IMPORTED = {}; HE = null; $("#tismsg").textContent = ""; $("#hemsg").textContent = ""; document.querySelectorAll(".hecol").forEach((e) => (e.hidden = true));
+  REG = {}; COMPS = {}; THUMB = {}; EDITPOLY = {}; EDITRAW = {}; AUTOOFF = {}; IMPORTED = {}; HE = null; $("#tismsg").textContent = ""; $("#hemsg").textContent = ""; document.querySelectorAll(".hecol").forEach((e) => (e.hidden = true));
   $("#ttab tbody").innerHTML = RUNS.map((x, i) => `<tr><td><input type="checkbox" data-i="${i}" checked></td><td></td><td>${x.kind}</td><td>${x.kind === "project" ? '<span class="sub">n/a</span>' : `<button data-d="${i}">Draw…</button> <span class="sub" data-n="${i}"></span>`}</td><td class="hecol" hidden></td><td class="hecol" hidden></td></tr>`).join("");
   document.querySelectorAll("#ttab tbody tr").forEach((tr, i) => { tr.children[1].textContent = RUNS[i].name; });
   $("#outdir").value = d.default_output;
-  $("#s2").hidden = false; $("#s3").hidden = false; checkMerged();
+  $("#s2").hidden = false; $("#s3").hidden = false; checkMerged(); tisState();
 };
 // An earlier merged project (<folder>/_merged) is offered for opening as it is: nothing is converted or merged again.
 async function checkMerged() {
@@ -39,7 +40,7 @@ async function checkMerged() {
   }
 }
 $("#outdir").addEventListener("change", checkMerged);
-$("#ttab").addEventListener("change", (e) => { if (e.target.type === "checkbox") checkMerged(); });
+$("#ttab").addEventListener("change", (e) => { if (e.target.type === "checkbox") { checkMerged(); tisState(); } });
 // ---- tissue boxes from the <run>_regions.geojson files of an earlier import (only to tell tissues apart, not anatomical regions): each found file's shapes replace the run's shapes, its detected tissues start switched off
 $("#tisfind").onclick = async () => {
   const msg = $("#tismsg"), folder = $("#tisfolder").value.trim(); msg.textContent = "";
@@ -48,27 +49,45 @@ $("#tisfind").onclick = async () => {
   const r = await post("/api/xenium/batch/tissues", { folder, runs, name_col: "" });
   if (!r.ok) { msg.textContent = await detail(r); return; }
   const d = await r.json(), names = Object.keys(d.found);
-  for (const n of names) { REG[n] = d.found[n].shapes; COMPS[n] = {}; AUTOOFF[n] = true; IMPORTED[n] = d.found[n].tissues; delete EDITPOLY[n]; }
+  for (const n of names) { REG[n] = d.found[n].shapes; COMPS[n] = {}; AUTOOFF[n] = true; IMPORTED[n] = d.found[n].tissues; delete EDITPOLY[n]; delete EDITRAW[n]; }
   const errs = Object.entries(d.errors).map(([n, e]) => `${n}: ${e}`);
   msg.textContent = `Loaded tissue boxes for ${names.length} of ${runs.length} run(s)` + (d.missing.length ? `; no file for ${d.missing.length}: ${d.missing.join(", ")} (they keep their detected tissues)` : "") + (errs.length ? `; could not read ${errs.length}: ${errs.join("; ")}` : "") + ".";
-  refreshNotes(); if (!$("#gal").hidden) galRender();
+  refreshNotes(); tisState(); if (!$("#gal").hidden) galRender();
 };
-// ---- export the tissue boxes of the ticked runs now (as edited here), without converting
+// ---- export the tissue boxes of the ticked runs now (as edited here), from the geometry this page holds: no run is read
+// A run's tissue outlines before the switched-off shapes are cut out: null = its kept shapes are the tissues (tissue boxes loaded from a GeoJSON, no
+// detected tissue switched back on); else [{name, polys}] as the editor or the slide review built them; undefined = not built yet.
+const hasCompEdits = (n) => Object.values(COMPS[n] || {}).some((e) => e.name || e.keep !== undefined);
+function builtTissues(n) {
+  if (AUTOOFF[n] && !Object.values(COMPS[n] || {}).some((e) => e.keep === true)) return null;
+  if (EDITRAW[n] && EDITRAW[n].key === skey()) return EDITRAW[n].polys;
+  const t = THUMB[n];
+  if (!(REG[n] || []).length && !hasCompEdits(n) && t && t.d && t.key === skey()) return t.d.comps.filter((c) => c.id > 0 && c.keep && t.d.polys && t.d.polys[c.id]).map((c) => ({ name: c.name, polys: t.d.polys[c.id] }));
+  return undefined;
+}
+// the export is greyed out until every ticked run has its tissue boxes (loaded from GeoJSON, or built in the slide review / the editor)
+function tisState() {
+  const runs = galRuns(), miss = runs.filter((x) => builtTissues(x.name) === undefined), ok = runs.length > 0 && !miss.length;
+  $("#tisexport").disabled = !ok; $("#tisout").disabled = !ok; if (!ok) $("#tisover").hidden = true;
+  $("#tisready").textContent = !runs.length ? "No run is ticked." : !miss.length ? "" : `Tissue boxes are not built yet for ${miss.length} of ${runs.length} ticked run(s): `
+    + miss.slice(0, 6).map((x) => x.name).join(", ") + (miss.length > 6 ? ", …" : "") + ". Load them from GeoJSON, or build them in Review all slides… (every page; a run edited before the detection settings changed has to be opened again).";
+}
 async function tisExport(overwrite) {
   const msg = $("#tisoutmsg"), folder = $("#tisout").value.trim(); $("#tisover").hidden = true;
   if (!folder) { msg.textContent = "Choose a folder for the files."; return; }
   const runs = galRuns(); if (!runs.length) { msg.textContent = "No run is ticked."; return; }
+  const body = runs.map((x) => ({ name: x.name, shapes: REG[x.name] || [], tissues: builtTissues(x.name) }));
+  if (body.some((x) => x.tissues === undefined)) { tisState(); return; }
   msg.textContent = `writing ${runs.length} file(s)…`; $("#tisexport").disabled = true;
-  const r = await post("/api/xenium/batch/tissues/export", { runs, folder, ...settings(), cut_off: $("#cutoff").checked, overwrite, name_col: $("#regcol").value.trim() || "sample_id_unblinded",
-    regions: Object.fromEntries(runs.filter((x) => (REG[x.name] || []).length).map((x) => [x.name, REG[x.name]])),
-    comps: Object.fromEntries(runs.filter((x) => Object.keys(COMPS[x.name] || {}).length).map((x) => [x.name, COMPS[x.name]])),
-    auto_off: Object.fromEntries(runs.filter((x) => AUTOOFF[x.name]).map((x) => [x.name, true])) });
-  $("#tisexport").disabled = false;
+  const r = await post("/api/xenium/batch/tissues/export", { runs: body, folder, cut_off: $("#cutoff").checked, overwrite, name_col: $("#regcol").value.trim() || "sample_id_unblinded" });
+  tisState();
   let d = null; try { d = JSON.parse(await r.text()); } catch (e) { /* not JSON */ }
   if (r.status === 409 && !overwrite) { msg.textContent = (d && d.detail) + ". Overwrite them?"; $("#tisover").hidden = false; return; }
   if (!r.ok) { msg.textContent = (d && d.detail) || "export failed"; return; }
-  const errs = Object.entries(d.errors).map(([n, e]) => `${n}: ${e}`);
-  msg.textContent = `Wrote ${d.written.length} file(s) to ${folder}` + (errs.length ? `; failed for ${errs.length}: ${errs.join("; ")}` : "") + ".";
+  const errs = Object.entries(d.errors).map(([n, e]) => `${n}: ${e}`), ov = Object.entries(d.overlaps || {}), em = Object.entries(d.empty || {});
+  msg.textContent = `Wrote ${d.written.length} file(s) to ${folder}` + (errs.length ? `; failed for ${errs.length}: ${errs.join("; ")}` : "") + "."
+    + (ov.length ? ` Overlapping geometries found (written as they are) in ${ov.length} run(s): ` + ov.map(([n, ps]) => `${n}: ${ps.map((p) => p.join(" & ")).join(", ")}`).join("; ") + "." : "")
+    + (em.length ? ` Left out because nothing of them remained after the cut: ` + em.map(([n, ts]) => `${n}: ${ts.join(", ")}`).join("; ") + "." : "");
 }
 $("#tisexport").onclick = () => tisExport(false); $("#tisover").onclick = () => tisExport(true);
 $("#cutoff").addEventListener("change", () => { EDITPOLY = {}; if (!$("#gal").hidden) galRender(); });
@@ -240,14 +259,14 @@ async function galLoad() {
     else if (t && t.error) note.textContent = t.error;
     else { pending++; note.textContent = "reading…"; }
   }
-  $("#gmsg").textContent = pending ? `reading ${pending} run(s)…` : "";
+  $("#gmsg").textContent = pending ? `reading ${pending} run(s)…` : ""; tisState();
   if (pending) G.timer = setTimeout(galLoad, 1500);
 }
 $("#galopen").onclick = () => { $("#gal").hidden = false; G.page = 0; galRender(); };
 $("#gclose").onclick = () => { $("#gal").hidden = true; clearTimeout(G.timer); G.tok++; refreshNotes(); };
 $("#gprev").onclick = () => { G.page--; galRender(); }; $("#gnext").onclick = () => { G.page++; galRender(); };
 $("#gper").onchange = () => { G.per = +$("#gper").value; G.page = 0; galRender(); };
-for (const id of ["p_gap", "p_minc", "p_mint", "p_detect", "p_txmin"]) $("#" + id).addEventListener("change", () => { document.querySelectorAll(".txonly").forEach((e) => (e.hidden = $("#p_detect").value !== "transcripts")); COMPS = {}; THUMB = {}; refreshNotes(); if (!$("#gal").hidden) galRender(); });   // piece ids belong to the detection settings
+for (const id of ["p_gap", "p_minc", "p_mint", "p_detect", "p_txmin"]) $("#" + id).addEventListener("change", () => { document.querySelectorAll(".txonly").forEach((e) => (e.hidden = $("#p_detect").value !== "transcripts")); COMPS = {}; THUMB = {}; refreshNotes(); tisState(); if (!$("#gal").hidden) galRender(); });   // piece ids belong to the detection settings
 
 // ---- editor of one run (the single-run page's tools and preview)
 // transcript density: one tinted square per bin (brightness = log count, colour = the tissue of the bin, grey = no tissue), written into the pixels before the cells
@@ -280,10 +299,10 @@ $("#ddone").onclick = () => {
   if (!$("#gal").hidden) galLoad();                // redraw this run's card (and any other still reading)
 };
 async function dRefresh() {
-  const tok = ++D.tok, n = D.run.name;
+  const tok = ++D.tok, n = D.run.name; delete EDITRAW[n];   // until this preview arrives the run's outlines are not known
   const r = await post("/api/xenium/batch/draw/preview", { run: n, spec: { ...settings(), comps: COMPS[n] || {}, rects: shapes(n), auto_off: !!AUTOOFF[n], cut_off: $("#cutoff").checked } });
   if (!r.ok) { $("#derr").textContent = await detail(r); return; }
-  const d = await r.json(); if (tok !== D.tok) return; $("#derr").textContent = ""; D.prev = d; EDITPOLY[n] = { key: skey(), polys: d.tissue_polys || [] }; dDraw(); dTable();
+  const d = await r.json(); if (tok !== D.tok) return; $("#derr").textContent = ""; D.prev = d; EDITPOLY[n] = { key: skey(), polys: d.tissue_polys || [] }; EDITRAW[n] = { key: skey(), polys: d.tissue_polys_raw || [] }; tisState(); dDraw(); dTable();
 }
 function dDraw() {
   const cv = $("#cv"), ctx = cv.getContext("2d"), W = cv.width, H = cv.height, img = ctx.createImageData(W, H), u = new Uint32Array(img.data.buffer), v = D.view, L = D.prev.labels;

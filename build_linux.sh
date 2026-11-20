@@ -23,9 +23,9 @@ fi
 .venv-linux/bin/python -m pip install -r requirements-linux.txt
 .venv-linux/bin/pyinstaller --noconfirm --clean --name WebbScope \
   --distpath dist --workpath build-linux --specpath build-linux \
-  --add-data "$PWD/webbscope/web:webbscope/web" \
+  --add-data "$PWD/webbscope/web:webbscope/web" --add-data "$PWD/webbscope/engine/data:webbscope/engine/data" \
   --collect-submodules uvicorn \
-  --hidden-import orjson --hidden-import shapely --hidden-import scipy.ndimage --hidden-import PIL --hidden-import readimc --hidden-import imageio.v2 --collect-all pylibCZIrw --collect-submodules webbscope \
+  --hidden-import orjson --hidden-import shapely --hidden-import scipy.ndimage --hidden-import PIL --hidden-import readimc --hidden-import h5py --hidden-import imageio.v2 --collect-all pylibCZIrw --collect-submodules webbscope \
   --exclude-module webview \
   run_app.py
 echo "--- smoke test"

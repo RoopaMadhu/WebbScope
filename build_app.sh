@@ -6,9 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 .venv/bin/python -m PyInstaller --noconfirm --clean --name WebbScope --windowed \
   --distpath dist --workpath build --specpath build \
-  --add-data "$PWD/webbscope/web:webbscope/web" \
+  --add-data "$PWD/webbscope/web:webbscope/web" --add-data "$PWD/webbscope/engine/data:webbscope/engine/data" \
   --collect-submodules uvicorn --collect-submodules webview \
-  --hidden-import orjson --hidden-import shapely --hidden-import scipy.ndimage --hidden-import PIL --hidden-import readimc --hidden-import imageio.v2 --collect-all pylibCZIrw --collect-submodules webbscope \
+  --hidden-import orjson --hidden-import shapely --hidden-import scipy.ndimage --hidden-import PIL --hidden-import readimc --hidden-import h5py --hidden-import imageio.v2 --collect-all pylibCZIrw --collect-submodules webbscope \
   run_app.py
 # Zip the app for download; the version comes from webbscope/__init__.py.
 VERSION="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' webbscope/__init__.py)"

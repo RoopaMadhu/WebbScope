@@ -15,7 +15,11 @@ class Store:
         self.meta = json.loads((c / "cache_meta.json").read_text())
         self.genes = json.loads((c / "genes.json").read_text())
         self.gene_index = {g: i for i, g in enumerate(self.genes)}
-        self.norm_scale = float(self.meta.get("norm_scale", 10000.0))
+        self.values = self.meta.get("values", "counts")          # "counts" (log-normalised here), "lognorm" (log-normalised values as given) or "both"
+        self.has_counts = self.values in ("counts", "both")       # a raw-counts layer exists (self.data holds the counts)
+        self.ln_given = self.values in ("lognorm", "both")        # the log-normalised values were given (shown as they are)
+        ns = self.meta.get("norm_scale", 10000.0)
+        self.norm_scale = float(ns) if ns is not None else None
         self.df = pd.read_parquet(c / "cells.parquet")
         self.n = len(self.df)
         # The viewer, its embeddings and every number in it describe QC'ed Xenium cells only (cells_with_regions_...qs). scFFPE cells have no
@@ -25,11 +29,28 @@ class Store:
         sg = c / "signatures.json"   # curated gene signatures resolved against the panel (scripts/build_signatures.py)
         self.signatures = json.loads(sg.read_text()) if sg.exists() else {"signatures": [], "isg_candidates": []}
         self.sig_by_id = {x["id"]: x for x in self.signatures["signatures"]}
+        from .signature_defs import SHOWN_CURATED
+        from .signatures import resolve as resolve_curated
+        for x in resolve_curated(self.genes):    # a shown curated list that this project's signatures.json lacks (an older project): resolved now
+            if x["id"] in SHOWN_CURATED and x["id"] not in self.sig_by_id:
+                self.sig_by_id[x["id"]] = x
+                self.signatures["signatures"].append(x)
+        from .genesets import Resolved
+        self.genesets = Resolved(self.genes)    # GO / Reactome gene sets (MSigDB) against this panel
+        self._gs_full = {}
         scf = c / "scffpe_composition.json"
         self.scffpe = json.loads(scf.read_text()) if scf.exists() else None
         self.indptr = np.load(c / "csr_indptr.npy", mmap_mode="r")
         self.indices = np.load(c / "csr_indices.npy", mmap_mode="r")
         self.data = np.load(c / "csr_data.npy", mmap_mode="r")
+        self.ln = None                                             # (indptr, indices, data) of the given log-normalised values; None = computed from the counts
+        if self.values == "lognorm":
+            self.ln = (self.indptr, self.indices, self.data)
+        elif self.values == "both":
+            if (c / "csr_data_ln.npy").exists():                   # same non-zeros as the counts: only the values are stored
+                self.ln = (self.indptr, self.indices, np.load(c / "csr_data_ln.npy", mmap_mode="r"))
+            else:
+                self.ln = tuple(np.load(c / f"ln_{k}.npy", mmap_mode="r") for k in ("indptr", "indices", "data"))
         self.poly_off = self.poly_xy = None
         if (c / "poly_offsets.npy").exists():
             self.poly_off = np.load(c / "poly_offsets.npy", mmap_mode="r")
@@ -160,7 +181,7 @@ class Store:
                 cats[k].update(self.state_parent)
         return {"mapping": m, "n_cells": self.n, "n_genes": len(self.genes), "samples": samples,
                 "cats": cats, "numeric": {k: v for k, v in self.numeric.items()},
-                "matrix": self.meta, "norm_scale": self.norm_scale, "has_polygons": self.poly_off is not None, "umaps": list(self.umap), "n_pcs": int(self.pca.shape[1]) if self.pca is not None else 0, "coordinate_unit": "µm (assumed: area equals area_um in source)"}
+                "matrix": self.meta, "norm_scale": self.norm_scale, "values": self.values, "has_counts": self.has_counts, "ln_given": self.ln_given, "has_polygons": self.poly_off is not None, "umaps": list(self.umap), "n_pcs": int(self.pca.shape[1]) if self.pca is not None else 0, "coordinate_unit": "µm (assumed: area equals area_um in source)"}
 
     def validation(self):
         df, m = self.df, self.map
@@ -188,21 +209,53 @@ class Store:
         return (off - off[0]).astype(np.int32), np.asarray(self.poly_xy[off[0]:off[-1]])
 
     # -- expression ---------------------------------------------------------------
+    def sig(self, sid):
+        """A signature by id: a curated one (signatures.json, hidden ones included) or a GO / Reactome gene set; None if unknown."""
+        if sid in self.sig_by_id:
+            return self.sig_by_id[sid]
+        if sid not in self._gs_full:
+            self._gs_full[sid] = self.genesets.get(sid)
+        return self._gs_full[sid]
+
     def gene_vector(self, gene, lo, hi, layer="logcpx", scale=None):
         """Dense expression for one gene over cells [lo, hi). Only that gene's nonzeros are read.
-        logcpx = log1p(counts / lib_size * scale); scale defaults to the source pipeline's normalisation value (harmony_normval)."""
+        logcpx = log1p(counts / lib_size * scale); scale defaults to the source pipeline's normalisation value (harmony_normval).
+        A project whose matrix is already log-normalised returns its values as they are for logcpx and has no counts layer."""
+        if layer == "counts" and not self.has_counts:
+            raise ValueError("this project holds log-normalised values, not raw counts")
         scale = self.norm_scale if scale is None else scale
         g = self.gene_index[gene]
-        a, b = int(self.indptr[g]), int(self.indptr[g + 1])
-        idx = np.asarray(self.indices[a:b])
-        val = np.asarray(self.data[a:b])
+        given = layer != "counts" and self.ln is not None
+        ptr, ind, dat = self.ln if given else (self.indptr, self.indices, self.data)
+        a, b = int(ptr[g]), int(ptr[g + 1])
+        idx = np.asarray(ind[a:b])
+        val = np.asarray(dat[a:b])
         l, r = np.searchsorted(idx, [lo, hi])
         idx, val = idx[l:r], val[l:r]
         out = np.zeros(hi - lo, dtype=np.float32)
-        if layer == "counts":
+        if layer == "counts" or given:
             out[idx - lo] = val
         else:
             out[idx - lo] = np.log1p(val / np.maximum(self.lib[idx], 1.0) * scale)
+        return out
+
+    def cell_expression(self, gi):
+        """[{gene, counts (None without raw counts), logcpx}] of one cell's detected genes (gene-major CSR: one search per gene)."""
+        def col(ptr, ind, dat):
+            got = {}
+            for g in range(len(self.genes)):
+                p0, p1 = int(ptr[g]), int(ptr[g + 1])
+                j = int(np.searchsorted(ind[p0:p1], gi))
+                if j < p1 - p0 and ind[p0 + j] == gi:
+                    got[g] = float(dat[p0 + j])
+            return got
+        cnt = col(self.indptr, self.indices, self.data) if self.has_counts else {}
+        ln = col(*self.ln) if self.ln is not None else None
+        out = []
+        for g in sorted(set(cnt) | set(ln or ())):
+            c = cnt.get(g, 0.0) if self.has_counts else None
+            v = ln.get(g, 0.0) if ln is not None else float(np.log1p(c / max(float(self.lib[gi]), 1.0) * self.norm_scale))
+            out.append({"gene": self.genes[g], "counts": c, "logcpx": v})
         return out
 
     def resolve_genes(self, names):

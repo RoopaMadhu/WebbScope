@@ -15,6 +15,7 @@ dist/
 
 # Example / test data and raw Xenium output: far over GitHub's 100 MB per-file limit
 sample_project/
+sample_project_h5ad/
 atera_sample/
 registered_H_E_images/
 Xenium_Preview_*/
