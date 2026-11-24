@@ -5,10 +5,11 @@ Each run goes through the same code as the single-run import (xenium.Session / x
 default settings, one run at a time, so only one run's counts are in memory while converting. The merged project is a normal project folder
 (`<out>/_merged`) that the viewer opens like any other:
   sample         = "<run folder>_<tissue>"         (tissues are T0 .. Tn-1, ordered left to right on the slide)
-  disease_subtype= the run folder name            (so the viewer's "by disease subtype" grouping is by run)
+  run            = the run folder name            (the Slide window groups the tissues of one run; not offered as a group for statistics)
   cell_type/state= "<run folder>_<tissue>: Cluster N"   (10x graph clusters of that run; not comparable between runs, hence the prefix)
   genes          = those present in every run (reported if any were dropped)
-  no embeddings  (the 10x UMAP / PCA of different runs share no coordinates); cells are drawn grey until a colouring is chosen.
+  embeddings     = each run's own 10x UMAP (embedding_per_run in project.json): the runs share no coordinates, so the viewer shows one run
+                   at a time; no PCA. Cells are drawn grey until a colouring is chosen.
 """
 import gc, json, os, re, shutil, sys, time, traceback
 from pathlib import Path
@@ -108,6 +109,8 @@ def _is_project(p):
     m = Path(p) / "project.json"
     if not (m.is_file() and (Path(p) / "cells.parquet").is_file()):
         return None
+    if (Path(p) / xenium.MARKER).is_file() and not xenium.finished(p):
+        return None                                             # an import that was stopped half-way: not a project
     try:
         return json.loads(m.read_text()).get("source") == "xenium"
     except Exception:
@@ -250,6 +253,152 @@ def he_match(run_names, czi, ann):
     return out
 
 
+# ---- cell labels from the user's own annotation file (one table for all runs), applied when the runs are merged
+ID_PREFIX = "__id_prefix__"                                     # run column choice: the part of the cell id before its last _ | : (as Seurat / Scanpy prefix merged cells)
+XENIUM_ID = re.compile(r"^[a-p]{8}-\d+$|^\d+$")                 # a Xenium cell id (current and early formats)
+_TAIL = re.compile(r"^.*[_|:]")
+
+
+def _id_parts(v):
+    """(cell id as written, its part after the last _ | :, the part before it or "")."""
+    v = pd.Series(v, dtype="string").fillna("")
+    tail = v.str.replace(_TAIL, "", regex=True)
+    head = pd.Series([a[: len(a) - len(b) - 1] if a != b else "" for a, b in zip(v, tail)], dtype="string")
+    return v, tail, head
+
+
+def ann_inspect(path, run_names):
+    """The columns of an annotation file and the suggested roles: {columns, n_rows, id_col, run_col, type_col, state_col, donor_col, id_prefix}.
+    id_prefix = the cell ids carry a prefix (sample_cellid), which can stand for the run when there is no run column."""
+    from .engine.config import CANDIDATES, find_columns
+    p = Path(path).expanduser()
+    if not p.is_file():
+        raise importer.ImportError_(f"not found: {p}")
+    d = xenium._read_annotation(p)
+    if not len(d.columns):
+        raise importer.ImportError_("the annotation file has no columns")
+    cols = [str(c) for c in d.columns]
+    smp = d.head(5000)
+    def xen(c):                                                 # share of values that are Xenium cell ids, as written or after a prefix
+        v, tail, _ = _id_parts(smp[c].astype(str))
+        return max(v.str.match(XENIUM_ID).mean(), tail.str.match(XENIUM_ID).mean())
+    rate = {c: float(xen(c)) for c in d.columns if d[c].dtype == object or str(d[c].dtype).startswith(("string", "category"))}
+    id_col = max(rate, key=rate.get) if rate and max(rate.values()) > 0.5 else next((c for c in CANDIDATES["cell_id"] if c in cols), cols[0])
+    v, tail, head = _id_parts(smp[id_col].astype(str))
+    id_prefix = bool((head != "").mean() > 0.9 and tail.str.match(XENIUM_ID).mean() > 0.5)
+    run_col, best = None, 0
+    for c in d.columns:
+        if c == id_col:
+            continue
+        vals = d[c].dropna().astype(str).unique()
+        if not 1 <= len(vals) <= 2000:
+            continue
+        m = ann_match(vals, run_names)
+        k = sum(1 for x in m.values() if x["value"] is not None)
+        if k > best:
+            run_col, best = c, k
+    if run_col is None and id_prefix:
+        run_col = ID_PREFIX
+    pick = lambda role: next((c for c in CANDIDATES[role] if c in cols), None)
+    donor = pick("donor") or next(iter(find_columns(cols, "donor")), None)
+    return {"columns": cols, "n_rows": int(len(d)), "id_col": id_col, "run_col": run_col, "type_col": pick("cell_type"), "state_col": pick("cell_state"),
+            "donor_col": donor, "id_prefix": id_prefix}
+
+
+def _ann_values(d, run_col, id_col):
+    """The value saying which run each row is from (the cell id's prefix for ID_PREFIX)."""
+    if run_col == ID_PREFIX:
+        return _id_parts(d[id_col].astype(str))[2]
+    return d[run_col].astype("string")
+
+
+def ann_values(path, run_col, id_col):
+    """{value: number of rows} of the run column (at most 2000 values)."""
+    d = xenium._read_annotation(Path(path).expanduser())
+    for c in (id_col, run_col):
+        if c and c != ID_PREFIX and c not in d.columns:
+            raise importer.ImportError_(f"the annotation file has no column {c!r}")
+    vc = _ann_values(d, run_col, id_col).dropna().value_counts()
+    if len(vc) > 2000:
+        raise importer.ImportError_(f"the column {run_col} has {len(vc):,} different values: it does not say which run a cell is from")
+    return {str(k): int(n) for k, n in vc.items()}
+
+
+def ann_match(values, run_names):
+    """Suggest the run-column value of each run: {run: {value, why}}. The value equal to the run name, else the one value sharing the most
+    identifying numbers with it (as for the H&E scans: 'slidearray077' matches '..._slidearray0077_...'); a tie or no shared number leaves it empty."""
+    values = [str(v) for v in values]
+    rt = {r: _name_tokens(r) for r in run_names}
+    if len(rt) > 1:
+        common = set.intersection(*[{t[1] for t in v} for v in rt.values()])
+        rt = {r: [t for t in v if t[1] not in common] for r, v in rt.items()}
+    vt = {v: _name_tokens(v) for v in values}
+    out = {}
+    for r in run_names:
+        if r in vt:
+            out[r] = {"value": r, "why": "same name"}; continue
+        sc = sorted(((_shared(rt[r], t)[0], v) for v, t in vt.items()), reverse=True)
+        best = [v for w, v in sc if w and w == sc[0][0]]
+        if len(best) == 1:
+            out[r] = {"value": best[0], "why": "shares " + ", ".join(_shared(rt[r], vt[best[0]])[1])}
+        else:
+            out[r] = {"value": None, "why": f"{len(best)} values match equally, choose one" if best else "no value shares a number with this run"}
+    return out
+
+
+def ann_prepare(ann, log):
+    """Read the annotation file once for the merge: {spec, rows: {value: rows}} (rows for one run) or {spec, rows: None} (one run, no run column)."""
+    d = xenium._read_annotation(Path(ann["path"]).expanduser())
+    for k in ("id_col", "run_col", "type_col", "state_col", "donor_col"):
+        c = ann.get(k)
+        if c and c != ID_PREFIX and c not in d.columns:
+            raise importer.ImportError_(f"the annotation file has no column {c!r} (chosen as {k.replace('_col', '').replace('_', ' ')})")
+    if not (ann.get("type_col") or ann.get("state_col")):
+        raise importer.ImportError_("choose the cell type column (or the cell state column) of the annotation file")
+    log(f"annotation file {Path(ann['path']).name}: {len(d):,} rows")
+    if not ann.get("run_col"):
+        return {"spec": ann, "rows": None, "df": d}
+    key = _ann_values(d, ann["run_col"], ann["id_col"])
+    return {"spec": ann, "rows": {str(k): g for k, g in d.groupby(key.values, sort=False)}}
+
+
+def _annotate(t, run, A, log):
+    """Cell type, cell state and the other columns of the annotation rows for this run, matched by cell id (as written, or after a prefix).
+    Returns (table, True) or (t unchanged, False) when the run has no rows or no cell matches."""
+    s = A["spec"]
+    if A["rows"] is None:
+        rows = A["df"]
+    else:
+        val = (s.get("runs") or {}).get(run)
+        rows = A["rows"].get(str(val)) if val is not None else None
+        if rows is None:
+            log(f"{run}: no annotation rows chosen; its 10x clusters are kept")
+            return t, False
+    ids = t["cell_id_in_run"].astype(str)
+    v, tail, _ = _id_parts(rows[s["id_col"]].astype(str))
+    key = tail if tail.isin(ids).sum() > v.isin(ids).sum() else v
+    r = rows.assign(_k=key.values)
+    dup = int(r["_k"].duplicated().sum())
+    r = r.drop_duplicates("_k").set_index("_k")
+    hit = ids.isin(r.index)
+    if not hit.any():
+        log(f"{run}: none of its cell ids is in the annotation rows chosen for it; its 10x clusters are kept")
+        return t, False
+    r = r.reindex(ids.values)
+    t = t.copy()
+    tc, sc = s.get("type_col") or s.get("state_col"), s.get("state_col") or s.get("type_col")
+    t["cell_type"] = r[tc].astype("string").fillna("unlabelled").values
+    t["cell_state"] = r[sc].astype("string").fillna("unlabelled").values
+    skip = {s["id_col"], s.get("run_col"), s.get("type_col"), s.get("state_col")}
+    clash = [c for c in r.columns if c not in skip and c in t.columns]
+    for c in r.columns:
+        if c not in skip and c not in t.columns:
+            t[c] = r[c].values
+    log(f"{run}: {int(hit.sum()):,} of {len(t):,} cells labelled from the annotation file"
+        + (f"; {dup:,} repeated cell ids (first kept)" if dup else "") + (f"; columns already in the cell table not taken: {', '.join(map(str, clash[:5]))}" if clash else ""))
+    return t, True
+
+
 def _he_key(czi_path):
     return safe_name(Path(czi_path).stem)
 
@@ -265,6 +414,8 @@ def build_he(czi_path, ann_path, out_root, log, workers=4):
     d = Path(out_root) / HE_DIR / key
     mk = d / ".source.json"
     want = {"czi": _fp(czi_path), "ann": _fp(ann_path) if ann_path else None}
+    if not he_slide.is_ome(czi_path):
+        want["levels"] = "halved from full resolution"           # tiles of a CZI made before this read the coarser levels from the file's own copies: made again
     if mk.is_file() and (d / he_slide.INDEX).is_file():
         try:
             if json.loads(mk.read_text()) == want:
@@ -280,10 +431,10 @@ def build_he(czi_path, ann_path, out_root, log, workers=4):
     return key, json.loads((d / he_slide.INDEX).read_text())
 
 
-def attach_he(out_root, merged, he_map, run_names, log, cores=1):
+def attach_he(out_root, merged, he_map, run_names, log, cores=1, threads=4):
     """Build the tiles of every scan that a converted run uses and write the merged project's he_slide.json: one entry per scan with the runs that use it.
     he_map = {run: {czi, annotations}}. A scan that cannot be read is logged and skipped (its runs get no H&E).
-    Scans are built side by side when cores allow (4 threads each)."""
+    Each scan is tiled with `threads` threads; scans are built side by side when the cores allow (cores // threads at once)."""
     out_root, merged = Path(out_root), Path(merged)
     scans, runs = {}, {}
     todo = {}
@@ -295,21 +446,22 @@ def attach_he(out_root, merged, he_map, run_names, log, cores=1):
         return None
     log(f"=== H&E: {len(todo)} scan(s) for {sum(len(v) for v in todo.values())} run(s)")
     items = list(todo.items())
-    n_par = max(1, min(len(items), cores // 4))
+    threads = max(1, int(threads))
+    n_par = max(1, min(len(items), cores // threads))
 
     def one(i):
         (czi_path, ann_path), rs = items[i]
         tag = f"[{Path(czi_path).name}] " if n_par > 1 else ""
         log(f"=== H&E [{i + 1}/{len(items)}] {Path(czi_path).name} -> {', '.join(rs)}")
         try:
-            return build_he(czi_path, ann_path, out_root, (lambda m: log(tag + m)))
+            return build_he(czi_path, ann_path, out_root, (lambda m: log(tag + m)), workers=threads)
         except Exception as e:
             if not isinstance(e, importer.ImportError_):
                 traceback.print_exc()
             log(f"=== H&E {Path(czi_path).name} FAILED, skipped: {e}")
             return None
+    log(f"H&E: {n_par} scan(s) at a time, {threads} thread(s) each ({cores} core(s))")
     if n_par > 1:
-        log(f"H&E: {n_par} scans at a time")
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(n_par) as ex:
             res = list(ex.map(one, range(len(items))))
@@ -352,7 +504,7 @@ def _convert_one(run, out, spec, log, transcripts=False, tx_table=False, threads
     m = sess.m[:, kept].tocsr()
     m.data = np.round(m.data).astype(np.int32)
     sess_ctrl_n = dict(sess.ctrl_n)
-    piece = {"name": run["name"], "m": m, "genes": list(sess.genes), "tissues": rep["tissues"], "n_cells": rep["n_cells"],
+    piece = {"name": run["name"], "dir": Path(out), "m": m, "genes": list(sess.genes), "tissues": rep["tissues"], "n_cells": rep["n_cells"],
              "controls": {xenium.CTRL_KEYS[k]: n for k, n in sess_ctrl_n.items() if k in xenium.CTRL_KEYS},
              "tx_dir": (out / "transcripts") if rep.get("transcripts") is not None else None,
              "if": if_image.read_index(out)}
@@ -387,7 +539,7 @@ def _load_project(run, log, transcripts=False):
     if has_tx and not transcripts:
         log(f"{run['name']}: has stored transcripts, not included (tick the transcripts box to include them)")
     log(f"{run['name']}: existing project read ({len(ids):,} cells, {len(genes):,} genes, {len(tissues)} tissue(s))")
-    return {"name": run["name"], "m": m, "genes": list(genes), "tissues": tissues, "n_cells": len(ids), "controls": ctrl,
+    return {"name": run["name"], "dir": d, "m": m, "genes": list(genes), "tissues": tissues, "n_cells": len(ids), "controls": ctrl,
             "tx_dir": tx if (has_tx and transcripts) else None, "if": if_image.read_index(d), "cells": cells, "bnd": pd.read_parquet(d / "cell_boundaries.parquet")}
 
 
@@ -440,22 +592,32 @@ def merge_if(pieces, out, log):
     return len(images)
 
 
-def merge(pieces, out, log):
-    """Write the merged project folder `out` from the per-run pieces."""
-    out = Path(out)
-    if out.exists():
-        if not (out / xenium.MARKER).exists() and any(out.iterdir()):
-            raise importer.ImportError_(f"{out} exists and is not an earlier merged import; choose a new or empty output folder")
-        for f in out.iterdir():
-            shutil.rmtree(f) if f.is_dir() else f.unlink()
-    out.mkdir(parents=True, exist_ok=True)
+def _run_umap(p, ids):
+    """The run's own 10x UMAP for its cells ids (in that order) as an (n, 2) array, or None when the run folder has none."""
+    f = Path(p["dir"]) / "embeddings.parquet" if p.get("dir") else None
+    if f is None or not f.is_file():
+        return None
+    import pyarrow.parquet as pq
+    if not {"cell_id", "umap_harmony_1", "umap_harmony_2"} <= set(pq.read_schema(f).names):
+        return None
+    e = pd.read_parquet(f, columns=["cell_id", "umap_harmony_1", "umap_harmony_2"])
+    e = e.set_index(e["cell_id"].astype(str)).reindex(pd.Index(ids, dtype=str))
+    return e[["umap_harmony_1", "umap_harmony_2"]].to_numpy(np.float32)
+
+
+def merge(pieces, out, log, ann=None):
+    """Write the merged project folder `out` from the per-run pieces. ann: the user's annotation file and its columns (cell labels, see _annotate)."""
+    if ann and ann.get("path") and not ann.get("run_col") and len(pieces) > 1:
+        raise importer.ImportError_("choose the column of the annotation file that says which run each cell is from: Xenium cell ids repeat between runs")
+    A = ann_prepare(ann, log) if ann and ann.get("path") else None
+    out = xenium.claim_folder(out, xenium.MARKER, "merged import")
     sets = [set(p["genes"]) for p in pieces]
     common = [g for g in pieces[0]["genes"] if all(g in s for s in sets)]
     if not common:
         raise importer.ImportError_("the runs have no gene in common")
     dropped = {p["name"]: len(p["genes"]) - len(common) for p in pieces if len(p["genes"]) != len(common)}
     log(f"merging {len(pieces)} runs: {len(common):,} genes shared by all runs" + (f"; genes left out per run: {dropped}" if dropped else " (the panels are identical)"))
-    mats, tabs, bnds = [], [], []
+    mats, tabs, bnds, umaps, own = [], [], [], [], []
     for p in pieces:
         run = p["name"]
         if p["genes"] != common:
@@ -469,18 +631,25 @@ def merge(pieces, out, log):
         sample = run + "_" + t["tissue"].astype(str)
         t["tissue"] = sample
         t["run"] = run
-        t["disease_subtype"] = run
-        t["disease_type"] = run
-        for col in ("cell_type", "cell_state"):
-            t[col] = sample + ": " + t[col].astype(str)
+        lab = False
+        if A is not None:
+            t, lab = _annotate(t, run, A, log)
+        if not lab:                                             # 10x clusters: not comparable between runs, so they carry the tissue's name
+            for col in ("cell_type", "cell_state"):
+                t[col] = sample + ": " + t[col].astype(str)
+        own.append(lab)
         tabs.append(t)
         b = p["bnd"].copy()
         b["cell_id"] = run + "|" + b["cell_id"].astype(str)
         bnds.append(b)
+        umaps.append(_run_umap(p, t["cell_id_in_run"].tolist()))
     log("writing merged counts")
     M = sp.hstack(mats, format="csr")
     sp.save_npz(out / "matrix.npz", M, compressed=False)
     cells = pd.concat(tabs, ignore_index=True)
+    for c in cells.columns:                                     # annotation columns that only some runs have: object columns of mixed values become text
+        if cells[c].dtype == object:
+            cells[c] = cells[c].where(cells[c].isna(), cells[c].astype(str))
     ids = cells["cell_id"].tolist()
     if len(set(ids)) != len(ids):
         raise importer.ImportError_("duplicate cell ids after merging")
@@ -492,6 +661,12 @@ def merge(pieces, out, log):
     log("writing merged cell table and boundaries")
     cells.to_parquet(out / "cells.parquet", index=False)
     pd.concat(bnds, ignore_index=True).to_parquet(out / "cell_boundaries.parquet", index=False)
+    have = [u is not None for u in umaps]
+    if any(have):                                              # each run's own UMAP; cells of a run without one get NaN
+        u = np.concatenate([x if x is not None else np.full((len(t), 2), np.nan, np.float32) for x, t in zip(umaps, tabs)])
+        pd.DataFrame({"cell_id": ids, "umap_harmony_1": u[:, 0], "umap_harmony_2": u[:, 1]}).to_parquet(out / "embeddings.parquet", index=False)
+        log(f"embeddings: the 10x UMAP of {sum(have)} of {len(pieces)} runs, each in its own coordinates (shown one run at a time)"
+            + ("" if all(have) else "; without one: " + ", ".join(p["name"] for p, h in zip(pieces, have) if not h)))
     n_tx = merge_transcripts(pieces, common, out, log) if any(p["tx_dir"] for p in pieces) else None
     merge_if(pieces, out, log)
     tissues = {f"{p['name']}_{k}": v for p in pieces for k, v in p["tissues"].items()}
@@ -500,6 +675,23 @@ def merge(pieces, out, log):
                 "norm_scale": 10000.0, "coordinate_unit": "um", "source": "xenium-batch", "default_grey": True,
                 "runs": [p["name"] for p in pieces], "controls": {p["name"]: p["controls"] for p in pieces},
                 "cell_labels": "10x graph clusters per tissue ('<run>_<tissue>: Cluster N'); not comparable between runs"}
+    if any(own):
+        donor = (ann or {}).get("donor_col")
+        if donor and donor in cells.columns:
+            manifest["roles"]["donor"] = donor
+            d = cells[donor].astype("string")
+            if d.isna().any():                                  # a tissue's cells without a donor (not in the file, or a run without labels): the tissue's own donor, else the tissue
+                top = d.groupby(cells["tissue"].values).agg(lambda s: s.mode().iloc[0] if s.notna().any() else pd.NA)
+                d = d.fillna(pd.Series(cells["tissue"].map(top).values, dtype="string")).fillna(cells["tissue"].astype("string"))
+                cells[donor] = d.astype(str)
+                cells.to_parquet(out / "cells.parquet", index=False)
+                log(f"donor: cells without one take their tissue's donor (or the tissue's name when none of its cells has one)")
+        manifest["cell_labels"] = (f"from {Path(ann['path']).name} ({sum(own)} of {len(pieces)} runs)"
+                                   + ("; the other runs keep their 10x graph clusters ('<run>_<tissue>: Cluster N')" if not all(own) else ""))
+        manifest["default_grey"] = not all(own)
+        log(f"cell labels: from the annotation file for {sum(own)} of {len(pieces)} runs" + ("" if all(own) else "; the others keep their 10x clusters"))
+    if any(have):
+        manifest.update(embedding_label="10x Xenium analysis of each run (not comparable between runs)", embedding_per_run=True)
     (out / "project.json").write_text(json.dumps(manifest, indent=2))
     xenium.write_signatures(out, common, log)
     (out / xenium.MARKER).write_text(json.dumps({"runs": [p["name"] for p in pieces], "tissues": tissues, "n_cells": len(ids), "n_genes": len(common),
@@ -528,7 +720,7 @@ def _worker(i, run, out, spec, transcripts, tx_table, threads, ifimg, reg=None):
         return i, None, str(e)
 
 
-def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, he=None, tx_table=False, workers=0, ifimg=False, he_reg=None, reg=None):
+def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, he=None, tx_table=False, workers=0, ifimg=False, he_reg=None, reg=None, he_threads=4, ann=None):
     """Convert every run (a failing run is logged and skipped), then merge. `workers` = runs converted at once (0 = automatic, 1 = one by one).
     Returns {done, failed, merged, first}."""
     spec = {**SPEC, **(spec or {})}
@@ -601,11 +793,13 @@ def run_batch(runs, out_root, log, spec=None, do_merge=True, transcripts=False, 
     failed = list(failed.values())
     merged = None
     if do_merge and pieces:
-        merged = merge(pieces, out_root / MERGED, log)
+        merged = merge(pieces, out_root / MERGED, log, ann)
         if he:
-            attach_he(out_root, merged, he, [p["name"] for p in pieces], log, cores=cpu_count() if not workers else min(int(workers), cpu_count()))
+            attach_he(out_root, merged, he, [p["name"] for p in pieces], log, cores=cpu_count() if not workers else min(int(workers), cpu_count()), threads=he_threads)
     elif he and pieces:
         log("H&E is only attached to the merged project: tick the merge option to use it")
+    if ann and ann.get("path") and not (do_merge and pieces):
+        log("the annotation file is only used for the merged project: tick the merge option to use it")
     if he_reg and merged:                                       # registered H&E OME-TIFFs for the merged samples (<run>_<tissue>)
         try:
             from . import he_registered

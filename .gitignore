@@ -16,6 +16,8 @@ dist/
 # Example / test data and raw Xenium output: far over GitHub's 100 MB per-file limit
 sample_project/
 sample_project_h5ad/
+sample_project_batch_import_processed_data/
+sample_project_mcp_lung/
 atera_sample/
 registered_H_E_images/
 Xenium_Preview_*/
@@ -46,5 +48,17 @@ IMC_slidearray0073_2024-08-22.mcd
 .Rhistory
 .RData
 
-# Local helper
+# Kidney sample data, wherever it is: never part of the repository
+sample_project*
+*kidney*
+*slidearray*
+*.qs
+
+# Local helpers and reports: not part of the app
 tools/make_sample.py
+tools/make_sample_h5ad.py
+tools/make_sample_batch_processed.py
+tools/make_sample_mcp_lung.py
+docs/WebbScope_browser_review.html
+webbscope/store.py
+webbscope/make_signatures.py

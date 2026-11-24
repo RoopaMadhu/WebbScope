@@ -1,7 +1,9 @@
 """H&E slide images: Zeiss CZI or OME-TIFF -> tiled pyramids (the viewer's he/ format) and ImageScope annotations -> GeoJSON in micrometres.
 
 A slide scan (CZI) holds one or more scenes (here: the tissue sections of one slide). Each scene becomes its own pyramid in the project's
-he/<key>/<level>/<x>_<y>.jpg (level 0 = full resolution, every further level halves it; 512 px tiles, the format the viewer already reads),
+he/<key>/<level>/<x>_<y>.jpg (level 0 = full resolution, every further level halves it; 512 px tiles, the format the viewer already reads).
+Only level 0 is read from the CZI; the coarser levels are made by halving it, not read from the scanner's own reduced copies in the file,
+which can leave out parts of the tissue (they then vanish when zoomed out),
 described by he_slide.json. The slide frame is the pixel grid of the scan's bounding box (origin = its top-left corner, y down), in micrometres.
 Annotations (ImageScope .annotations XML: named polygons, some flagged negative) are expressed in that same frame and written to
 he_slide_annotations.geojson with the properties the region importer already uses (annotation_name, region_id, negative_roa, line_color_hex).
@@ -272,13 +274,11 @@ def build(czi_path, out_dir, ann_path=None, log=print, quality=88, workers=4):
         nz = _levels(s["w"], s["h"])
         scenes.append({"key": key, "name": s["name"], "scene": s["index"], "w": s["w"], "h": s["h"], "px": px, "x0": round((s["x"] - bx) * px, 3),
                        "y0": round((s["y"] - by) * px, 3), "tsize": TSIZE, "nz": nz})
-        for z in range(nz):
-            lw, lh = max(1, s["w"] >> z), max(1, s["h"] >> z)
-            for ty0 in range(0, math.ceil(lh / TSIZE), BLOCK // TSIZE):
-                for tx0 in range(0, math.ceil(lw / TSIZE), BLOCK // TSIZE):
-                    jobs.append((str(czi_path), str(out_dir), key, s["x"], s["y"], z, tx0, ty0,
-                                 min(BLOCK, lw - tx0 * TSIZE), min(BLOCK, lh - ty0 * TSIZE), quality))
-    log(f"H&E: writing {len(jobs)} blocks of tiles ({sum(sc['nz'] for sc in scenes)} pyramid levels in all) with {workers} threads")
+        for ty0 in range(0, math.ceil(s["h"] / TSIZE), BLOCK // TSIZE):          # level 0 only: the coarser levels are halved from it below
+            for tx0 in range(0, math.ceil(s["w"] / TSIZE), BLOCK // TSIZE):
+                jobs.append((str(czi_path), str(out_dir), key, s["x"], s["y"], 0, tx0, ty0,
+                             min(BLOCK, s["w"] - tx0 * TSIZE), min(BLOCK, s["h"] - ty0 * TSIZE), quality))
+    log(f"H&E: reading {len(jobs)} full-resolution blocks ({len(scenes)} scene(s)) with {workers} threads; the coarser levels are halved from them")
     (out_dir / "he").mkdir(parents=True, exist_ok=True)
     done = tiles = 0
     last = time.time()
@@ -288,6 +288,11 @@ def build(czi_path, out_dir, ann_path=None, log=print, quality=88, workers=4):
             if time.time() - last > 5:
                 log(f"  H&E tiles: {done}/{len(jobs)} blocks, {tiles:,} tiles, {time.time() - t0:.0f} s")
                 last = time.time()
+        from .he_registered import _up
+        for sc in scenes:                                                         # each coarser level from the one below it (a level needs the whole level below)
+            base = out_dir / "he" / sc["key"]
+            for z in range(1, sc["nz"]):
+                tiles += sum(ex.map(lambda ty, z=z, base=base, sc=sc: _up(base, z, sc["w"], sc["h"], ty), range(math.ceil(max(1, sc["h"] >> z) / TSIZE))))
     index = {"source": info["file"], "px": px, "frame": "micrometres from the top-left of the scan's bounding box, y down (not registered to Xenium)",
              "bounds_um": [0, 0, round(info["bbox"][2] * px, 1), round(info["bbox"][3] * px, 1)], "scenes": scenes,
              "objective": info["objective"], "magnification": info["magnification"], "acquired": info["acquired"], "annotations": None}

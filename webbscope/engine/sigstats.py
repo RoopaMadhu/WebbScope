@@ -1,4 +1,4 @@
-"""Signature statistics: change across disease subtypes, and spatial localisation of two signatures.
+"""Signature statistics: change across the donor groups (groups.py), and spatial localisation of two signatures.
 
 All tests use DONORS as the unit (cells within a tissue are spatially autocorrelated, so cell-level p-values would be meaningless). A donor's
 tissue pieces (fragments) come from one biopsy, so their cells are pooled into one unit; the "sample" field of the rows holds the donor id.
@@ -7,10 +7,6 @@ Scores are the mean log-normalised expression of the signature genes, optionally
 """
 import numpy as np
 from scipy import stats
-
-SUBTYPE_ORDER = ["Control", "No LN", "Class I/II", "Class III", "Class V"]
-TYPE_ORDER = ["Control", "No LN", "LN"]
-ORDERS = {"subtype": SUBTYPE_ORDER, "type": TYPE_ORDER}
 
 
 def _holm(p):
@@ -47,19 +43,11 @@ def donors_of(S):
     return d
 
 
-def subtype_of(SM, sample):
-    t = SM.info[sample]["disease_subtype"]
-    return t if t not in ("", "nan", "None") else SM.info[sample]["disease_type"]
-
-
-def group_of(SM, sample, group_by):
-    return subtype_of(SM, sample) if group_by == "subtype" else (SM.info[sample]["disease_type"] or "unknown")
-
-
-def summary(S, SM, NB, genes, sigma, scope, filters, hidden, layer="logcpx", min_cells=30, group_by="subtype", expr=()):
-    """Per-sample score statistics over the cells passing `filters`, aggregated by disease subtype (5 groups) or disease type (3 groups),
-    with across-group tests. scope = how the score is z-scored: none | sample | subtype | type | all (see smooth.py)."""
-    ORDER = ORDERS[group_by]
+def summary(S, SM, NB, genes, sigma, scope, filters, hidden, layer="logcpx", min_cells=30, expr=()):
+    """Per-donor score statistics over the cells passing `filters`, aggregated by the project's groups, with across-group tests: Kruskal-Wallis,
+    each group versus the reference (if one is set), and a rank correlation with the group order (if the user said the groups are ordered).
+    scope = how the score is z-scored (see smooth.py)."""
+    G = S.groups
     genes = tuple(genes)
     rows = []
     for dn, smp in donors_of(S).items():
@@ -73,7 +61,7 @@ def summary(S, SM, NB, genes, sigma, scope, filters, hidden, layer="logcpx", min
                 gv[k].append(S.gene_vector(g, a, b, layer)[m])
             n_cells += b - a
         x = np.concatenate(xs)
-        r = {"sample": dn, "subtype": subtype_of(SM, s0), "group": group_of(SM, s0, group_by), "disease_type": SM.info[s0]["disease_type"], "n": int(len(x)), "n_cells": int(n_cells)}
+        r = {"sample": dn, "group": G.of(s0), "n": int(len(x)), "n_cells": int(n_cells)}
         if len(x):
             q = np.percentile(x, [25, 50, 75])
             r.update(mean=float(x.mean()), median=float(q[1]), q25=float(q[0]), q75=float(q[2]), sd=float(x.std()))
@@ -84,29 +72,30 @@ def summary(S, SM, NB, genes, sigma, scope, filters, hidden, layer="logcpx", min
         if r["n"] >= min_cells:
             groups.setdefault(r["group"], []).append(r["mean"])
             gdon.setdefault(r["group"], set()).add(r["sample"])
-    order = [t for t in ORDER if t in groups] + sorted(t for t in groups if t not in ORDER)
+    order = [t for t in G.order if t in groups] + sorted(t for t in groups if t not in G.order)
     sub = []
     for t in order:
         v = np.array(groups[t])
-        sub.append({"subtype": t, "n_samples": int(len(v)), "n_donors": len(gdon[t]), "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else None,
+        sub.append({"group": t, "n_samples": int(len(v)), "n_donors": len(gdon[t]), "mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1 else None,
                     "se": float(v.std(ddof=1) / np.sqrt(len(v))) if len(v) > 1 else None})
-    tests = {"min_cells": min_cells, "kruskal_p": None, "vs_control": [], "spearman_rho": None, "spearman_p": None}
+    ref = G.reference
+    tests = {"min_cells": min_cells, "kruskal_p": None, "reference": ref, "vs_reference": [], "spearman_rho": None, "spearman_p": None}
     big = [t for t in order if len(groups[t]) >= 2]
     if len(big) >= 2:
         try:
             tests["kruskal_p"] = float(stats.kruskal(*[groups[t] for t in big]).pvalue)
         except ValueError:
             pass
-    if "Control" in groups and len(groups["Control"]) >= 2:
-        rest = [t for t in order if t != "Control" and len(groups[t]) >= 2]
-        ps = [float(stats.mannwhitneyu(groups[t], groups["Control"], alternative="two-sided").pvalue) for t in rest]
+    if ref in groups and len(groups[ref]) >= 2:
+        rest = [t for t in order if t != ref and len(groups[t]) >= 2]
+        ps = [float(stats.mannwhitneyu(groups[t], groups[ref], alternative="two-sided").pvalue) for t in rest]
         adj = _holm(ps) if ps else []
-        tests["vs_control"] = [{"subtype": t, "p": p, "p_holm": float(h), "diff": float(np.mean(groups[t]) - np.mean(groups["Control"]))} for t, p, h in zip(rest, ps, adj)]
-    ordinal = [(ORDER.index(t), x) for t in order if t in ORDER for x in groups[t]]
+        tests["vs_reference"] = [{"group": t, "p": p, "p_holm": float(h), "diff": float(np.mean(groups[t]) - np.mean(groups[ref]))} for t, p, h in zip(rest, ps, adj)]
+    ordinal = [(G.order.index(t), x) for t in order if t in G.order for x in groups[t]] if G.ordered else []
     if len(ordinal) >= 6 and len({o for o, _ in ordinal}) >= 3:
         rho = stats.spearmanr([o for o, _ in ordinal], [x for _, x in ordinal])
         tests["spearman_rho"], tests["spearman_p"] = float(rho.statistic), float(rho.pvalue)
-    return {"genes": list(genes), "sigma": sigma, "scope": scope, "group_by": group_by, "order": ORDER, "samples": rows, "subtypes": sub, "groups": sub, "tests": tests}
+    return {"genes": list(genes), "sigma": sigma, "scope": scope, "order": G.order, "samples": rows, "groups": sub, "tests": tests}
 
 
 def _boot_ci(vals, n=2000, seed=1):
@@ -118,10 +107,13 @@ def _boot_ci(vals, n=2000, seed=1):
     return [float(np.percentile(m, 2.5)), float(np.percentile(m, 97.5))]
 
 
+MIN_TEST_DONORS = 6                         # a signed-rank p-value below 0.05 is impossible with fewer
+
+
 def _wilcoxon(vals):
     v = np.asarray(vals, float)
     v = v[np.isfinite(v)]
-    if len(v) < 6 or np.allclose(v, 0):
+    if len(v) < MIN_TEST_DONORS or np.allclose(v, 0):
         return None
     try:
         return float(stats.wilcoxon(v).pvalue)
@@ -129,7 +121,7 @@ def _wilcoxon(vals):
         return None
 
 
-def localization(S, SM, genes_a, genes_b, sigma, q=0.10, subtype=None, min_cells=50, min_samples=4):
+def localization(S, SM, genes_a, genes_b, sigma, q=0.10, group=None, min_cells=50, min_samples=4):
     """Do two signatures sit in different places? Scores are smoothed and z-scored within each sample, so both have mean 0 / sd 1 per
     sample and their difference is in SD units. Per sample: correlation of the two maps (raw and after removing each cell type's mean),
     overlap of the top-q hotspots against chance. Per region / cell type: contrast d = mean(A) - mean(B) over the cells inside it (and the
@@ -138,7 +130,7 @@ def localization(S, SM, genes_a, genes_b, sigma, q=0.10, subtype=None, min_cells
     pr = S.cats.get("path_region")
     reg_names = pr["levels"] if pr else []
     ct_names = S.cats["cell_type"]["levels"]
-    don = {d: smp for d, smp in donors_of(S).items() if subtype is None or subtype_of(SM, smp[0]) == subtype}
+    don = {d: smp for d, smp in donors_of(S).items() if group is None or S.groups.of(smp[0]) == group}
     samples = list(don)
     per_sample, reg_rows, ct_rows = [], {}, {}
     pooled_a, pooled_b = [], []
@@ -158,7 +150,7 @@ def localization(S, SM, genes_a, genes_b, sigma, q=0.10, subtype=None, min_cells
         ta, tb = za >= np.quantile(za, 1 - q), zb >= np.quantile(zb, 1 - q)
         expected = max(ta.sum(), tb.sum()) / n
         ov = float((ta & tb).sum() / max(1, min(ta.sum(), tb.sum())))
-        per_sample.append({"sample": s, "subtype": subtype_of(SM, smp[0]), "n": int(n), "r": r_all, "r_adj": r_adj, "overlap": ov, "overlap_expected": float(expected),
+        per_sample.append({"sample": s, "group": S.groups.of(smp[0]), "n": int(n), "r": r_all, "r_adj": r_adj, "overlap": ov, "overlap_expected": float(expected),
                            "overlap_ratio": float(ov / expected) if expected else None, "jaccard": float((ta & tb).sum() / max(1, (ta | tb).sum()))})
         pooled_a.append(za)
         pooled_b.append(zb)
@@ -193,7 +185,7 @@ def localization(S, SM, genes_a, genes_b, sigma, q=0.10, subtype=None, min_cells
 
     allr = np.array([[p["r"], p["r_adj"], p["overlap_ratio"]] for p in per_sample], float)
     pa, pb = np.concatenate(pooled_a), np.concatenate(pooled_b)
-    return {"a": list(ga), "b": list(gb), "sigma": sigma, "q": q, "subtype": subtype, "min_cells": min_cells, "min_samples": min_samples, "n_samples": len(samples), "n_donors": len(samples),
+    return {"a": list(ga), "b": list(gb), "sigma": sigma, "q": q, "group": group, "min_cells": min_cells, "min_samples": min_samples, "min_test_donors": MIN_TEST_DONORS, "regions_seen": len(reg_rows), "cell_types_seen": len(ct_rows), "n_samples": len(samples), "n_donors": len(samples),
             "samples": per_sample, "regions": aggregate(reg_rows), "cell_types": aggregate(ct_rows, adjust=False),
             "overall": {"r_mean": float(np.nanmean(allr[:, 0])), "r_adj_mean": float(np.nanmean(allr[:, 1])), "overlap_ratio_mean": float(np.nanmean(allr[:, 2])),
                         "r_pooled": float(np.corrcoef(pa, pb)[0, 1])}}

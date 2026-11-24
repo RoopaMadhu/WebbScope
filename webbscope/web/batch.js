@@ -4,7 +4,7 @@ const post = (u, b) => fetch(u, { method: "POST", headers: { "content-type": "ap
 let REG = {}, COMPS = {}, THUMB = {}, EDITPOLY = {}, EDITRAW = {}, AUTOOFF = {}, IMPORTED = {};   // EDITRAW: the editor's tissue outlines before the switched-off shapes are cut out (for the export)
 // AUTOOFF / IMPORTED: runs whose tissue boxes were loaded from a GeoJSON -> true / [{name, polys}]
 //   // run name -> drawn shapes; -> {piece id: {name, keep}} edits of the detected tissues; -> thumbnail data of the gallery
-let RUNS = [], PARENT_MERGED = null, HE = null;   // HE = {czi: [{name, path}], annotations: [...], match: {run: {czi, annotations, why}}} once an H&E folder was matched
+let RUNS = [], PARENT_MERGED = null, HE = null, ANN = { cols: null, values: null, match: null };   // HE = {czi: [{name, path}], annotations: [...], match: {run: {czi, annotations, why}}} once an H&E folder was matched
 async function detail(r) { try { return JSON.parse(await r.text()).detail; } catch (e) { return "failed"; } }
 $("#find").onclick = async () => {
   $("#err").textContent = "";
@@ -15,7 +15,7 @@ $("#find").onclick = async () => {
   if (!RUNS.length) { $("#err").textContent = "No Xenium runs found directly inside this folder (looked for Xenium output sub-folders with cell_feature_matrix/, cells and cell_boundaries, .tar.gz or .zip bundles, and project folders already written by this app)." + (d.skipped.length ? " Skipped sub-folders: " + d.skipped.join(", ") : ""); return; }
   $("#runsum").textContent = `${RUNS.length} run(s)` + (d.skipped.length ? `; ${d.skipped.length} sub-folder(s) skipped because they are not Xenium outputs: ${d.skipped.join(", ")}` : "");
   REG = {}; COMPS = {}; THUMB = {}; EDITPOLY = {}; EDITRAW = {}; AUTOOFF = {}; IMPORTED = {}; HE = null; $("#tismsg").textContent = ""; $("#hemsg").textContent = ""; document.querySelectorAll(".hecol").forEach((e) => (e.hidden = true));
-  $("#ttab tbody").innerHTML = RUNS.map((x, i) => `<tr><td><input type="checkbox" data-i="${i}" checked></td><td></td><td>${x.kind}</td><td>${x.kind === "project" ? '<span class="sub">n/a</span>' : `<button data-d="${i}">Draw…</button> <span class="sub" data-n="${i}"></span>`}</td><td class="hecol" hidden></td><td class="hecol" hidden></td></tr>`).join("");
+  $("#ttab tbody").innerHTML = RUNS.map((x, i) => `<tr><td><input type="checkbox" data-i="${i}" checked></td><td></td><td>${x.kind}</td><td>${x.kind === "project" ? '<span class="sub">n/a</span>' : `<button data-d="${i}">Draw…</button> <span class="sub" data-n="${i}"></span>`}</td><td class="hecol" hidden></td><td class="hecol" hidden></td><td class="anncol" hidden></td></tr>`).join(""); ANN.match = null; annShow();
   document.querySelectorAll("#ttab tbody tr").forEach((tr, i) => { tr.children[1].textContent = RUNS[i].name; });
   $("#outdir").value = d.default_output;
   $("#s2").hidden = false; $("#s3").hidden = false; checkMerged(); tisState();
@@ -116,6 +116,54 @@ $("#hefind").onclick = async () => {
   });
   msg.textContent = `${HE.czi.length} scan(s) and ${HE.annotations.length} annotation file(s) found; ${n} of ${RUNS.length} run(s) matched by name. Runs left at (none) get no H&E.`;
 };
+// ---- cell labels from the user's annotation file (batch.ann_inspect / ann_match); applied when the runs are merged
+const ID_PREFIX = "__id_prefix__";
+const annEsc = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+function annFill(sel, cols, blank, extra) { sel.innerHTML = (blank ? '<option value="">(none)</option>' : "") + (extra || []).map(([v, t]) => `<option value="${annEsc(v)}">${annEsc(t)}</option>`).join("") + cols.map((c) => `<option value="${annEsc(c)}">${annEsc(c)}</option>`).join(""); }
+function annShow() {   // the "cell labels" column of the runs table
+  const on = !!ANN.cols, byRun = on && !!$("#a_run").value;
+  document.querySelectorAll(".anncol").forEach((e) => (e.hidden = !on));
+  if (!on) return;
+  document.querySelectorAll("#ttab tbody tr").forEach((tr, i) => {
+    const td = tr.children[6], run = RUNS[i]; if (!td || !run) return;
+    const note = (t) => td.replaceChildren(Object.assign(document.createElement("span"), { className: "sub", textContent: t }));
+    if (!byRun) return note(RUNS.length > 1 ? "choose the run column" : "all rows (one run)");
+    if (!ANN.match) return note("press Match to runs");
+    const m = ANN.match[run.name] || {}, sel = document.createElement("select"); sel.className = "annsel"; sel.style.maxWidth = "220px";
+    sel.innerHTML = '<option value="">(none: 10x clusters)</option>' + Object.entries(ANN.values).map(([v, n]) => `<option value="${annEsc(v)}">${annEsc(v)} (${n.toLocaleString()} cells)</option>`).join("");
+    sel.value = m.value || ""; const why = document.createElement("div"); why.className = "sub"; why.style.cssText = "font-size:11px;margin:2px 0 0"; why.textContent = m.why || "";
+    sel.addEventListener("change", () => { why.textContent = sel.value ? "chosen by you" : ""; }); td.replaceChildren(sel, why);
+  });
+}
+$("#annload").onclick = async () => {
+  const msg = $("#annmsg"); ANN.cols = null; ANN.match = null; $("#anncols").hidden = $("#annmatchrow").hidden = true;
+  const path = $("#annpath").value.trim(); if (!path) { msg.textContent = "Enter the path of the annotation file."; annShow(); return; }
+  msg.textContent = "reading…";
+  const r = await post("/api/xenium/batch/ann", { path, runs: RUNS.map((x) => x.name) });
+  if (!r.ok) { msg.textContent = await detail(r); annShow(); return; }
+  const d = await r.json(); ANN.cols = d;
+  annFill($("#a_id"), d.columns); annFill($("#a_run"), d.columns, true, d.id_prefix ? [[ID_PREFIX, "the prefix of the cell id"]] : []);
+  annFill($("#a_type"), d.columns, true); annFill($("#a_state"), d.columns, true); annFill($("#a_donor"), d.columns, true);
+  $("#a_id").value = d.id_col; $("#a_run").value = d.run_col || ""; $("#a_type").value = d.type_col || ""; $("#a_state").value = d.state_col || ""; $("#a_donor").value = d.donor_col || "";
+  $("#anncols").hidden = false;
+  const upd = () => { $("#annmatchrow").hidden = !$("#a_run").value; ANN.match = null; annShow(); }; $("#a_run").onchange = upd; $("#a_id").onchange = upd; upd();
+  msg.textContent = `${d.n_rows.toLocaleString()} rows. Check the columns` + (d.run_col ? "." : RUNS.length > 1 ? "; with several runs choose the run column (Xenium cell ids repeat between runs)." : ".");
+  if (d.run_col) await $("#annmatch").onclick();
+};
+$("#annmatch").onclick = async () => {
+  const msg = $("#annmsg"); msg.textContent = "matching…";
+  const r = await post("/api/xenium/batch/ann/match", { path: $("#annpath").value.trim(), runs: RUNS.map((x) => x.name), run_col: $("#a_run").value, id_col: $("#a_id").value });
+  if (!r.ok) { msg.textContent = await detail(r); ANN.match = null; annShow(); return; }
+  const d = await r.json(); ANN.values = d.values; ANN.match = d.match; annShow();
+  const n = Object.values(d.match).filter((m) => m.value).length;
+  msg.textContent = `${Object.keys(d.values).length} value(s) in the run column; ${n} of ${RUNS.length} run(s) matched. Check the cell labels column of the runs table; runs left at (none) keep their 10x clusters.`;
+};
+function annChoice() {   // {path, columns, runs: {run: value}} for the ticked runs, or {} when no file is loaded
+  if (!ANN.cols || !$("#annpath").value.trim()) return {};
+  const runs = {}, byRun = !!$("#a_run").value;
+  document.querySelectorAll("#ttab tbody tr").forEach((tr, i) => { if (!tr.querySelector("input[type=checkbox]").checked) return; const s = tr.querySelector(".annsel"); if (byRun && s && s.value) runs[RUNS[i].name] = s.value; });
+  return { path: $("#annpath").value.trim(), id_col: $("#a_id").value, run_col: $("#a_run").value, type_col: $("#a_type").value, state_col: $("#a_state").value, donor_col: $("#a_donor").value, runs };
+}
 function heChoice() {   // {run: {czi, annotations}} for the ticked runs that have a scan chosen
   const out = {}; if (!HE) return out;
   document.querySelectorAll("#ttab tbody tr").forEach((tr, i) => {
@@ -137,8 +185,8 @@ $("#go").onclick = async () => {
   const runs = [...document.querySelectorAll("#ttab input[type=checkbox]:checked")].map((c) => RUNS[+c.dataset.i]);
   if (!runs.length) { $("#err2").textContent = "No run is ticked."; return; }
   $("#go").disabled = true; $("#log2").textContent = "";
-  const r = await post("/api/xenium/batch/run", { runs, output: $("#outdir").value.trim(), merge: $("#domerge").checked, transcripts: $("#wanttx").checked, tx_table: $("#wanttab").checked, workers: +$("#workers").value || 0, ifimg: $("#wantif").checked, he_reg_folder: $("#hereg_folder").value.trim(), he_reg_index: $("#hereg_index").value.trim(),
-    ...settings(), he: heChoice(),
+  const r = await post("/api/xenium/batch/run", { runs, output: $("#outdir").value.trim(), merge: $("#domerge").checked, transcripts: $("#wanttx").checked, tx_table: $("#wanttab").checked, workers: +$("#workers").value || 0, he_threads: Math.max(1, Math.round(+$("#hethreads").value || 4)), ifimg: $("#wantif").checked, he_reg_folder: $("#hereg_folder").value.trim(), he_reg_index: $("#hereg_index").value.trim(),
+    ...settings(), he: heChoice(), annotation: annChoice(),
     export_regions: $("#wantreg").checked, regions_name_col: $("#regcol").value.trim() || "sample_id_unblinded", regions_dir: $("#regdir").value.trim(),
     regions: Object.fromEntries(runs.filter((x) => (REG[x.name] || []).length).map((x) => [x.name, REG[x.name]])),
     comps: Object.fromEntries(runs.filter((x) => Object.keys(COMPS[x.name] || {}).length).map((x) => [x.name, COMPS[x.name]])),

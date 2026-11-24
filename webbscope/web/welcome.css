@@ -8,3 +8,11 @@ button,input{font:inherit;background:#262a33;color:#dfe3ea;border:1px solid #3a4
 select{font:inherit;background:#262a33;color:#dfe3ea;border:1px solid #3a4050;border-radius:4px;padding:5px 6px;max-width:28em}
 .crow{margin:8px 0;align-items:center}.crow label{min-width:11em}.crow label.req::after{content:" *";color:#ff8a80}
 [hidden]{display:none !important}
+.cards{display:grid;gap:12px;margin:22px 0}
+.card{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid #3a4050;border-radius:6px;background:#1d2027;color:#dfe3ea;text-decoration:none}
+.card b{font-size:15px}.card span{color:#9fb0cc;font-size:13px}
+.card .choices{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.card .choices a{padding:7px 14px;border:1px solid #3a4050;border-radius:4px;background:#262a33;text-decoration:none;color:#dfe3ea}
+.card .choices a:hover{background:#31364a}
+code{font-size:12px;color:#c9d4e6}
+#recent{margin-top:6px;display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}#recentlist{display:contents}#recent a.gone{color:#6f7a8c;text-decoration:line-through}

@@ -10,7 +10,7 @@ OUT="$NAME-v$VERSION-src.tar.gz"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 mkdir "$STAGE/$NAME"
-rsync -a --exclude='__pycache__' --exclude='.DS_Store' \
+rsync -a --exclude='__pycache__' --exclude='.DS_Store' --exclude='WebbScope_browser_review.html' --exclude='/webbscope/store.py' --exclude='/webbscope/make_signatures.py' \
   webbscope run_app.py build_linux.sh requirements-linux.txt README.md docs "$STAGE/$NAME/"
 COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$OUT" "$NAME"
 echo "made $OUT ($(du -h "$OUT" | cut -f1))"

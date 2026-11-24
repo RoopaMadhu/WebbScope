@@ -10,6 +10,7 @@ Counting is per index-cell/neighbour pair (a neighbour shared by two index cells
 its own neighbour. `bg` is the field's distribution over ALL cells of the sample, the reference for enrichment. The last bin
 (index = number of levels) holds cells whose field value is missing.
 """
+import hashlib, json
 import threading
 import numpy as np
 import scipy.sparse as sp
@@ -29,6 +30,30 @@ def match(S, key, codes, ids):
             sel |= 1 << int(i)
         return (codes.astype(np.int64) & sel) != 0
     return np.isin(codes, ids)
+
+
+OR_KEY = "__or"                     # reserved key in `filters`: the cell_type and cell_state selections are combined with OR (union), not AND
+OR_FIELDS = ("cell_type", "cell_state")
+
+
+def filter_mask(S, a, b, filters):
+    """Boolean per cell [a:b]: passes every field filter (AND across fields). With the reserved OR_KEY present, the selections of
+    OR_FIELDS count as ONE condition that any of them can satisfy (e.g. proximal tubule cells OR M7 macrophages)."""
+    mask = np.ones(b - a, bool)
+    union = None
+    for kk, ids in filters.items():
+        if kk == OR_KEY:
+            continue
+        if kk not in S.cats:
+            raise KeyError(f"unknown filter field {kk!r}")
+        m = match(S, kk, S.cats[kk]["codes"][a:b], ids)
+        if OR_KEY in filters and kk in OR_FIELDS:
+            union = m if union is None else (union | m)
+        else:
+            mask &= m
+    if union is not None:
+        mask &= union
+    return mask
 
 
 class Neighbors:
@@ -114,14 +139,24 @@ class Neighbors:
             m &= (v > e["thr"]) if e["op"] == "gt" else (v <= e["thr"])
         return m
 
-    def index_mask(self, sample, filters, hidden, expr=()):
+    @staticmethod
+    def _cells_key(cells):
+        return hashlib.sha1(json.dumps({s: sorted(v) for s, v in cells.items()}, sort_keys=True).encode()).hexdigest() if cells else ""
+
+    def index_mask(self, sample, filters, hidden, expr=(), cells=None):
+        """The index cells of a sample: those passing the filters and, when `cells` ({sample: cell positions in the sample}) is given, also chosen there."""
         S = self.S
         a, b = S.slices[sample]
+        if cells and sample not in cells:
+            return np.zeros(b - a, bool)
         mask = np.ones(b - a, bool)
-        for kk, ids in filters.items():
-            if kk not in S.cats:
-                raise KeyError(f"unknown filter field {kk!r}")
-            mask &= match(S, kk, S.cats[kk]["codes"][a:b], ids)
+        if cells:
+            ids = np.asarray(cells[sample], dtype=np.int64)
+            if len(ids) and (ids.min() < 0 or ids.max() >= b - a):
+                raise KeyError(f"a selected cell is outside sample {sample!r}")
+            mask[:] = False
+            mask[ids] = True
+        mask &= filter_mask(S, a, b, filters)
         for kk, ids in hidden.items():
             if kk not in S.cats:
                 raise KeyError(f"unknown filter field {kk!r}")
@@ -130,7 +165,7 @@ class Neighbors:
             mask &= self.expr_mask(sample, expr)
         return mask
 
-    def neighbourhoods(self, sample, filters, hidden, method, distance, k, steps, limit, order, seed, expr=()):
+    def neighbourhoods(self, sample, filters, hidden, method, distance, k, steps, limit, order, seed, expr=(), cells=None):
         """Index cells of one sample with their neighbour lists (for drawing neighbourhoods in space).
         order: random (seeded) | most | fewest neighbours. Returns at most `limit` index cells."""
         S = self.S
@@ -138,7 +173,7 @@ class Neighbors:
             raise KeyError(f"unknown sample {sample!r}")
         distance, k, steps = self._norm(method, distance, k, steps)
         a, b = S.slices[sample]
-        idx = np.flatnonzero(self.index_mask(sample, filters, hidden, expr))
+        idx = np.flatnonzero(self.index_mask(sample, filters, hidden, expr, cells))
         res = {"sample": sample, "n_index": int(len(idx)), "index": [], "ids": [], "neighbors": []}
         if not len(idx):
             return res
@@ -158,7 +193,7 @@ class Neighbors:
         res["neighbors"] = [j_s[starts[r]:starts[r + 1]].tolist() for r in sel]
         return res
 
-    def compute(self, field, method, distance, k, steps, filters, hidden, expr=()):
+    def compute(self, field, method, distance, k, steps, filters, hidden, expr=(), cells=None):
         S = self.S
         if field not in S.cats:
             raise KeyError(f"unknown field {field!r}")
@@ -168,10 +203,10 @@ class Neighbors:
         k, steps = int(min(max(k, 1), MAX_K)), int(min(max(steps, 1), MAX_STEPS))
         norm = lambda d: {kk: sorted(int(i) for i in v) for kk, v in sorted(d.items())}
         filters, hidden = norm(filters), norm(hidden)
-        for kk in list(filters) + list(hidden):
+        for kk in [k for k in filters if k != OR_KEY] + list(hidden):
             if kk not in S.cats:
                 raise KeyError(f"unknown filter field {kk!r}")
-        key = (field, method, distance, k, steps, repr(filters), repr(hidden), repr(expr))
+        key = (field, method, distance, k, steps, repr(filters), repr(hidden), repr(expr), self._cells_key(cells))
         if key in self.cache:
             return self.cache[key]
         nlev = len(S.cats[field]["levels"])
@@ -180,14 +215,7 @@ class Neighbors:
         out = {}
         for sample in S.samples:
             a, b = S.slices[sample]
-            mask = np.ones(b - a, bool)
-            for kk, ids in filters.items():
-                mask &= match(S, kk, S.cats[kk]["codes"][a:b], ids)
-            for kk, ids in hidden.items():
-                mask &= ~match(S, kk, S.cats[kk]["codes"][a:b], ids)
-            if expr:
-                mask &= self.expr_mask(sample, expr)
-            idx = np.flatnonzero(mask)
+            idx = np.flatnonzero(self.index_mask(sample, filters, hidden, expr, cells))
             codes = fc[a:b]
             rec = {"n_index": int(len(idx)), "n_cells": int(b - a), "bg": np.bincount(codes, minlength=nlev + 1).tolist(),
                    "counts": [0] * (nlev + 1), "n_pairs": 0}
@@ -203,7 +231,7 @@ class Neighbors:
         self.cache[key] = res
         return res
 
-    def per_cell(self, field, method, distance, k, steps, filters, hidden, expr, groups, bins=40, boot=200, seed=1):
+    def per_cell(self, field, method, distance, k, steps, filters, hidden, expr, groups, bins=40, boot=200, seed=1, cells=None):
         """Spread of the neighbour composition ACROSS index cells (the pooled composition in compute() hides it).
         `groups`: {level: {sample: group name}}; the index cells of all samples in a group are pooled. Per group and neighbour type:
           q       [5, 25, 50, 75, 95]th percentile and mean of the per-cell neighbour fraction (cells with no neighbour are left out),
@@ -217,7 +245,7 @@ class Neighbors:
         norm = lambda d: {kk: sorted(int(i) for i in v) for kk, v in sorted(d.items())}
         filters, hidden = norm(filters), norm(hidden)
         gkey = repr(sorted((lv, sorted(m.items())) for lv, m in groups.items()))
-        key = ("pc", field, method, distance, k, steps, repr(filters), repr(hidden), repr(expr), gkey)
+        key = ("pc", field, method, distance, k, steps, repr(filters), repr(hidden), repr(expr), gkey, self._cells_key(cells))
         if key in self.cache:
             return self.cache[key]
         nlev = len(S.cats[field]["levels"])
@@ -227,7 +255,7 @@ class Neighbors:
         per = {}                                    # sample -> (C: index cells x L neighbour counts, bg: counts over all cells)
         for sample in S.samples:
             a, b = S.slices[sample]
-            idx = np.flatnonzero(self.index_mask(sample, filters, hidden, expr))
+            idx = np.flatnonzero(self.index_mask(sample, filters, hidden, expr, cells))
             codes = fc[a:b]
             bg = np.bincount(codes, minlength=L)
             if not len(idx):

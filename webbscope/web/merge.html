@@ -1,0 +1,54 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>WebbScope — merge several datasets</title>
+<link rel="stylesheet" href="/static/welcome.css"><link rel="stylesheet" href="/static/xenium.css"></head><body>
+<div id="xbox">
+  <h1>Merge several datasets</h1>
+  <p class="sub">Processed datasets (project folders with a matrix and cell metadata, or <code>.h5ad</code> files) are merged into one project to browse
+    together. Each dataset is read as when it is opened alone. In the merged project the cell types, states, regions and other labels are kept as they are,
+    the genes are those every dataset has, the cell ids get the dataset's name in front, and a sample name used by two datasets gets it too. Raw counts are
+    log-normalised together; embeddings are not merged (each was computed on its own). The datasets are never modified.
+    <a href="/welcome">← start page</a></p>
+
+  <section>
+    <h2>1 · Folder with the datasets</h2>
+    <p class="sub">A folder holding the datasets: project folders (one per dataset) and / or <code>.h5ad</code> files. A <code>.h5ad</code> file directly in it is read alone; a folder with one <code>.h5ad</code> also gives that folder's cell outlines and regions.</p>
+    <div class="row"><input id="path" placeholder="/path/to/folder with the datasets" autofocus><button id="browse" hidden>Browse folder…</button><button id="find" class="primary">Find datasets</button></div>
+    <div id="err"></div>
+  </section>
+
+  <section id="s2" hidden>
+    <h2>2 · Datasets</h2>
+    <table id="ttab"><thead><tr><th>use</th><th>name</th><th>kind</th><th>columns</th><th>path</th></tr></thead><tbody></tbody></table>
+    <div id="skipped" class="sub"></div>
+    <div id="earlier" class="sub"></div>
+  </section>
+
+  <section id="s3" hidden>
+    <h2>3 · Columns of the datasets without saved choices</h2>
+  <div id="colsbox" hidden>
+    <p class="sub" id="colsintro"></p>
+    <div id="h5rows" hidden>
+      <div class="row crow"><label for="colcounts">Raw counts</label><select id="colcounts"></select></div>
+      <div class="row crow"><label for="colln">Log-normalised values</label><select id="colln"></select></div>
+      <div class="sub" id="colmnote"></div>
+      <div class="row crow"><label for="colgenes">Gene names</label><select id="colgenes"></select> <span id="colgenesn" class="sub"></span></div>
+    </div>
+    <div class="sub" id="colfiles" hidden></div>
+    <div class="row crow" id="valrow" hidden><label for="colvalues">Values in the matrix</label><select id="colvalues"><option value="counts">raw counts: WebbScope log-normalises them</option><option value="lognorm">already log-normalised: used as they are</option></select> <span id="colvaln" class="sub"></span></div>
+    <div class="row crow" id="scalerow" hidden><label for="colscale">Normalisation scale</label><input id="colscale" placeholder="empty = the median total counts per cell" style="flex:0 1 18em"> <span class="sub">log1p(counts / total counts of the cell × scale)</span></div>
+    <div id="colrows"></div>
+    <label class="sub" id="saverow"><input type="checkbox" id="savepj"> <span id="savelab"></span></label>
+  </div>
+  </section>
+
+  <section id="s4" hidden>
+    <h2 id="s4h">4 · Merge</h2>
+    <div class="grid"><label>Output folder (the merged project; an earlier merge there is replaced)</label><input id="outdir"></div>
+    <div class="row"><button id="go" class="primary">Merge and open</button></div>
+    <pre id="log2"></pre><div id="err2"></div>
+  </section>
+</div>
+<script src="/static/colform.js"></script>
+<script src="/static/merge.js"></script>
+<script src="/static/unlock.js"></script>
+</body></html>

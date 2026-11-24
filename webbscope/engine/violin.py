@@ -66,7 +66,7 @@ def violins(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_only
 
     from . import sigstats
     units = sigstats.donors_of(S)             # per-donor values: the cells of a donor's tissue pieces (one biopsy) are pooled
-    label_of = {d: (sigstats.subtype_of(SM, m[0]) if unit == "subtype" else SM.info[m[0]]["disease_type"]) for d, m in units.items()}   # used when unit is subtype / type
+    label_of = {d: S.groups.of(m[0]) for d, m in units.items()}   # used when unit is "group"
 
     def cells(vec, ct, gid, members):
         return np.concatenate([vec[s][mask(ct, gid, *S.slices[s])] for s in members])
@@ -96,7 +96,7 @@ def violins(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_only
                         q = np.percentile(x, [25, 50, 75])
                         r.update(mean=float(x.mean()), median=float(q[1]), q25=float(q[0]), q75=float(q[2]), density=_density(x, lo, hi))
                     rows.append(r)
-                if unit != "sample":      # bar plot data: the mean of the per-donor means of each disease subtype / type (each donor counts once)
+                if unit != "sample":      # bar plot data: the mean of the per-donor means of each group (each donor counts once)
                     rows = _aggregate(rows, label_of)
                 groups.append({"id": int(gid), "name": gname, "samples": rows})
             out.append({"feature": f["label"], "cell_type": "All cells" if ct < 0 else ct_names[ct], "cell_type_id": int(ct), "level": level, "lo": lo, "hi": hi, "groups": groups})
@@ -105,14 +105,14 @@ def violins(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_only
 
 def histograms(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_only=False, bins=60, unit="sample", min_cells=10):
     """Histogram of the per-cell values that the violins are made from, one panel per (feature, cell type). Exact zeros get their own bar.
-    unit "sample": all donors pooled in one histogram. unit "subtype" / "type": one histogram per disease subtype / type, each the AVERAGE over its
+    unit "sample": all donors pooled in one histogram. unit "group": one histogram per group, each the AVERAGE over its
     donors of the donor's own histogram (share of the donor's cells per bin), so every donor counts once whatever its cell number.
     For a single gene there is also a histogram of its raw counts in the same cells, and a check that the plotted value equals
     log1p(raw count / total counts x scale) recomputed from the counts (only when no smoothing / z-score is applied)."""
     from . import sigstats
     ct_codes, ct_names = S.cats["cell_type"]["codes"], S.cats["cell_type"]["levels"]
     donors = sigstats.donors_of(S)
-    label_of = {d: (sigstats.subtype_of(SM, m[0]) if unit == "subtype" else SM.info[m[0]]["disease_type"]) for d, m in donors.items()} if unit != "sample" else {}
+    label_of = {d: S.groups.of(m[0]) for d, m in donors.items()} if unit != "sample" else {}
     out = []
     for f in feats:
         genes = tuple(f["genes"]); single = len(genes) == 1 and S.has_counts     # raw-count histogram: only when the project has raw counts
@@ -183,3 +183,67 @@ def histograms(S, SM, feats, cell_types, sigma, scope, layer="logcpx", nonzero_o
                     rec["groups"] = groups
             out.append(rec)
     return out
+
+
+def dotplot(S, SM, feats, cell_types, layer="logcpx", nonzero_only=False, level="cell_type", by="all", min_cells=10):
+    """For each feature and cell type (or state): the share of cells with a value above 0, and the mean value (over all cells, or the expressing
+    cells only). Worked out per donor (tissue pieces pooled) from donors with at least `min_cells` cells there. by "all" / "group": the average over
+    the donors, so every donor counts once; by "donor": one plot per donor. Values are never z-scored: "above 0" must mean "detected"."""
+    from . import sigstats
+    from .store import MISSING
+    if level == "cell_state":
+        if "cell_state" not in S.cats or not S.state_parent or any(c < 0 for c in cell_types):
+            raise ValueError("cell-state columns need real cell types and the cell-state labels")
+        ct_names, names, parent = S.cats["cell_type"]["levels"], S.cats["cell_state"]["levels"], S.state_parent["parent"]
+        columns = [{"id": i, "name": names[i], "parent": ct_names[c]} for c in cell_types for i in sorted((i for i, p in enumerate(parent) if p == c), key=lambda i: _natural(names[i]))]
+        codes = S.cats["cell_state"]["codes"]
+    else:
+        names = S.cats["cell_type"]["levels"]
+        columns = [{"id": int(c), "name": "All cells" if c < 0 else names[c]} for c in cell_types]
+        codes = S.cats["cell_type"]["codes"]
+    lut = np.full(len(names) + 1, -1, np.int64)                       # label code -> column; the last entry stands for a missing label
+    for j, c in enumerate(columns):
+        if c["id"] >= 0:
+            lut[c["id"]] = j
+    all_col = next((j for j, c in enumerate(columns) if c["id"] < 0), None)
+    donors = sigstats.donors_of(S)
+    ids, nf, nc = list(donors), len(feats), len(columns)
+    col_of = {d: lut[np.minimum(np.concatenate([codes[S.slices[s][0]:S.slices[s][1]] for s in m]).astype(np.int64), len(names))] for d, m in donors.items()}
+    assert MISSING >= len(names)
+    F, M = np.full((nf, len(ids), nc), np.nan), np.full((nf, len(ids), nc), np.nan)
+    N = np.zeros((len(ids), nc), np.int64)
+    for di, d in enumerate(ids):
+        col = col_of[d]
+        ok = col >= 0
+        c = col[ok]
+        N[di] = np.bincount(c, minlength=nc)
+        if all_col is not None:
+            N[di, all_col] = len(col)
+        for fi, f in enumerate(feats):
+            v = np.concatenate([SM.expression(s, tuple(f["genes"]), layer, 0.0, "none") for s in donors[d]]).astype(np.float64)
+            x, on = v[ok], v[ok] > 0
+            n_on, total = np.bincount(c, on.astype(float), nc), np.bincount(c, x * on if nonzero_only else x, nc)
+            if all_col is not None:
+                n_on[all_col], total[all_col] = (v > 0).sum(), v[v > 0].sum() if nonzero_only else v.sum()
+            base = n_on if nonzero_only else N[di].astype(float)
+            F[fi, di] = np.where(N[di] >= min_cells, n_on / np.maximum(N[di], 1), np.nan)
+            M[fi, di] = np.where(base >= min_cells, total / np.maximum(base, 1), np.nan)
+
+    def clean(a):
+        return [[None if not np.isfinite(v) else round(float(v), 5) for v in row] for row in a]
+
+    def plot(name, which):
+        fs, ms = F[:, which], M[:, which]
+        kf, km = np.isfinite(fs).sum(1), np.isfinite(ms).sum(1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            f, m = np.nansum(fs, 1) / kf, np.nansum(ms, 1) / km
+        return {"name": name, "n_donors": len(which), "f": clean(f), "m": clean(m), "n": N[which].sum(0).tolist(), "donors": kf[0].tolist() if nf else []}
+
+    if by == "donor":
+        plots = [plot(d, [i]) for i, d in enumerate(ids)]
+    elif by == "group" and S.groups.column:
+        of = {d: S.groups.of(donors[d][0]) for d in ids}
+        plots = [plot(g, [i for i, d in enumerate(ids) if of[d] == g]) for g in S.groups.order if any(of[d] == g for d in ids)]
+    else:
+        plots = [plot("All donors", list(range(len(ids))))]
+    return {"features": [f["label"] for f in feats], "columns": columns, "plots": plots, "min_cells": min_cells, "nonzero_only": nonzero_only}

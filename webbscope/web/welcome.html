@@ -1,34 +1,40 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>WebbScope — open a project</title>
+<html><head><meta charset="utf-8"><title>WebbScope</title>
 <link rel="stylesheet" href="/static/welcome.css"></head><body>
 <div id="box">
   <h1>WebbScope</h1>
-  <p>Open a project folder (a matrix with a cell table, or one AnnData <code>.h5ad</code> file; cell outlines and other extras are optional) or the path to an <code>.h5ad</code> file.</p>
+  <p class="sub">A viewer for spatial transcriptomics. What do you have?</p>
   <div id="current" hidden>Currently open: <b id="cur"></b> — <a href="/">back to the viewer</a></div>
-  <div class="row"><input id="path" placeholder="/path/to/project_folder" autofocus><button id="browse" hidden title="Choose the project folder">Browse folder…</button><button id="browseh5" hidden title="Choose an AnnData .h5ad file (its folder is the project: outlines and other extras are read from there)">Browse .h5ad…</button><button id="open">Open</button></div>
-  <div class="sub" id="chrow">Columns are asked once per project and then remembered. <a href="#" id="chcols">Change columns…</a></div>
-  <div class="row"><input id="roi" placeholder="region_heterogeneity object, optional (/path/to/object.rds or .qs2)" title="A list with the ROI-level expression, metadata, PCA and UMAP; feeds the ROI heterogeneity window. A .qs2 file is read through R (Rscript)."><button id="roibrowse" hidden>Browse…</button></div>
-  <div class="row"><input id="ifimg" placeholder="IF image, optional (morphology_focus.ome.tif, or the Xenium run folder)" title="The Xenium morphology image of this run (DAPI), shown under or beside the cells like the H&amp;E. It is read where it is, not copied, and has to be in the cells' coordinates (the Xenium morphology image is)."><button id="ifbrowse" hidden>Browse…</button></div>
-  <div class="row"><input id="imcfile" placeholder="IMC slide, optional (.mcd file)" title="An imaging mass cytometry file of the slide. It is converted once into the cache (minutes for a file of 20 GB), never changed, and shown beside the cells, not aligned to them."><button id="imcbrowse" hidden>Browse…</button></div>
-  <div class="row"><input id="hereg" placeholder="registered H&E images, optional (folder of .ome.tif / .ome.tiff, one per tissue)" title="One OME-TIFF per tissue, already in the Xenium frame. Each image goes to the sample whose id is the image's file name (without _warped_he.ome.tif), or as listed in the index.json below. Shown under or beside the cells."><button id="heregbrowse" hidden>Browse…</button></div>
-  <div class="row"><input id="heregidx" placeholder="index.json for those images, optional (image name → sample id)"><button id="heregidxbrowse" hidden>Browse…</button></div>
-  <div id="colsbox" hidden>
-    <p class="sub" id="colsintro"></p>
-    <div id="h5rows" hidden>
-      <div class="row crow"><label for="colcounts">Raw counts</label><select id="colcounts"></select></div>
-      <div class="row crow"><label for="colln">Log-normalised values</label><select id="colln"></select></div>
-      <div class="sub" id="colmnote"></div>
-      <div class="row crow"><label for="colgenes">Gene names</label><select id="colgenes"></select> <span id="colgenesn" class="sub"></span></div>
+  <div id="busy" hidden>An import is running: <a href="/open">follow it</a></div>
+  <div class="cards">
+    <div class="card">
+      <b>Processed data</b>
+      <span>A counts matrix with cell metadata, or an AnnData <code>.h5ad</code> file. Your cell types and other labels are used as they are; cell outlines, regions, embeddings and H&amp;E are optional.</span>
+      <span class="choices"><a href="/open">One dataset</a><a href="/merge">Several datasets (merge)</a></span>
     </div>
-    <div class="sub" id="colfiles" hidden></div>
-    <div class="row crow" id="valrow" hidden><label for="colvalues">Values in the matrix</label><select id="colvalues"><option value="counts">raw counts: WebbScope log-normalises them</option><option value="lognorm">already log-normalised: used as they are</option></select> <span id="colvaln" class="sub"></span></div>
-    <div class="row crow" id="scalerow" hidden><label for="colscale">Normalisation scale</label><input id="colscale" placeholder="empty = the median total counts per cell" style="flex:0 1 18em"> <span class="sub">log1p(counts / total counts of the cell × scale)</span></div>
-    <div id="colrows"></div>
-    <label class="sub" id="saverow"><input type="checkbox" id="savepj"> <span id="savelab"></span></label>
+    <div class="card">
+      <b>Raw Xenium output</b>
+      <span>Xenium output folders or <code>.tar.gz</code> / <code>.zip</code> bundles, converted into a project: the tissues are found on each slide and labelled with the 10x clusters.</span>
+      <span class="choices"><a href="/xenium">One run</a><a href="/xenium-batch">A folder of runs</a></span>
+    </div>
   </div>
-  <p class="sub">Have raw Xenium output instead? <a href="/xenium">Import a Xenium output bundle (.tar.gz, .zip or folder)…</a> · <a href="/xenium-batch">Import a folder of many runs…</a></p>
-  <pre id="log"></pre>
-  <div id="err"></div>
+  <div id="recent" hidden><span class="sub">Recent:</span> <span id="recentlist"></span></div>
 </div>
-<script src="/static/welcome.js"></script>
+<script>
+const q = (s) => document.querySelector(s);
+fetch("/api/status").then((r) => r.json()).then((s) => {
+  if (s.open && s.project) { q("#current").hidden = false; q("#cur").textContent = s.project; }
+  if (s.state === "importing") q("#busy").hidden = false;
+}).catch(() => {});
+fetch("/api/recent").then((r) => r.json()).then((d) => {   // projects opened before: one click opens them again (with the choices made then)
+  const box = q("#recentlist");
+  for (const e of d.recent || []) {
+    const a = document.createElement("a");
+    a.href = "/open?path=" + encodeURIComponent(e.path); a.textContent = e.label; a.title = e.path + (e.exists ? "" : " (not found)");
+    if (!e.exists) a.className = "gone";
+    box.append(a);
+  }
+  q("#recent").hidden = !box.children.length;
+}).catch(() => {});
+</script>
 </body></html>

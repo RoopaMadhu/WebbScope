@@ -1,14 +1,20 @@
 """Read an AnnData .h5ad file with h5py alone (anndata and scanpy are not needed).
 
 Read: the cell table (obs, with its index as a column), the gene names (var index or a var column), one matrix (X, a layer, or raw/X; sparse
-CSR / CSC or dense), the spatial coordinates in obsm (as extra columns <key>_x, <key>_y of the cell table) and the UMAP / PCA in obsm.
+CSR / CSC or dense), the spatial coordinates in obsm (as extra columns <key>_x, <key>_y of the cell table), the UMAP / PCA in obsm and cell
+outlines kept as WKT text in an obs column (found by its values; such columns are outlines, so they are not part of the cell table).
 Files written by anndata 0.7 or later are supported (obs stored as a group); older ones (obs as one compound table) are refused with a message.
 """
+import re
 import h5py, numpy as np, pandas as pd, scipy.sparse as sp
 from .importer import ImportError_
 
 UMAP_KEYS = ("X_umap_harmony", "X_umap")
 PCA_KEYS = ("X_pca_harmony", "X_harmony", "X_pca")
+WKT_POLYGON = re.compile(r"\s*(MULTI)?POLYGON\s*(Z\s*)?(\(|EMPTY)", re.I)
+WKT_ANY = re.compile(r"\s*((MULTI)?(POINT|LINESTRING|POLYGON)|GEOMETRYCOLLECTION)\s*(Z\s*)?(\(|EMPTY)", re.I)
+NO_TEXT = ("", "nan", "none", "na", "<na>")               # a missing value written as text
+OUTLINE_NAMES = ("geometry", "shape", "geom")
 
 
 def _attr(node, k, default=None):
@@ -61,7 +67,13 @@ def _column(g, name, f):
         return None
 
 
-def _frame(f, path):
+def _order(g, idx):
+    """The columns of a dataframe group, in order."""
+    order = g.attrs.get("column-order")
+    return [o.decode() if isinstance(o, bytes) else str(o) for o in order] if order is not None and len(order) else [k for k in g.keys() if k not in (idx, "__categories")]
+
+
+def _frame(f, path, leave_out=()):
     """A dataframe group (obs, var, raw/var) -> (DataFrame of the readable columns, index values as str, names of the skipped columns)."""
     g = f[path]
     if not isinstance(g, h5py.Group):
@@ -70,12 +82,9 @@ def _frame(f, path):
     if idx not in g:
         raise ImportError_(f"{path} has no index in this .h5ad")
     index = np.asarray(_values(g[idx])).astype(str)
-    order = g.attrs.get("column-order")
-    order = [o.decode() if isinstance(o, bytes) else str(o) for o in order] if order is not None and len(order) else \
-        [k for k in g.keys() if k not in (idx, "__categories")]
     data, skipped = {}, []
-    for c in order:
-        if c not in g:
+    for c in _order(g, idx):
+        if c not in g or c in leave_out:
             continue
         v = _column(g, c, f)
         if v is None or len(v) != len(index):
@@ -91,9 +100,51 @@ def n_obs(f):
     return len(node["values"]) if isinstance(node, h5py.Group) else len(node)
 
 
+def _text_source(f, node):
+    """The string dataset holding a column's text (its levels when categorical); None for a column that holds no text."""
+    if isinstance(node, h5py.Group):
+        node = node.get("categories") if _attr(node, "encoding-type", "") == "categorical" else node.get("values")
+    elif isinstance(node.attrs.get("categories"), h5py.Reference):   # anndata 0.7: codes here, the levels elsewhere
+        node = f[node.attrs["categories"]]
+    return node if isinstance(node, h5py.Dataset) and node.ndim == 1 and h5py.check_string_dtype(node.dtype) is not None else None
+
+
+def _holds_wkt(f, node, step=5000):
+    """True when the first values that are not missing are all WKT and at least one is a polygon (a column of WKT points is not an outline)."""
+    d = _text_source(f, node)
+    if d is None:
+        return False
+    for a in range(0, len(d), step):
+        v = [x for x in d.asstr()[a:a + step] if x.strip().lower() not in NO_TEXT]
+        if v:
+            return all(WKT_ANY.match(x) for x in v) and any(WKT_POLYGON.match(x) for x in v)
+    return False
+
+
+def outline_columns(f):
+    """The obs columns holding WKT polygons: {"all": every one, "cell": the one to draw, or None}. A column named for nuclei is never drawn as
+    the cell's outline; among the others a plain geometry / shape / geom name comes first, then a name with cell or bound in it."""
+    g = f["obs"]
+    if not isinstance(g, h5py.Group):
+        return {"all": [], "cell": None}
+    idx = _attr(g, "_index", "_index")
+    found = [c for c in _order(g, idx) if c in g and _holds_wkt(f, g[c])]
+    cell = sorted((c for c in found if "nuc" not in c.lower()), key=lambda c: (c.lower() not in OUTLINE_NAMES, not ("cell" in c.lower() or "bound" in c.lower())))
+    return {"all": found, "cell": cell[0] if cell else None}
+
+
+def outlines(f, column):
+    """The WKT text of one obs column, one entry per cell, as objects (None = missing)."""
+    v = _column(f["obs"], column, f)
+    if v is None:
+        raise ImportError_(f"the outline column {column!r} of this .h5ad cannot be read")
+    return pd.Series(v).astype(object).where(lambda x: x.notna(), None).values
+
+
 def obs(f):
-    """(cell table, name of the column holding the obs index, skipped columns). The spatial arrays of obsm are added as <key>_x / <key>_y."""
-    df, index, skipped = _frame(f, "obs")
+    """(cell table, name of the column holding the obs index, skipped columns). The spatial arrays of obsm are added as <key>_x / <key>_y;
+    columns of WKT outlines are left out."""
+    df, index, skipped = _frame(f, "obs", outline_columns(f)["all"])
     idcol = "cell_id" if "cell_id" not in df.columns else "obs_names"
     df.insert(0, idcol, index)
     for key in spatial_keys(f):
@@ -111,8 +162,8 @@ def obs_columns(f):
     if not isinstance(g, h5py.Group):
         raise ImportError_("this .h5ad was written by an old anndata version (before 0.7). Open it with anndata and save it again (adata.write_h5ad), then try again.")
     idx = _attr(g, "_index", "_index")
-    order = g.attrs.get("column-order")
-    cols = [o.decode() if isinstance(o, bytes) else str(o) for o in order] if order is not None and len(order) else [k for k in g.keys() if k not in (idx, "__categories")]
+    wkt = outline_columns(f)["all"]
+    cols = [c for c in _order(g, idx) if c not in wkt]
     idcol = "cell_id" if "cell_id" not in cols else "obs_names"
     return [idcol] + cols + [f"{k}_{ax}" for k in spatial_keys(f) for ax in "xy"], idcol
 

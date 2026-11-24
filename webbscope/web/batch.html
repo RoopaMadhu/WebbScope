@@ -4,8 +4,8 @@
 <div id="xbox">
   <h1>Import a folder of Xenium runs</h1>
   <p class="sub">Every run in the folder is converted in turn (tissues are found automatically, as in the single-run import), each into its own project, and then all tissues are merged into one project to browse together,
-    grouped by run folder instead of disease subtype. Tissues are named <code>&lt;folder&gt;_T0</code>, <code>&lt;folder&gt;_T1</code> …; cell types are <code>&lt;folder&gt;_T0: Cluster K</code> (10x clusters are not comparable between runs), and cells start grey.
-    The input is never modified. <a href="/welcome">← open an existing project</a> · <a href="/xenium">import a single run</a></p>
+    grouped by run folder. Tissues are named <code>&lt;folder&gt;_T0</code>, <code>&lt;folder&gt;_T1</code> …; cell types are <code>&lt;folder&gt;_T0: Cluster K</code> (10x clusters are not comparable between runs), and cells start grey, unless you give your own cell labels (step 2, <b>Cell labels</b>).
+    The input is never modified. <a href="/welcome">← start page</a> · <a href="/xenium">import a single run</a></p>
 
   <section id="s1">
     <h2>1 · Folder with the runs</h2>
@@ -16,7 +16,7 @@
   <section id="s2" hidden>
     <h2>2 · Runs</h2>
     <p class="sub" id="runsum"></p>
-    <style>#ttab td{vertical-align:top}</style><table id="ttab"><thead><tr><th>use</th><th>name</th><th>kind</th><th>drawn regions</th><th class="hecol" hidden>H&amp;E scan</th><th class="hecol" hidden>annotations</th></tr></thead><tbody></tbody></table>
+    <style>#ttab td{vertical-align:top}</style><table id="ttab"><thead><tr><th>use</th><th>name</th><th>kind</th><th>drawn regions</th><th class="hecol" hidden>H&amp;E scan</th><th class="hecol" hidden>annotations</th><th class="anncol" hidden>cell labels</th></tr></thead><tbody></tbody></table>
     <div class="row"><button id="galopen" class="primary">Review all slides…</button><span class="sub">thumbnails of every ticked run with its detected tissue boxes; click one to edit it</span></div>
     <details id="tisbox"><summary><b>Tissue boxes from GeoJSON</b> (optional): the <code>&lt;run&gt;_regions.geojson</code> files an earlier import exported</summary>
       <p class="sub">To separate the tissues on each slide the same way as before. Give the folder that holds the files: the output folder of the earlier batch import (each run's file is in the run's folder there) or the folder they were also saved in. Each run's file is found by its name (<code>&lt;run&gt;_regions.geojson</code>, in the folder or one or two levels down). Its tissue boxes become the run's shapes (a shape that was switched off is loaded switched off), and the detected tissues of that run are switched off (switch one on again in the drawing window). Runs without a file keep their detected tissues. These files only tell the tissues apart; they are not anatomical regions within a tissue.</p>
@@ -35,6 +35,26 @@
         merged project&#39;s <b>H&amp;E slide</b> window with a scan selector. They are not aligned to the cells.</p>
       <div class="row"><input id="hepath" placeholder="/path/to/folder with the H&amp;E scans (.czi or .ome.tif / .ome.tiff)"><button id="hefind">Match to runs</button></div>
       <div id="hemsg" class="sub"></div>
+      <div class="grid"><label>Threads per scan</label><input id="hethreads" type="number" min="1" max="256" value="4" style="width:8em"></div>
+      <div class="sub">The scans are tiled after the runs are merged, side by side: scans at once = the cores &divide; this number. More threads make each scan faster (on a test scan: 4 threads 3.2&times; one thread, 8 threads 1.4&times; four), with a little more memory per thread. Raise it when there are fewer scans than that, for example 2 scans on a 32-core job: 16 threads each.</div>
+    </details>
+    <details id="annbox"><summary><b>Cell labels</b> (optional): your own annotation file instead of the 10x clusters</summary>
+      <p class="sub">One table for all runs (<code>.csv</code>, <code>.tsv</code> or <code>.parquet</code>; one row per cell) from your own analysis (Seurat, Scanpy …):
+        the Xenium cell id, a column saying which run (slide) each cell is from, the cell type and, if you have them, the cell state, the donor and any other columns
+        (they become columns of the cell table, for colouring, filters and groups). Xenium cell ids repeat between runs, so with several runs the run column is needed;
+        cell ids with a prefix (<code>sample_aaabbbcc-1</code>, as Seurat and Scanpy write merged cells) are matched by their part after the prefix, and the prefix can stand for the run.
+        Each run is matched to a value of the run column by name or by the numbers in it (as for the H&amp;E scans); check the <b>cell labels</b> column of the table.
+        Runs left at (none) keep their 10x clusters. The labels are applied when the runs are merged (also for runs converted earlier).</p>
+      <div class="row"><input id="annpath" placeholder="/path/to/cell_annotation.csv (.tsv / .parquet)"><button id="annload">Load</button></div>
+      <div id="anncols" class="grid" hidden>
+        <label>cell id column</label><select id="a_id"></select>
+        <label>run column</label><select id="a_run"></select>
+        <label>cell type column</label><select id="a_type"></select>
+        <label>cell state column (optional)</label><select id="a_state"></select>
+        <label>donor column (optional)</label><select id="a_donor"></select>
+      </div>
+      <div class="row" id="annmatchrow" hidden><button id="annmatch">Match to runs</button></div>
+      <div id="annmsg" class="sub"></div>
     </details>
     <details id="hereg"><summary><b>Registered H&amp;E images</b> (optional): one <code>.ome.tif</code> / <code>.ome.tiff</code> per tissue, already in the Xenium frame</summary>
       <p class="sub">Shown under or beside the cells (the <b>Images</b> button) in the merged project. Each image goes to the sample whose name is the image's file name (without <code>_warped_he.ome.tif</code>); the merged samples are called <code>&lt;run&gt;_T0</code>, <code>&lt;run&gt;_T1</code> …, so an <code>index.json</code> that maps image names to those sample ids is usually needed. Images that match nothing are listed in the log. Needs the merge option.</p>
@@ -86,4 +106,5 @@
   </div></div></div>
 <script src="/static/shapeedit.js"></script>
 <script src="/static/batch.js"></script>
+<script src="/static/unlock.js"></script>
 </body></html>

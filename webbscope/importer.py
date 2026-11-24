@@ -7,7 +7,8 @@ Required inputs : either a matrix + features.tsv.gz, barcodes.tsv.gz and the cel
 Optional inputs : project.json               which column is which (roles), the normalisation scale; without it the columns are chosen when opening
                   cell_boundaries.parquet    cell outlines (without it the cells are drawn as dots): one row per outline point (cell_id,
                                              vertex_x, vertex_y, as Xenium writes it) or one row per cell with its outline as GeoParquet (WKB)
-                                             or WKT text in a geometry / shape / geom column (read by read_boundaries)
+                                             or WKT text in a geometry / shape / geom column (read by read_boundaries); an .h5ad
+                                             may instead keep WKT outlines in an obs column (read by boundaries_from_wkt)
                   regions.geojson            pathologist outlines (cell coordinates)  -> Regions, Region neighbourhoods, Glomeruli, region filters
                   embeddings.parquet         UMAP / PCA coordinates                    -> Embeddings
                   gloms/gloms.json + .npz    ROI-level object                          -> ROI heterogeneity (or give a region_heterogeneity .rds when opening: roi_object.py)
@@ -133,7 +134,19 @@ def known_choices(project, h5ad=None, file_only=False):
     file_only: an .h5ad file was given (not its folder), so the folder's project.json is not used."""
     pj = {} if file_only else saved_choices(project, h5ad)
     name = h5ad or pj.get("h5ad")
-    return name, {**pj, **remembered(project, name)}
+    mem = {k: v for k, v in remembered(project, name).items() if k != "file_only"}   # file or folder is decided by what is opened now, not by the last time
+    return name, {**pj, **mem}
+
+
+def _h5ad_outline(h5):
+    """The obs column of the .h5ad with the cells' WKT outlines, or None."""
+    import h5py
+    from . import h5ad
+    try:
+        with h5py.File(h5, "r") as f:
+            return h5ad.outline_columns(f)["cell"]
+    except (OSError, KeyError, ValueError, ImportError_):
+        return None
 
 
 def _fingerprint(project, roi_object=None, cols=None):
@@ -144,6 +157,9 @@ def _fingerprint(project, roi_object=None, cols=None):
     if h5 is not None:
         st = h5.stat()
         fp["h5ad"] = [h5.name, st.st_size, int(st.st_mtime)]
+        wkt = _h5ad_outline(h5)
+        if wkt:
+            fp["h5ad_outlines"] = wkt                                        # a cache made before these were read is redone once
     if roi_object:
         st = Path(roi_object).stat()
         fp["roi_object"] = [str(Path(roi_object).resolve()), st.st_size, int(st.st_mtime)]
@@ -322,12 +338,13 @@ def import_project(project, cdir, log=print, roi_object=None, cols=None):
         raise ImportError_("This folder is not a project: it needs one .h5ad file, or a matrix (counts.mtx or matrix.mtx, and/or counts_logcpx.mtx; also .mtx.gz or .npz) with features.tsv.gz, barcodes.tsv.gz and the cell metadata (cells_metadata.parquet or cells.parquet)")
     only = bool(cols.get("file_only")) and h5 is not None              # an .h5ad file was given: read that file alone, nothing else in its folder
     if only:
-        log(f"the file {h5.name} was given: only it is read (cell outlines and other files in its folder are not; give the folder to use them)")
+        log(f"the file {h5.name} was given: only it is read (the files in its folder are not; give the folder to use them)")
     here = (lambda f: False) if only else (lambda f: (project / f).exists())   # a file of the project folder, when the folder is used
     has_pj = here("project.json")
     man = json.loads((project / "project.json").read_text()) if has_pj else {"name": h5.stem if h5 else project.name, "format_version": 2}
     roles = {**ROLE_DEFAULTS, **man.get("roles", {})}
     emb, C, L, src = {}, None, None, {}           # C = raw counts, L = log-normalised values (genes x cells CSR; either may be absent)
+    wkt, wkt_col = None, None                     # an .h5ad's WKT outlines, in the order of the cell table
 
     if h5 is not None:
         import h5py
@@ -368,6 +385,14 @@ def import_project(project, cdir, log=print, roi_object=None, cols=None):
                         log(f"{ck}: the {len(li):,} genes of {lk} are used (of {len(ci):,})")
                         C = C[pos]
             emb = h5ad.embeddings(f)
+            oc = h5ad.outline_columns(f)
+            if here("cell_boundaries.parquet"):
+                if oc["all"]:
+                    log(f"cell_boundaries.parquet is used; the WKT in obs ({', '.join(oc['all'])}) is not")
+            elif oc["cell"]:
+                wkt_col, wkt = oc["cell"], h5ad.outlines(f, oc["cell"])
+            elif oc["all"]:
+                log(f"obs holds only nucleus outlines ({', '.join(oc['all'])}): the cells are drawn as dots")
         roles["cell_id"] = idcol
         src["h5ad"] = h5.name
     else:
@@ -461,6 +486,7 @@ def import_project(project, cdir, log=print, roi_object=None, cols=None):
         log("cells of one sample were not contiguous; reordering by sample")
         cells = cells.iloc[order].reset_index(drop=True)
         ids = [ids[i] for i in order]
+        wkt = wkt[order] if wkt is not None else None
         C = C[:, order] if C is not None else None
         L = L[:, order] if L is not None else None
         emb = {k: (n, a[order]) for k, (n, a) in emb.items()}
@@ -480,6 +506,10 @@ def import_project(project, cdir, log=print, roi_object=None, cols=None):
     if here("cell_boundaries.parquet"):
         log("reading cell boundaries")
         xy, cnt, binfo = read_boundaries(project / "cell_boundaries.parquet", ids, roles["cell_id"], log)
+        off = np.r_[0, np.cumsum(cnt)].astype(np.int64)
+    elif wkt is not None:
+        log(f"reading cell outlines from the obs column {wkt_col}")
+        xy, cnt, binfo = boundaries_from_wkt(wkt, ids, wkt_col, log)
         off = np.r_[0, np.cumsum(cnt)].astype(np.int64)
     elif not only:
         log("no cell_boundaries.parquet: the cells are drawn as dots")
@@ -705,6 +735,16 @@ def read_boundaries(path, ids, id_role=None, log=print):
     if dup:
         raise ImportError_(f"cell_boundaries.parquet: {dup:,} cells have more than one row")
     geoms, pos = geoms[known], pos[known]
+    xy, cnt, st = _outline_points(geoms, pos, n)
+    info = {"format": f"one row per cell, {kind}", "id_column": best, "geometry_column": gcol, "rows_for_unknown_cells": int((~known).sum()), **st}
+    log(f"cell boundaries: {kind}, cell ids from {best}" + _outline_notes(st))
+    return xy, cnt, info
+
+
+def _outline_points(geoms, pos, n):
+    """Shapely geometries of the cells at positions pos -> (xy float32 ordered by cell, vertices per cell, counts of what was simplified or left out).
+    One outline per cell: of a multipolygon the largest part; holes are left out; points, lines and empty geometries give none."""
+    import shapely
     tid = shapely.get_type_id(geoms)                          # 3 polygon, 6 multipolygon, -1 missing
     empty = shapely.is_missing(geoms) | shapely.is_empty(geoms)
     multi = (tid == 6) & ~empty
@@ -720,12 +760,30 @@ def read_boundaries(path, ids, id_role=None, log=print):
     coords, which = shapely.get_coordinates(shapely.get_exterior_ring(polys), return_index=True)
     cellof = ppos[which]
     o = np.argsort(cellof, kind="stable")
-    xy = coords[o].astype(np.float32)
-    info = {"format": f"one row per cell, {kind}", "id_column": best, "geometry_column": gcol, "rows_for_unknown_cells": int((~known).sum()),
-            "empty": int(empty.sum()), "multipolygons_largest_part_used": int(multi.sum()), "with_holes_left_out": holes, "not_polygons": int(other.sum())}
-    notes = [f"{v:,} {k.replace('_', ' ')}" for k, v in info.items() if k in ("empty", "multipolygons_largest_part_used", "with_holes_left_out", "not_polygons") and v]
-    log(f"cell boundaries: {kind}, cell ids from {best}" + (f" ({'; '.join(notes)})" if notes else ""))
-    return xy, np.bincount(cellof, minlength=n), info
+    return coords[o].astype(np.float32), np.bincount(cellof, minlength=n), {"empty": int(empty.sum()), "multipolygons_largest_part_used": int(multi.sum()),
+                                                                             "with_holes_left_out": holes, "not_polygons": int(other.sum())}
+
+
+def _outline_notes(st):
+    notes = [f"{v:,} {k.replace('_', ' ')}" for k, v in st.items() if v]
+    return f" ({'; '.join(notes)})" if notes else ""
+
+
+def boundaries_from_wkt(text, ids, column, log=print):
+    """WKT outlines of an .h5ad's obs column, one entry per cell in the order of ids -> (xy, vertices per cell, a summary dict), as read_boundaries."""
+    import shapely
+    from .h5ad import NO_TEXT
+    n = len(ids)
+    present = np.array([isinstance(t, str) and t.strip().lower() not in NO_TEXT for t in text], bool)
+    geoms = np.full(n, None, dtype=object)
+    geoms[present] = shapely.from_wkt(text[present].astype(object), on_invalid="ignore")
+    bad = present & shapely.is_missing(geoms)
+    if bad.any():
+        i = int(np.flatnonzero(bad)[0])
+        raise ImportError_(f"the obs column {column}: {int(bad.sum()):,} outline(s) could not be read as WKT (first: cell {ids[i]}: {str(text[i])[:60]!r})")
+    xy, cnt, st = _outline_points(geoms, np.arange(n), n)
+    log(f"cell boundaries: WKT text in obs column {column}" + _outline_notes(st))
+    return xy, cnt, {"format": "one row per cell, WKT text in the .h5ad", "geometry_column": column, **st}
 
 
 def _read_matrix_file(path, genes, ids, log):

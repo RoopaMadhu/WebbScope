@@ -51,7 +51,7 @@ async function loaded() {
     + `; ${fmt(i.zero_count_cells)} cells have no transcripts.` + (i.has_transcripts ? " Transcripts will be included." : " Transcripts are not included.");
   $("#lab10x").textContent = i.has_clusters ? `10x graph clusters (${i.n_clusters} clusters)` : "none found in this output (all cells get one label)";
   $("#pname").value = i.name; $("#outdir").value = i.default_output;
-  $("#herow").hidden = !i.he;
+  $("#herow").hidden = !i.he; $("#hethrow").hidden = !i.he;
   if (i.he) { const c = i.he.czi, a = i.he.annotations; $("#hetxt").textContent = `Include the H&E (${c.file}: ${c.scenes.length} scene(s), ${c.px_um.toFixed(3)} µm/pixel` + (a ? `; ${a.n_regions} annotation polygons in ${a.names.filter((n) => n.n_regions).length} annotation names` : "") + "); building the tiles takes about a minute and about 0.5 GB"; }
   for (const s of ["#s2", "#s3", "#s4"]) $(s).hidden = false;
   X.sel = null; X.pending = null;
@@ -149,11 +149,15 @@ $("#cutoff").addEventListener("change", () => { X.spec.cut_off = $("#cutoff").ch
 async function tisExport(overwrite) {
   const msg = $("#tisoutmsg"), folder = $("#tisout").value.trim(); $("#tisover").hidden = true;
   if (!folder) { msg.textContent = "Choose a folder for the file."; return; }
-  const r = await post("/api/xenium/tissues/export", { spec: X.spec, folder, name: $("#pname").value.trim() || "slide", name_col: $("#regcol").value.trim() || "sample_id_unblinded", overwrite });
+  if (!X.prev || !X.prev.tissue_polys_raw) { msg.textContent = "No tissue boxes yet: read the run first."; return; }
+  const name = $("#pname").value.trim() || "slide";     // from the outlines this page holds, as on the batch page: works even if the server has lost the run
+  const r = await post("/api/xenium/batch/tissues/export", { runs: [{ name, shapes: X.spec.rects, tissues: X.prev.tissue_polys_raw }], folder, cut_off: $("#cutoff").checked, name_col: $("#regcol").value.trim() || "sample_id_unblinded", overwrite });
   let d = null; try { d = JSON.parse(await r.text()); } catch (e) { /* not JSON */ }
   if (r.status === 409) { msg.textContent = (d && d.detail) + ". Overwrite it?"; $("#tisover").hidden = false; return; }
   if (!r.ok) { msg.textContent = (d && d.detail) || "export failed"; return; }
-  msg.textContent = "Written: " + d.written.join(", ");
+  if (d.errors[name]) { msg.textContent = d.errors[name]; return; }
+  const ov = d.overlaps[name] || [], em = d.empty[name] || [];
+  msg.textContent = "Written: " + d.written.join(", ") + (ov.length ? `. Overlapping geometries found (written as they are): ${ov.map((q) => q.join(" & ")).join(", ")}` : "") + (em.length ? `. Left out because nothing of them remained after the cut: ${em.join(", ")}` : "");
 }
 $("#tisexport").onclick = () => tisExport(false); $("#tisover").onclick = () => tisExport(true);
 function txUi() { document.querySelectorAll(".txonly").forEach((e) => (e.hidden = X.spec.detect !== "transcripts")); if (X.spec.detect !== "transcripts") $("#txnote").textContent = ""; }
@@ -259,7 +263,7 @@ $("#go").onclick = async () => {
   }
   if (!Object.keys(X.prev.counts).length) { $("#err2").textContent = "No tissue is switched on."; return; }
   $("#go").disabled = true; $("#log2").textContent = "";
-  const r = await post("/api/xenium/convert", { spec: X.spec, output: $("#outdir").value.trim(), name: $("#pname").value.trim(), annotation: ann || {}, transcripts: !!(X.info.has_transcripts && $("#wanttx").checked), he: !!(X.info.he && $("#wanthe").checked),
+  const r = await post("/api/xenium/convert", { spec: X.spec, output: $("#outdir").value.trim(), name: $("#pname").value.trim(), annotation: ann || {}, transcripts: !!(X.info.has_transcripts && $("#wanttx").checked), he: !!(X.info.he && $("#wanthe").checked), he_threads: Math.max(1, Math.round(+$("#hethreads").value || 4)),
     he_reg_folder: $("#f_hereg").value.trim(), he_reg_index: $("#f_heregidx").value.trim(), imc_file: $("#f_imc").value.trim(), export_regions: $("#wantreg").checked, regions_name_col: $("#regcol").value.trim() || "sample_id_unblinded", regions_dir: $("#regdir").value.trim() });
   if (!r.ok) { $("#err2").textContent = (JSON.parse(await r.text()).detail) || "failed"; $("#go").disabled = false; return; }
   pollConv();

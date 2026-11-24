@@ -3,7 +3,7 @@
 <link rel="stylesheet" href="/static/welcome.css"><link rel="stylesheet" href="/static/xenium.css"></head><body>
 <div id="xbox">
   <h1>Import Xenium output</h1>
-  <p class="sub">Turns a Xenium output bundle into a WebbScope project. Only the counts, cell table, cell boundaries and the 10x analysis files are read, plus the transcripts and an H&amp;E scan if you ask for them; the Xenium images are never touched. <a href="/welcome">← open an existing project</a></p>
+  <p class="sub">Turns a Xenium output bundle into a WebbScope project. Only the counts, cell table, cell boundaries and the 10x analysis files are read, plus the transcripts and an H&amp;E scan if you ask for them; the Xenium images are never touched. <a href="/welcome">← start page</a></p>
 
   <section id="s1">
     <h2>1 · Xenium output</h2>
@@ -64,7 +64,7 @@
         <div class="sub" id="tismsg">Load the tissue boxes of a GeoJSON that an earlier import exported (<code>…_regions.geojson</code>), to separate the tissues on the slide the same way again: its tissue boxes replace the shapes drawn here and the detected tissues are switched off (tick one to use it again). This only tells the tissues apart; it is not an anatomical-regions file.</div>
         <label class="rad"><input type="checkbox" id="cutoff" checked> Cut the switched-off shapes (drawn with “use” unticked) out of the tissue boxes, as shown here and exported; the shapes themselves stay in the exported file, switched off</label>
         <div class="row"><input id="tisout" data-pick="dir" placeholder="/path/to/folder for &lt;project name&gt;_regions.geojson"><button id="tisexport">Export tissue boxes</button><button id="tisover" hidden>Overwrite</button></div>
-        <div class="sub" id="tisoutmsg">Writes the tissue boxes as they are now (including edits to loaded ones) without converting the data, named after the project name in step 4.</div>
+        <div class="sub" id="tisoutmsg">Writes the tissue boxes as they are now (including edits to loaded ones), named after the project name in step 4, from their outlines alone: no cells are read, so it also works after a job died and restarted (press <b>Job died? Unlock buttons</b> if needed). Each feature holds the outline, the tissue name and the slide; a switched-off shape is written too, marked <code>keep: false</code>.</div>
         <div id="tsum"></div><div id="selbar"></div>
       </div>
     </div>
@@ -88,6 +88,7 @@
     <h2>4 · Create the project</h2>
     <div class="grid"><label>Project name</label><input id="pname"><label>Output folder (new or empty; the input is never modified)</label><input id="outdir"></div>
     <label class="rad" id="herow" hidden><input type="checkbox" id="wanthe" checked> <span id="hetxt"></span></label>
+    <div class="grid" id="hethrow" hidden><label title="More threads make each scan faster (on a test scan: 4 threads 3.2× one thread, 8 threads 1.4× four), with a little more memory per thread. Use up to the cores of this job.">H&amp;E threads</label><input id="hethreads" type="number" min="1" max="256" value="4" style="width:8em"></div>
     <label class="rad"><input type="checkbox" id="wantreg"> Export the drawn regions and tissue bounding boxes as <code>&lt;project name&gt;_regions.geojson</code> in the project folder (Xenium µm coordinates). A rectangle is exported as its box and a free-hand region as the outline you traced, not a convex hull.</label>
     <div class="grid"><label>Name of the column that holds each box's name in that file</label><input id="regcol" value="sample_id_unblinded">
       <label>Also save a copy in this folder (optional)</label><input id="regdir" data-pick="dir" placeholder="/path/to/folder (created if needed); empty = only the project folder"></div>
@@ -97,4 +98,5 @@
 </div>
 <script src="/static/shapeedit.js"></script>
 <script src="/static/xenium.js"></script>
+<script src="/static/unlock.js"></script>
 </body></html>

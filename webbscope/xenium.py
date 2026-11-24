@@ -21,6 +21,33 @@ from scipy.io import mmread, mmwrite
 from . import importer, if_image
 
 MARKER = ".webbscope_xenium_import.json"
+STOPPED = ("If it is a WebbScope import that was stopped half-way by an earlier version (one that did not mark its folders until the end), "
+           "delete that folder or choose another.")
+
+
+def claim_folder(out, marker=MARKER, label="WebbScope import"):
+    """Empty `out` (when it holds an earlier import of this kind) and mark it as WebbScope's before anything is written, so that a job stopped
+    half-way leaves a folder the next import may replace. The marker says "incomplete" until the import rewrites it with its details at the end.
+    Refuses a folder that is not empty and has no marker. The marker is set to "incomplete" before anything is deleted and is never deleted itself,
+    so a job stopped while emptying leaves a folder that is known to be unfinished."""
+    out = Path(out).expanduser()
+    if out.exists() and not (out / marker).exists() and any(out.iterdir()):
+        raise importer.ImportError_(f"{out} exists and is not an earlier {label}; choose a new or empty folder. {STOPPED}")
+    out.mkdir(parents=True, exist_ok=True)
+    (out / marker).write_text(json.dumps({"incomplete": True, "started": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    for f in out.iterdir():
+        if f.name != marker:
+            shutil.rmtree(f) if f.is_dir() and not f.is_symlink() else f.unlink()
+    return out
+
+
+def finished(folder, marker=MARKER):
+    """True when `folder` holds an import of this kind that ran to the end."""
+    f = Path(folder) / marker
+    try:
+        return f.is_file() and not json.loads(f.read_text()).get("incomplete")
+    except (OSError, ValueError, AttributeError):
+        return False
 IF_KEY = "run"                                  # name of the IF image in a single run's if.json
 CTRL_KEYS = {"Negative Control Probe": "nc_probe", "Negative Control Codeword": "nc_codeword", "Unassigned Codeword": "unassigned_codeword", "Deprecated Codeword": "deprecated_codeword"}
 BIN_UM = 50.0                                   # density grid for tissue detection from cells
@@ -690,10 +717,14 @@ class Light(Session):
 
 
 def _read_annotation(p):
-    n = p.name
-    if n.endswith(".parquet"):
+    """A cell table: .parquet, or text (.csv / .tsv / .txt, also .gz) with commas or tabs (the separator is taken from the first line)."""
+    p = Path(p)
+    if p.name.endswith(".parquet"):
         return pd.read_parquet(p)
-    return pd.read_csv(p, sep=None, engine="python")           # comma or tab
+    import gzip
+    with (gzip.open(p, "rt") if p.name.endswith(".gz") else open(p, encoding="utf-8", errors="replace")) as f:
+        first = f.readline()
+    return pd.read_csv(p, sep="\t" if first.count("\t") > first.count(",") else ",", low_memory=False)
 
 
 NEG_CATS = ["genomic_control_probe", "deprecated_codeword", "negative_control_probe", "negative_control_codeword", "unassigned_codeword"]   # codeword_category values that are negative controls (predesigned_gene / custom_gene are the positive probes)
@@ -1238,21 +1269,6 @@ def write_regions(sess, spec, order, idx, out, log, name_col="sample_id_unblinde
     return len(feats)
 
 
-def export_tissue_boxes(sess, spec, folder, slide, name_col="sample_id_unblinded", overwrite=False):
-    """Write <slide>_regions.geojson (tissue boxes and drawn shapes, as write_regions) into `folder` now, without converting the run. Refuses to replace
-    an existing file unless `overwrite`. Returns the path written."""
-    d = Path(folder).expanduser()
-    f = d / regions_filename(slide)
-    if f.exists() and not overwrite:
-        raise FileExistsError(str(f))
-    d.mkdir(parents=True, exist_ok=True)
-    order, idx, _, _ = sess.labels(spec)
-    if not len(order):
-        raise importer.ImportError_(f"{slide}: no tissue is switched on")
-    write_regions(sess, spec, order, idx, d, lambda m: None, name_col, slide)
-    return str(f)
-
-
 def _polygonal(g):
     """Only the polygon parts of a geometry (a cut or make_valid can leave lines or points behind)."""
     from shapely.geometry import Polygon
@@ -1311,13 +1327,7 @@ def write_tissue_geometry(folder, slide, shapes, tissues=None, cut_off=True, nam
 
 def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None, tx_table=None, threads=1, export_regions=False, regions_name_col="sample_id_unblinded", regions_dir=None):
     """Write the project folder `out`; returns a short report. Refuses to touch a folder that is not a previous import of this kind."""
-    out = Path(out).expanduser()
-    if out.exists():
-        if not (out / MARKER).exists() and any(out.iterdir()):
-            raise importer.ImportError_(f"{out} exists and is not an earlier WebbScope Xenium import; choose a new or empty folder")
-        for f in out.iterdir():
-            shutil.rmtree(f) if f.is_dir() else f.unlink()
-    out.mkdir(parents=True, exist_ok=True)
+    out = claim_folder(out, MARKER, "WebbScope Xenium import")
     order, idx, comps, counts = sess.labels(spec)
     kept = np.flatnonzero(idx >= 0)
     if not len(kept):
@@ -1391,7 +1401,7 @@ def convert(sess, spec, out, project_name, ann, log, transcripts=False, he=None,
         n_tx, n_tab = write_transcripts(sess, order, idx, ids, sess.src["tx"], out, log, store=transcripts, table_prefix=tx_table, threads=threads)
     if he:
         from . import he_slide
-        he_slide.build(he["czi"], out, he.get("annotations"), log)
+        he_slide.build(he["czi"], out, he.get("annotations"), log, workers=int(he.get("threads") or 4))
     n_if = None
     ifps = if_image.pick_all(sess.src)
     if ifps:

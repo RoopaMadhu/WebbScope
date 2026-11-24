@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import numpy as np, pandas as pd
 from .config import load_mapping, CATEGORICAL_ROLES, REGION_ROLES
+from .groups import Groups
 
 MISSING = 65535
 SEP = " › "  # region path separator
@@ -86,6 +87,7 @@ class Store:
         self.map = load_mapping(self.df.columns, config_path)
         self.cache_dir = c
         self._build()
+        self.groups = Groups(self)
 
     # -- metadata -----------------------------------------------------------------
     def _build(self):
@@ -158,6 +160,16 @@ class Store:
             return str(d)
         return re.sub(r"_fragment[-_]?\d+$", "", str(sample))
 
+    @staticmethod
+    def _run(row):
+        """The run a tissue came from in imported Xenium projects (the run column; projects merged before it existed hold the run name in disease_subtype /
+        disease_type); tissues of one run share a slide."""
+        for c in ("run", "disease_subtype", "disease_type"):
+            v = str(row.get(c, ""))
+            if v not in ("", "nan", "None"):
+                return v
+        return ""
+
     def describe(self):
         m = self.map
         samples = []
@@ -166,8 +178,8 @@ class Store:
             row = self.df.iloc[a]
             samples.append({"id": s, "n": b - a, "x": [float(self.x[a:b].min()), float(self.x[a:b].max())],
                             "y": [float(self.y[a:b].min()), float(self.y[a:b].max())],
-                            "disease_type": str(row.get("disease_type", "")),
-                            "disease_subtype": str(row.get("disease_subtype", "")),
+                            "group": self.groups.of(s) if self.groups.column else "",
+                            "run": self._run(row),
                             "has_paths": s in self.paths, "offset": int(a),
                             "sample_type": str(row.get("sample_type", "")),
                             "donor": self.donor[s]})
@@ -180,7 +192,7 @@ class Store:
             if k == "cell_state" and self.state_parent:
                 cats[k].update(self.state_parent)
         return {"mapping": m, "n_cells": self.n, "n_genes": len(self.genes), "samples": samples,
-                "cats": cats, "numeric": {k: v for k, v in self.numeric.items()},
+                "groups": self.groups.describe(), "cats": cats, "numeric": {k: v for k, v in self.numeric.items()},
                 "matrix": self.meta, "norm_scale": self.norm_scale, "values": self.values, "has_counts": self.has_counts, "ln_given": self.ln_given, "has_polygons": self.poly_off is not None, "umaps": list(self.umap), "n_pcs": int(self.pca.shape[1]) if self.pca is not None else 0, "coordinate_unit": "µm (assumed: area equals area_um in source)"}
 
     def validation(self):

@@ -16,8 +16,9 @@ from .engine.smooth import Smoother, SCOPES, MAX_SIGMA
 from .engine.signature_defs import EXCLUDED_GENES, HIDDEN_CURATED
 from .engine.neighbors import Neighbors
 from .engine import sigstats, violin
+from .engine.genesets import MIN_GENES
 from .engine.glomhet import GlomHet
-from . import importer, xenium, batch, qc
+from . import access, importer, xenium, batch, qc, merge
 from .profiler import PROF
 import time
 from .transcripts import Transcripts
@@ -26,6 +27,8 @@ from pydantic import BaseModel
 
 WEB = Path(__file__).resolve().parent / "web"
 app = FastAPI(title="WebbScope")
+from . import agent                                            # Claude's access (MCP connector) and the user's sharing controls
+app.include_router(agent.router)
 app.add_middleware(GZipMiddleware, minimum_size=2000)
 S: Store = None
 HE_EXTRA = None         # folder holding registered H&E tiles (he/<key>/…, he/index.json) added when a project was opened, in the cache; else None
@@ -39,6 +42,7 @@ _gene_cache: dict = {}
 TX: Transcripts = None    # transcript overlay data of the open project, if it has any
 DEFAULT_GREY = False   # project.json "default_grey": start with the Grey cells display on (merged batch projects: the cell types are per tissue)
 EMB_LABEL = None       # set when the project's embeddings are not Harmony-corrected (Xenium import)
+EMB_PER_RUN = False    # each run has its own UMAP (batch import of Xenium runs): shown one run at a time
 
 
 def raw(arr):
@@ -95,16 +99,19 @@ def sl(sample):
 
 @app.middleware("http")
 async def no_stale_ui(request, call_next):
-    """Make browsers revalidate the UI files so a restart always serves the latest JS/CSS/HTML."""
+    """Only requests with the access token go on (access.py). Make browsers revalidate the UI files so a restart always serves the latest JS/CSS/HTML."""
+    denied = access.gate(request)
+    if denied is not None:
+        return denied
     p = request.url.path
-    if S is None and p.startswith("/api/") and p not in ("/api/status", "/api/open", "/api/pick", "/api/columns") and not p.startswith("/api/xenium/") and not p.startswith("/api/profile"):
+    if S is None and p.startswith("/api/") and p not in ("/api/status", "/api/open", "/api/pick", "/api/columns", "/api/recent", "/api/agent/status", "/api/viewer/commands") and not p.startswith("/api/xenium/") and not p.startswith("/api/merge") and not p.startswith("/api/profile"):
         return Response("no project is open", status_code=409)
     t0 = time.perf_counter()
     r = await call_next(request)
     if p.startswith("/api/") and not p.startswith("/api/profile") and p != "/api/status":       # not the profile page's own polling
         route = request.scope.get("route")
         PROF.request(route.path if route is not None else p, time.perf_counter() - t0, int(r.headers.get("content-length") or 0))
-    if p in ("/", "/welcome") or p.startswith("/static/"):
+    if p in ("/", "/welcome", "/open", "/merge") or p.startswith("/static/"):
         r.headers["Cache-Control"] = "no-cache"
     return r
 
@@ -114,12 +121,17 @@ def meta():
     d = S.describe()
     if EMB_LABEL:
         d["embedding_label"] = EMB_LABEL
+    d["embedding_per_run"] = EMB_PER_RUN
     d["default_grey"] = bool(DEFAULT_GREY)
+    d["agent_level"] = agent.level()
     d["has_gloms"] = (Path(S.cache_dir) / "gloms" / "gloms.json").exists()
     d["has_transcripts"] = TX is not None
     d["has_he_slide"] = (PROJ / "he_slide.json").exists()
     d["has_if"] = bool(IFX and IFX["samples"])
+    d["if_missing"] = d["has_if"] and not any(if_image.sample_list(IFX, x) for x in IFX["samples"])     # the project has an IF image but its file has moved
     d["has_imc"] = bool(IMX)
+    d["has_scffpe"] = S.scffpe is not None
+    d["has_signatures"] = bool(_shown_signatures()) or any(S.genesets.listing()["collections"].values())
     if TX is not None:                                           # transcripts in the whole run (= slide) each tissue came from: the rows of its transcripts.parquet
         for smp in d["samples"]:
             try:
@@ -129,6 +141,24 @@ def meta():
             except Exception:
                 smp["tx_slide_total"] = smp["tx_tissue_total"] = None
     return d
+
+
+class GroupsReq(BaseModel):
+    column: str | None = None               # None = no grouping
+    reference: str | None = None            # "auto" = suggest from the group names
+    order: list[str] | None = None
+    ordered: bool = False
+
+
+@app.post("/api/groups", response_class=ORJSONResponse)
+def set_groups(r: GroupsReq):
+    """Choose the column that groups the donors, the reference group and the order of the groups (engine/groups.py)."""
+    try:
+        S.groups.set(r.column, r.reference, r.order, r.ordered)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _sig_cache.clear(); _mask_cache.clear(); NB.cache.clear()      # z-scores and tests depend on the groups
+    return {"groups": S.groups.describe(), "samples": {s: S.groups.of(s) if S.groups.column else "" for s in S.samples}}
 
 
 @app.get("/api/validation", response_class=ORJSONResponse)
@@ -214,9 +244,13 @@ def _genes_of(sig_id, genes):
 def signatures():
     """What the signature pickers offer: the shown curated signatures in full (genes on the panel, genes missing, coherence checks; the curated
     lists under review are left out, see signature_defs.HIDDEN_CURATED), and the GO / Reactome gene sets with at least genesets.MIN_GENES genes
-    on the panel as [id, name, n genes] (the full record of one comes from /api/signature/{id}); + the subtype order used by the analyses."""
-    shown = [x for x in S.signatures["signatures"] if x["id"] not in HIDDEN_CURATED]
-    return {**S.signatures, "signatures": shown, "genesets": S.genesets.listing(), "subtype_order": sigstats.SUBTYPE_ORDER}
+    on the panel as [id, name, n genes] (the full record of one comes from /api/signature/{id}). A curated list with fewer genes on the panel than
+    that is left out too."""
+    return {**S.signatures, "signatures": _shown_signatures(), "genesets": S.genesets.listing()}
+
+
+def _shown_signatures():
+    return [x for x in S.signatures["signatures"] if x["id"] not in HIDDEN_CURATED and len(x["genes"]) >= MIN_GENES]
 
 
 @app.get("/api/signature/{sid}", response_class=ORJSONResponse)
@@ -232,8 +266,7 @@ class SigSummaryReq(BaseModel):
     sig: str | None = None
     genes: list[str] | None = None
     sigma: float = 25.0
-    scope: str = "all"                      # z-scoring: none | sample | subtype | type | all (pooled over the samples of that group)
-    group_by: str = "subtype"               # subtype (5 groups) | type (Control / No LN / LN)
+    scope: str = "all"                      # z-scoring: none | sample | group | all | notref (see smooth.py)
     filters: dict[str, list[int]] = {}
     hidden: dict[str, list[int]] = {}
     expr: list[ExprReq] = []
@@ -241,14 +274,14 @@ class SigSummaryReq(BaseModel):
 
 @app.post("/api/signature/summary", response_class=ORJSONResponse)
 def signature_summary(req: SigSummaryReq):
-    """Per-sample and per-disease-subtype statistics of a (smoothed) signature over the cells passing `filters`, with across-subtype tests."""
+    """Per-donor and per-group statistics of a (smoothed) signature over the cells passing `filters`, with across-group tests."""
     genes = _genes_of(req.sig, req.genes)
-    if req.scope not in SCOPES or req.group_by not in ("subtype", "type") or not 0 <= req.sigma <= MAX_SIGMA:
-        raise HTTPException(400, "bad scope, group_by or sigma")
+    if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
+        raise HTTPException(400, "bad scope or sigma")
     ex = _expr(req.expr)
-    key = ("sum", tuple(genes), req.sigma, req.scope, req.group_by, repr(sorted((k, sorted(v)) for k, v in req.filters.items())), repr(sorted((k, sorted(v)) for k, v in req.hidden.items())), repr(ex))
+    key = ("sum", tuple(genes), req.sigma, req.scope, repr(sorted((k, sorted(v)) for k, v in req.filters.items())), repr(sorted((k, sorted(v)) for k, v in req.hidden.items())), repr(ex))
     if key not in _sig_cache:
-        _sig_cache[key] = sigstats.summary(S, SM, NB, genes, req.sigma, req.scope, req.filters, req.hidden, group_by=req.group_by, expr=ex)
+        _sig_cache[key] = sigstats.summary(S, SM, NB, genes, req.sigma, req.scope, req.filters, req.hidden, expr=ex)
         _sig_cache[key]["sig"] = req.sig
     return _sig_cache[key]
 
@@ -258,7 +291,7 @@ class SigLocReq(BaseModel):
     b: str = "ifn2"
     sigma: float = 25.0
     q: float = 0.10
-    subtype: str | None = None
+    group: str | None = None
 
 
 @app.post("/api/signature/localization", response_class=ORJSONResponse)
@@ -267,9 +300,9 @@ def signature_localization(req: SigLocReq):
     ga, gb = _genes_of(req.a, None), _genes_of(req.b, None)
     if not 0 <= req.sigma <= MAX_SIGMA or not 0.01 <= req.q <= 0.5:
         raise HTTPException(400, "bad sigma or q")
-    key = ("loc", req.a, req.b, req.sigma, req.q, req.subtype)
+    key = ("loc", req.a, req.b, req.sigma, req.q, req.group)
     if key not in _sig_cache:
-        _sig_cache[key] = sigstats.localization(S, SM, ga, gb, req.sigma, req.q, req.subtype)
+        _sig_cache[key] = sigstats.localization(S, SM, ga, gb, req.sigma, req.q, req.group)
         _sig_cache[key].update(a_id=req.a, b_id=req.b)
     return _sig_cache[key]
 
@@ -286,20 +319,20 @@ class ViolinReq(BaseModel):
     scope: str = "none"
     nonzero_only: bool = False
     layer: str = "logcpx"                   # logcpx | counts (same as the main viewer)
-    unit: str = "sample"                    # sample | subtype | type: one violin per sample, or cells pooled per disease subtype / type
+    unit: str = "sample"                    # sample | group: one violin per donor, or one bar per group
     level: str = "cell_type"                # cell_type | cell_state (one panel per cell type, one group per cell state of it)
 
 
 @app.post("/api/violin", response_class=ORJSONResponse)
 def violin_api(req: ViolinReq):
     """Per-sample score distributions (one violin per sample) for each selected gene / signature and cell type."""
-    if not req.features or len(req.features) > 8 or not req.cell_types or len(req.cell_types) > 12:
-        raise HTTPException(400, "choose 1-8 features and 1-12 cell types")
+    if not req.features or len(req.features) > 8 or not req.cell_types or len(req.cell_types) > 60:
+        raise HTTPException(400, "choose 1-8 features and 1-60 cell types")
     if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
         raise HTTPException(400, "bad scope or sigma")
     _layer(req.layer)
-    if req.unit not in ("sample", "subtype", "type"):
-        raise HTTPException(400, "unit must be sample, subtype or type")
+    if req.unit not in ("sample", "group"):
+        raise HTTPException(400, "unit must be sample or group")
     if req.level not in ("cell_type", "cell_state"):
         raise HTTPException(400, "level must be cell_type or cell_state")
     nct = len(S.cats["cell_type"]["levels"])
@@ -317,7 +350,7 @@ def violin_api(req: ViolinReq):
     if key not in _sig_cache:
         try:
             _sig_cache[key] = {"panels": violin.violins(S, SM, feats, req.cell_types, req.sigma, req.scope, layer=req.layer, nonzero_only=req.nonzero_only, level=req.level, unit=req.unit),
-                               "samples": [{"id": d, "subtype": sigstats.subtype_of(SM, smp[0]), "disease_type": SM.info[smp[0]]["disease_type"]} for d, smp in sigstats.donors_of(S).items()]}
+                               "samples": [{"id": d, "group": S.groups.of(smp[0])} for d, smp in sigstats.donors_of(S).items()]}
         except ValueError as e:
             raise HTTPException(400, str(e))
     return _sig_cache[key]
@@ -326,19 +359,50 @@ def violin_api(req: ViolinReq):
 @app.post("/api/violin/hist", response_class=ORJSONResponse)
 def violin_hist(req: ViolinReq):
     """Histograms of the per-cell values behind the violins (all donors pooled), so the plotted scale can be checked."""
-    if not req.features or len(req.features) > 8 or not req.cell_types or len(req.cell_types) > 12:
-        raise HTTPException(400, "choose 1-8 features and 1-12 cell types")
+    if not req.features or len(req.features) > 8 or not req.cell_types or len(req.cell_types) > 60:
+        raise HTTPException(400, "choose 1-8 features and 1-60 cell types")
     _layer(req.layer)
     if req.scope not in SCOPES or not 0 <= req.sigma <= MAX_SIGMA:
         raise HTTPException(400, "bad scope or sigma")
     nct = len(S.cats["cell_type"]["levels"])
-    if any(c < -1 or c >= nct for c in req.cell_types) or req.unit not in ("sample", "subtype", "type"):
+    if any(c < -1 or c >= nct for c in req.cell_types) or req.unit not in ("sample", "group"):
         raise HTTPException(400, "unknown cell type or unit")
     feats = [{"label": (S.sig(f.sig) or {}).get("name", f.sig), "genes": _genes_of(f.sig, None)} if f.sig else {"label": f.gene, "genes": _genes_of(None, [f.gene])}
              for f in req.features if f.sig or f.gene]
     key = ("viohist", tuple((x["label"], tuple(x["genes"])) for x in feats), tuple(req.cell_types), req.sigma, req.scope, req.nonzero_only, req.layer, req.unit)
     if key not in _sig_cache:
         _sig_cache[key] = {"panels": violin.histograms(S, SM, feats, req.cell_types, req.sigma, req.scope, layer=req.layer, nonzero_only=req.nonzero_only, unit=req.unit), "norm_scale": S.norm_scale}
+    return _sig_cache[key]
+
+
+class DotReq(BaseModel):
+    features: list[ViolinFeature]
+    cell_types: list[int] = [0]             # cell_type level ids; -1 = all cells
+    layer: str = "logcpx"
+    nonzero_only: bool = False              # colour = the mean over the expressing cells only
+    level: str = "cell_type"                # cell_type | cell_state (columns)
+    by: str = "all"                         # all | donor | group: one plot for all donors, per donor, or per group
+
+
+@app.post("/api/dotplot", response_class=ORJSONResponse)
+def dot_plot(req: DotReq):
+    """Share of expressing cells and mean expression of each gene / signature in each cell type or state (see violin.dotplot)."""
+    if not req.features or len(req.features) > 60 or not req.cell_types or len(req.cell_types) > 60:
+        raise HTTPException(400, "choose 1-60 genes / signatures and 1-60 cell types")
+    _layer(req.layer)
+    if req.level not in ("cell_type", "cell_state") or req.by not in ("all", "donor", "group"):
+        raise HTTPException(400, "bad level or by")
+    nct = len(S.cats["cell_type"]["levels"])
+    if any(c < -1 or c >= nct for c in req.cell_types):
+        raise HTTPException(400, "unknown cell type")
+    feats = [{"label": (S.sig(f.sig) or {}).get("name", f.sig), "genes": _genes_of(f.sig, None)} if f.sig else {"label": f.gene, "genes": _genes_of(None, [f.gene])}
+             for f in req.features if f.sig or f.gene]
+    key = ("dot", tuple((x["label"], tuple(x["genes"])) for x in feats), tuple(req.cell_types), req.layer, req.nonzero_only, req.level, req.by)
+    if key not in _sig_cache:
+        try:
+            _sig_cache[key] = violin.dotplot(S, SM, feats, req.cell_types, req.layer, req.nonzero_only, req.level, req.by)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     return _sig_cache[key]
 
 
@@ -533,13 +597,14 @@ class NeighborReq(BaseModel):
     filters: dict[str, list[int]] = {}     # field -> allowed level ids (AND across fields)
     hidden: dict[str, list[int]] = {}      # field -> level ids to exclude
     expr: list[ExprReq] = []               # gene / signature filters (AND with the above)
+    cells: dict[str, list[int]] = {}       # {sample: cell positions}: when given, only these cells (the ones clicked or box-selected) can be index cells
 
 
 @app.post("/api/neighbors", response_class=ORJSONResponse)
 def neighbors(req: NeighborReq):
     """Neighbour composition of the cells passing `filters`, per sample (see neighbors.py)."""
     try:
-        return NB.compute(req.field, req.method, req.distance, req.k, req.steps, req.filters, req.hidden, _expr(req.expr))
+        return NB.compute(req.field, req.method, req.distance, req.k, req.steps, req.filters, req.hidden, _expr(req.expr), req.cells)
     except KeyError as e:
         raise HTTPException(400, str(e))
 
@@ -552,7 +617,7 @@ class NeighborDistReq(NeighborReq):
 def neighbors_dist(req: NeighborDistReq):
     """Per-index-cell spread of the neighbour composition and bootstrap enrichment intervals, per group (see Neighbors.per_cell)."""
     try:
-        return NB.per_cell(req.field, req.method, req.distance, req.k, req.steps, req.filters, req.hidden, _expr(req.expr), req.groups)
+        return NB.per_cell(req.field, req.method, req.distance, req.k, req.steps, req.filters, req.hidden, _expr(req.expr), req.groups, cells=req.cells)
     except KeyError as e:
         raise HTTPException(400, str(e))
 
@@ -566,6 +631,7 @@ class NeighborhoodReq(BaseModel):
     filters: dict[str, list[int]] = {}
     hidden: dict[str, list[int]] = {}
     expr: list[ExprReq] = []
+    cells: dict[str, list[int]] = {}
     limit: int = 48
     order: str = "random"                  # random | most | fewest (neighbours)
     seed: int = 1
@@ -576,7 +642,7 @@ def neighborhoods(req: NeighborhoodReq):
     """Index cells of one sample (those passing `filters`) with their neighbour cell indices, for drawing in space."""
     try:
         return NB.neighbourhoods(req.sample, req.filters, req.hidden, req.method, req.distance, req.k, req.steps,
-                                 max(1, min(req.limit, 200)), req.order, req.seed, _expr(req.expr))
+                                 max(1, min(req.limit, 200)), req.order, req.seed, _expr(req.expr), req.cells)
     except KeyError as e:
         raise HTTPException(400, str(e))
 
@@ -981,7 +1047,7 @@ def _log(msg):
 
 def _load(cache_dir, project):
     """Build the engine objects for an imported project."""
-    global S, SM, NB, GH, PROJ, EMB_LABEL, TX, DEFAULT_GREY, IFX, HE_EXTRA
+    global S, SM, NB, GH, PROJ, EMB_LABEL, EMB_PER_RUN, TX, DEFAULT_GREY, IFX, HE_EXTRA
     with PROF.step("load: Store (counts, cells, polygons from the cache)"):
         st = Store(cache_dir, Path(cache_dir) / "mapping.json")
     with PROF.step("load: Smoother, Neighbors, GlomHet"):
@@ -993,6 +1059,7 @@ def _load(cache_dir, project):
     S, SM, NB, GH, PROJ = st, sm, nb, gh, Path(project)
     _man = json.loads((Path(cache_dir) / "cache_info.json").read_text())["manifest"]
     EMB_LABEL = _man.get("embedding_label")
+    EMB_PER_RUN = bool(_man.get("embedding_per_run"))
     DEFAULT_GREY = bool(_man.get("default_grey"))
     HE_EXTRA = None
     _d = Path(cache_dir) / "he_registered"
@@ -1057,6 +1124,7 @@ def open_project(path, force=False, prepare=None, roi_object=None, if_path=None,
                 except HTTPException as e:
                     _log(f"IMC ignored: {e.detail}")
             ST.state = "ready"
+            _remember_recent(path)
             _log("ready")
         except importer.ImportError_ as e:
             ST.state, ST.error = "error", str(e); _log("error: " + str(e))
@@ -1064,6 +1132,41 @@ def open_project(path, force=False, prepare=None, roi_object=None, if_path=None,
             traceback.print_exc()
             ST.state, ST.error = "error", f"unexpected error: {e}"
     threading.Thread(target=work, daemon=True).start()
+
+
+RECENT_MAX = 8
+
+
+def _recent_file():
+    return importer.cache_root() / "recent.json"
+
+
+def _remember_recent(path):
+    """Put a project that opened at the top of the start page's Recent list (kept in the cache folder, not in the project)."""
+    try:
+        f = _recent_file()
+        p = str(Path(path).expanduser().resolve())
+        old = json.loads(f.read_text()) if f.is_file() else []
+        new = [p] + [x for x in old if x != p][:RECENT_MAX - 1]
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(new, indent=1))
+    except (OSError, ValueError):
+        pass
+
+
+@app.get("/api/recent", response_class=ORJSONResponse)
+def recent():
+    """The projects opened most recently (newest first): {path, label (folder or file name, with its parent when names repeat), exists}."""
+    try:
+        paths = json.loads(_recent_file().read_text()) if _recent_file().is_file() else []
+    except (OSError, ValueError):
+        paths = []
+    names = [Path(x).name for x in paths]
+    out = []
+    for x, n in zip(paths, names):
+        lab = f"{Path(x).parent.name}/{n}" if names.count(n) > 1 or n.startswith("_") else n
+        out.append({"path": x, "label": lab, "exists": Path(x).exists()})
+    return {"recent": out}
 
 
 def _register_he(he_reg, cdir):
@@ -1289,6 +1392,62 @@ def project_columns(path: str):
     return out
 
 
+def _cols_of(r):
+    """The column form's answers (an OpenReq or a MergeReq) as the importer's cols."""
+    cols = {k: v.strip() for k, v in (("sample", r.sample_col), ("donor", r.donor_col)) if v is not None and (k == "donor" or v.strip())}
+    for k, v in (r.roles or {}).items():
+        if k in importer.ROLES and k not in ("sample", "donor") and isinstance(v, str):
+            cols[k] = v.strip()
+    for k in ("values", "counts_matrix", "lognorm_matrix", "genes", "norm_scale"):
+        v = getattr(r, k)
+        if v is not None:
+            cols[k] = str(v).strip()
+    if cols.get("values") not in (None, "counts", "lognorm"):
+        raise HTTPException(400, "values must be 'counts' or 'lognorm'")
+    return cols
+
+
+@app.get("/api/merge/scan", response_class=ORJSONResponse)
+def merge_scan(path: str):
+    """The datasets in a folder for the merge page (project folders and .h5ad files)."""
+    try:
+        return merge.discover(path)
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+
+
+class MergeReq(BaseModel):
+    datasets: list[dict]           # [{name, path}] from /api/merge/scan, the ticked ones
+    out: str                       # the folder to write the merged project into (an earlier merge there is replaced)
+    sample_col: str | None = None  # the column form's answers, for the datasets whose columns are not known (same fields as OpenReq)
+    donor_col: str | None = None
+    roles: dict | None = None
+    values: str | None = None
+    counts_matrix: str | None = None
+    lognorm_matrix: str | None = None
+    genes: str | None = None
+    norm_scale: str | None = None
+
+
+@app.post("/api/merge", response_class=ORJSONResponse)
+def merge_run(r: MergeReq):
+    """Merge the datasets into r.out in the background (log in /api/status), then open the merged project."""
+    if not r.out.strip():
+        raise HTTPException(400, "give the output folder")
+    ds = [{"name": str(d.get("name", "")), "path": str(d.get("path", ""))} for d in r.datasets]
+    if len(ds) < 2:
+        raise HTTPException(400, "tick at least two datasets")
+    for d in ds:
+        if not d["name"] or not Path(d["path"]).expanduser().exists():
+            raise HTTPException(400, f"dataset not found: {d['path']}")
+    answers = _cols_of(r)
+    out = Path(r.out.strip()).expanduser()
+    if out.exists() and any(out.iterdir()) and not (out / merge.MARKER).is_file():
+        raise HTTPException(400, f"{out} exists and is not an earlier merge; choose a new or empty output folder")
+    open_project(str(out), False, lambda: merge.merge(ds, answers, out, _log))
+    return {"ok": True}
+
+
 @app.post("/api/open", response_class=ORJSONResponse)
 def open_(r: OpenReq):
     roi = None
@@ -1303,16 +1462,7 @@ def open_(r: OpenReq):
         ifp = Path(r.if_image.strip()).expanduser()
         if not ifp.exists():
             raise HTTPException(400, f"IF image not found: {ifp}")
-    cols = {k: v.strip() for k, v in (("sample", r.sample_col), ("donor", r.donor_col)) if v is not None and (k == "donor" or v.strip())}
-    for k, v in (r.roles or {}).items():
-        if k in importer.ROLES and k not in ("sample", "donor") and isinstance(v, str):
-            cols[k] = v.strip()
-    for k in ("values", "counts_matrix", "lognorm_matrix", "genes", "norm_scale"):
-        v = getattr(r, k)
-        if v is not None:
-            cols[k] = str(v).strip()
-    if cols.get("values") not in (None, "counts", "lognorm"):
-        raise HTTPException(400, "values must be 'counts' or 'lognorm'")
+    cols = _cols_of(r)
     imp = None
     if r.imc_file.strip():
         imp = Path(r.imc_file.strip()).expanduser()
@@ -1453,27 +1603,6 @@ def xenium_tissues_load(r: TissueLoadReq):
         raise HTTPException(400, str(e))
 
 
-class TissueExportReq(BaseModel):
-    spec: XSpec
-    folder: str                     # where to write <name>_regions.geojson
-    name: str                       # the file is <name>_regions.geojson (the project name)
-    name_col: str = "sample_id_unblinded"
-    overwrite: bool = False
-
-
-@app.post("/api/xenium/tissues/export", response_class=ORJSONResponse)
-def xenium_tissues_export(r: TissueExportReq):
-    """Write the run's tissue boxes (as edited now) to a GeoJSON without converting; 409 when the file exists and overwrite is not set."""
-    if not r.folder.strip():
-        raise HTTPException(400, "choose a folder for the file")
-    try:
-        return {"written": [xenium.export_tissue_boxes(_xs(), r.spec.model_dump(), r.folder, r.name.strip() or "slide", r.name_col.strip() or "sample_id_unblinded", r.overwrite)]}
-    except FileExistsError as e:
-        raise HTTPException(409, f"{e} exists")
-    except importer.ImportError_ as e:
-        raise HTTPException(400, str(e))
-
-
 class BTissueReq(BaseModel):
     folder: str                     # where the tissue-box files <run>_regions.geojson are (e.g. the output folder of an earlier batch import)
     runs: list                      # run names
@@ -1522,6 +1651,7 @@ class XConvertReq(BaseModel):
     annotation: dict = {}
     transcripts: bool = False
     he: bool = False
+    he_threads: int = 4             # threads tiling the H&E scan
     he_reg_folder: str = ""
     he_reg_index: str = ""
     imc_file: str = ""              # IMC slide (.mcd), optional: converted into the cache after the project opens
@@ -1551,6 +1681,8 @@ def xenium_convert(r: XConvertReq):
     if not r.output.strip():
         raise HTTPException(400, "choose an output folder")
 
+    if not 1 <= r.he_threads <= 256:
+        raise HTTPException(400, "H&E threads must be between 1 and 256")
     hreg = _he_reg_args(r.he_reg_folder, r.he_reg_index)
     imp = None
     if r.imc_file.strip():
@@ -1560,7 +1692,7 @@ def xenium_convert(r: XConvertReq):
 
     def prepare():
         _log("converting the Xenium output to a project folder")
-        rep = xenium.convert(s, r.spec.model_dump(), out, r.name, r.annotation or None, _log, r.transcripts, XST.he["paths"] if (r.he and XST.he) else None, export_regions=r.export_regions, regions_name_col=r.regions_name_col, regions_dir=_regions_dir(r.regions_dir) if r.export_regions else None)
+        rep = xenium.convert(s, r.spec.model_dump(), out, r.name, r.annotation or None, _log, r.transcripts, {**XST.he["paths"], "threads": r.he_threads} if (r.he and XST.he) else None, export_regions=r.export_regions, regions_name_col=r.regions_name_col, regions_dir=_regions_dir(r.regions_dir) if r.export_regions else None)
         if hreg:
             try:
                 he_registered.run(hreg["folder"], hreg["index"], out, _log)
@@ -1607,6 +1739,36 @@ def xenium_batch_he(r: BHeReq):
         raise HTTPException(400, str(e))
     d["match"] = batch.he_match(r.runs, d["czi"], d["annotations"])
     return d
+
+
+class BAnnReq(BaseModel):
+    path: str
+    runs: list = []                 # run names
+    run_col: str = ""               # for /match: the column (or batch.ID_PREFIX) saying which run a cell is from
+    id_col: str = ""
+
+
+@app.post("/api/xenium/batch/ann", response_class=ORJSONResponse)
+def xenium_batch_ann(r: BAnnReq):
+    """The columns of a cell annotation file for the batch import and the suggested roles (batch.ann_inspect)."""
+    try:
+        return batch.ann_inspect(r.path, [str(x) for x in r.runs])
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"cannot read the annotation file: {e}")
+
+
+@app.post("/api/xenium/batch/ann/match", response_class=ORJSONResponse)
+def xenium_batch_ann_match(r: BAnnReq):
+    """The values of the run column ({value: rows}) and the suggested value for each run."""
+    try:
+        vals = batch.ann_values(r.path, r.run_col, r.id_col)
+    except importer.ImportError_ as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"cannot read the annotation file: {e}")
+    return {"values": vals, "match": batch.ann_match(list(vals), [str(x) for x in r.runs])}
 
 
 # ---- slide gallery and drawing on the runs of a batch: runs are read without their counts (xenium.Light), thumbnails in the background
@@ -1791,6 +1953,8 @@ class BRunReq(BaseModel):
     detect: str = "cells"           # tissue detection from cell density or transcript density
     tx_min: int = 0                 # transcripts per 50 um bin (transcripts mode); 0 = automatic
     he: dict = {}                   # {run name: {czi, annotations}} from the H&E folder step
+    he_threads: int = 4             # threads tiling each H&E scan; scans at once = cores // he_threads
+    annotation: dict = {}           # the user's cell labels: {path, id_col, run_col, type_col, state_col, donor_col, runs: {run: value}} (batch._annotate)
     export_regions: bool = False    # write <run>_regions.geojson per run
     regions_name_col: str = "sample_id_unblinded"
     regions_dir: str = ""           # extra folder for those files, optional
@@ -1808,7 +1972,7 @@ def xenium_batch_run(r: BRunReq):
         raise HTTPException(400, "choose an output folder")
     if not r.runs or len(r.runs) > 500 or not all(isinstance(x, dict) and x.get("name") and x.get("path") for x in r.runs):
         raise HTTPException(400, "no runs selected")
-    if not (0 <= r.workers <= 256 and 0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6
+    if not (0 <= r.workers <= 256 and 1 <= r.he_threads <= 256 and 0 <= r.gap <= 5000 and 1 <= r.min_cells <= 10**7 and 0 <= r.min_counts <= 10**6
             and r.detect in ("cells", "transcripts") and 0 <= r.tx_min <= 10**7):
         raise HTTPException(400, "parameter out of range")
     out = Path(r.output).expanduser()
@@ -1819,6 +1983,18 @@ def xenium_batch_run(r: BRunReq):
         if not Path(v["czi"]).expanduser().is_file() or (v["annotations"] and not Path(v["annotations"]).expanduser().is_file()):
             raise HTTPException(400, f"H&E file not found: {v['czi'] if not Path(v['czi']).expanduser().is_file() else v['annotations']}")
 
+    ann = None
+    if (r.annotation or {}).get("path"):
+        a = r.annotation
+        ann = {k: (str(a.get(k)) if a.get(k) else None) for k in ("path", "id_col", "run_col", "type_col", "state_col", "donor_col")}
+        ann["path"] = str(Path(ann["path"]).expanduser())
+        ann["runs"] = {str(k): (str(v) if v not in (None, "") else None) for k, v in (a.get("runs") or {}).items()}
+        if not Path(ann["path"]).is_file():
+            raise HTTPException(400, f"annotation file not found: {ann['path']}")
+        if not ann["id_col"] or not (ann["type_col"] or ann["state_col"]):
+            raise HTTPException(400, "choose the cell id column and the cell type column of the annotation file")
+        if not ann["run_col"] and len(runs) > 1:
+            raise HTTPException(400, "choose the column of the annotation file that says which run each cell is from: Xenium cell ids repeat between runs")
     hreg = _he_reg_args(r.he_reg_folder, r.he_reg_index)
     rects = {str(k): v for k, v in (r.regions or {}).items() if isinstance(v, list) and v}
     if any(len(v) > 200 for v in rects.values()):
@@ -1829,7 +2005,7 @@ def xenium_batch_run(r: BRunReq):
     reg = {"comps": comps, "auto_off": {str(k): bool(v) for k, v in (r.auto_off or {}).items()}, "cut_off": r.cut_off, "export": r.export_regions, "col": r.regions_name_col, "dir": _regions_dir(r.regions_dir) if r.export_regions else None, "rects": rects}
 
     def prepare():
-        rep = batch.run_batch(runs, out, _log, spec, r.merge, r.transcripts, he, r.tx_table, r.workers, r.ifimg, hreg, reg)
+        rep = batch.run_batch(runs, out, _log, spec, r.merge, r.transcripts, he, r.tx_table, r.workers, r.ifimg, hreg, reg, he_threads=r.he_threads, ann=ann)
         keep = rep["merged"] or rep["first"]
         if keep is None:
             raise importer.ImportError_("no run could be converted; see the log above")
@@ -1967,7 +2143,18 @@ def profile_page():
 
 @app.get("/welcome")
 def welcome():
+    """The start page: one dataset, several datasets, or raw Xenium output."""
     return FileResponse(WEB / "welcome.html")
+
+
+@app.get("/open")
+def open_page():
+    return FileResponse(WEB / "open.html")
+
+
+@app.get("/merge")
+def merge_page():
+    return FileResponse(WEB / "merge.html")
 
 
 @app.get("/xenium-batch")

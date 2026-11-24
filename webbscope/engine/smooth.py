@@ -3,7 +3,7 @@
 Per sample: score = mean over the requested genes of the chosen layer; if sigma > 0 the score is replaced by a
 Gaussian-weighted mean over neighbouring cells (weights exp(-d^2 / 2 sigma^2), truncated at 3 sigma, the cell itself
 included). Z-scoring then standardises the smoothed score with the mean/sd pooled over every cell of the samples
-in the scope (this sample only, same disease subtype, same disease type, or all samples).
+in the scope (this donor, the same group, all samples, or all samples except the reference group; groups.py).
 
 `within` restricts both steps to a subset of cells: "tissue" (every cell, the default), "glom" (cells inside a glomerulus: each glomerulus is
 smoothed on its own, never mixing with the tissue around it or with another glomerulus, and the z-score mean/SD come from glomerulus cells only)
@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 
 MAX_SIGMA = 100.0
 WITHIN_TISSUE = "tissue"
-SCOPES = ("none", "sample", "subtype", "type", "all", "nocontrol")   # nocontrol: mean/SD from the non-Control samples only, applied to every sample
+SCOPES = ("none", "sample", "group", "all", "notref")   # notref: mean/SD from the samples outside the reference group, applied to every sample
 
 
 class Smoother:
@@ -28,9 +28,6 @@ class Smoother:
         self.W = OrderedDict()       # (sample, sigma) -> row-normalised CSR weights
         self.scores = OrderedDict()  # (sample, genes, layer, sigma) -> (vector, n, sum, sumsq)
         self.stats = {}              # (genes, layer, sigma, scope, group) -> (mean, sd)
-        df = store.df
-        self.info = {s: {c: str(df[c].iloc[store.slices[s][0]]) if c in df.columns else ""
-                         for c in ("disease_subtype", "disease_type")} for s in store.samples}
 
     # -- smoothing weights ----------------------------------------------------------
     def check_within(self, within):
@@ -125,10 +122,10 @@ class Smoother:
             return [s for s in self.S.samples if self.S.donor[s] == d]
         if scope == "all":
             return list(self.S.samples)
-        if scope == "nocontrol":
-            return [s for s in self.S.samples if self.info[s]["disease_type"] != "Control"]
-        col = "disease_subtype" if scope == "subtype" else "disease_type"
-        return [s for s in self.S.samples if self.info[s][col] == self.info[sample][col]]
+        G = self.S.groups
+        if scope == "notref":
+            return [s for s in self.S.samples if G.of(s) != G.reference]
+        return [s for s in self.S.samples if G.of(s) == G.of(sample)]
 
     def expression(self, sample, genes, layer="logcpx", sigma=0.0, scope="none", within=WITHIN_TISSUE):
         """Per-cell vector (float32) for `sample`: mean over genes, optionally smoothed, optionally z-scored; NaN outside `within`."""

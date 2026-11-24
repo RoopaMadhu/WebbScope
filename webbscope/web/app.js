@@ -19,11 +19,12 @@ const S = {
   exprFilters: [], exprV: [],             // gene / signature filters {name, genes, op, thr}; their per-cell scores for the current tissue
   hiddenCats: {},                         // colour key -> Set(level index) hidden via legend
   colorBy: "cell_type", geneA: "", geneB: "", sigGenes: [], sigVec: null, sigKey: "", sigGenes2: [], sigVec2: null, sigKey2: "", sigName2: "", smooth: 0, zscope: "none", within: "tissue", layer: "logcpx", clip: 99.5, numScale: { log: false, cmin: null, cmax: null, fmin: null, fmax: null },
-  psize: 5, opacity: 0.9, selected: new Set(), cellSearch: "",
+  psize: 5, opacity: 0.9, dimA: 0.45, orTS: false, bgWhite: false, selected: new Set(), cellSearch: "",
   vis: null, visIdx: null, drawIdx: null, // passes-filter mask; passing cells; all cells (filtered-out first, so highlights draw on top)
   ovLegend: false, ctxs: {}, boxMode: false, showPath: false, shape: "auto", polyZoom: 1, polyMax: 60000, mode: "pt", poly: null, colors: null, viewState: null, compField: "cell_type", paths: null,
 };
 let deckgl = null;
+const bgCol = () => (S.bgWhite ? "#ffffff" : "#0f1218");   // background of the viewer and of the tiles
 
 // ---------------------------------------------------------------- helpers
 const loading = (on) => { $("loading").style.display = on ? "block" : "none"; };
@@ -53,7 +54,11 @@ const REGION_COL = { "Cortex": "#00ffd5", "Medulla": "#ff2bd6", "IFTA": "#ffffff
   "Perivascular Fibrosis": "#7dffb3", "Gloms w/endocapillary hypercellularity": "#c77dff", "Gloms w/periglomerular fibrosis": "#4dd2ff", "Sclerotic Gloms": "#ff9f1c", "Non-sclerotic Gloms": "#b6ff00",
   "Artifacts": "#a0a8b8", "Intraglom Crescents": "#f15bb5", "Poorly Preserved Gloms": "#d4ff8f", "(outside all outlines)": "#6b7482" };
 const regionColor = (name, pen) => REGION_COL[String(name || "").trim()] || pen || "#ffffff";
-const catColor = (k, i) => {
+// User colour choices per category (S.colOv[field][level] = "#rrggbb"). By default they apply to figures only (S._inFig is on while a figure is built);
+// "also use in the viewer and windows" (S.colOvAll) applies them everywhere. They last for the session and are not saved.
+const ovHex = (k, i) => ((S.colOvAll || S._inFig) && S.colOv && S.colOv[k] && S.colOv[k][i]) || null;
+const catColor = (k, i) => ovHex(k, i) || catColor0(k, i);
+const catColor0 = (k, i) => {
   if (k === "cell_type") return TAB20_CT[i % TAB20_CT.length];
   if (k === "path_region") return regionColor(catMeta(k).levels[i], catMeta(k).colors[i]);
   if (k === "glom_quality") { const n = catMeta(k).levels[i]; return n === "passed qc" ? STATUS.good : n === "failed qc" ? STATUS.critical : PAL[i % PAL.length]; }
@@ -106,9 +111,8 @@ const rgName = () => (RG.level >= 0 ? display(RG.src, RG.level) : "");
 const transformed = () => S.smooth > 0 || S.zscope !== "none" || withinSpec() !== "tissue";
 const gkey = (genes) => (transformed() ? `E|${genes.join(",")}|${S.layer}|${S.smooth}|${S.zscope}|${withinSpec()}` : genes[0] + "|" + S.layer);
 const exprUrl = (genes) => `/api/sample/${encodeURIComponent(S.sample)}/expr?genes=${encodeURIComponent(genes.join(","))}&layer=${S.layer}&sigma=${S.smooth}&scope=${S.zscope}&within=${encodeURIComponent(withinSpec())}`;
-const SCOPE_LABEL = { sample: "within each donor", subtype: "across samples of the same disease subtype", type: "across samples of the same disease type", all: "across all samples", nocontrol: "against the non-control samples (No LN + LN; Control excluded from the mean/SD)" };
 const withinNote = () => { const w = withinSpec(); return w === "glom" ? "glomerulus cells only (each glom smoothed on its own; z-score mean/SD from glomerulus cells)" : w !== "tissue" ? `cells of the region “${rgName()}” only (smoothing and z-score mean/SD from that region)` : ""; };
-const transformNote = () => [S.smooth > 0 ? `Gaussian-smoothed, σ = ${S.smooth} µm` : "", S.zscope !== "none" ? `z-score ${SCOPE_LABEL[S.zscope]}` : "", withinNote()].filter(Boolean).join("; ");
+const transformNote = () => [S.smooth > 0 ? `Gaussian-smoothed, σ = ${S.smooth} µm` : "", S.zscope !== "none" ? `z-score ${scopeText(S.zscope)}` : "", withinNote()].filter(Boolean).join("; ");
 async function ensureGene(g) {
   const key = gkey([g]);
   if (!S.genes[key]) S.genes[key] = await bget(transformed() ? exprUrl([g]) : `/api/sample/${encodeURIComponent(S.sample)}/gene/${encodeURIComponent(g)}?layer=${S.layer}`, Float32Array);
@@ -128,17 +132,17 @@ async function init() {
   }   // merged batch projects: cell types are per tissue, so start uncoloured
   const m = S.meta; buildStateInfo(); rgnInit();
   for (const x of m.samples) if (!x.donor) x.donor = String(x.id).replace(/_fragment[-_]?\d+$/, "");   // older servers do not send the donor: derive it from the sample id
-  $("dsinfo").textContent = `${fmt(m.n_cells)} Xenium cells (QC'ed) · ${fmt(m.n_genes)} genes · ${donTxt(nDonors(m.samples))} · matrix ${m.matrix.orientation}`;
-  $("sample").innerHTML = m.samples.map((s) => `<option value="${s.id}">${dlabel(s.id)} — ${subtypeOf(s)} (${fmt(s.n)} cells)</option>`).join("");
-  const colorOpts = [];
-  for (const k of ROLE_ORDER) if (m.cats[k]) colorOpts.push([k, ROLE_LABEL[k]]);
-  colorOpts.push(["__gene", "Gene expression (one gene)"], ["__dual", "Two genes (dual colour)"], ["__sig", "Gene signature (mean of genes)"], ["__sigdual", "Two gene signatures (dual colour)"]);
-  for (const k of Object.keys(m.cats)) if (k.startsWith("meta:")) colorOpts.push([k, "meta: " + k.slice(5)]);
-  for (const k of Object.keys(m.numeric)) colorOpts.push([k, "numeric: " + k.slice(5)]);
-  $("colorby").innerHTML = colorOpts.map(([k, l]) => `<option value="${k}">${l}</option>`).join("");
+  $("dsinfo").textContent = `${fmt(m.n_cells)} cells · ${fmt(m.n_genes)} genes · ${donTxt(nDonors(m.samples))}`;
+  $("aboutinfo").textContent = `Expression matrix: ${m.matrix.orientation}. Coordinates: ${m.coordinate_unit}.`;
+  const colorGroup = (label, rows) => (rows.length ? `<optgroup label="${label}">${rows.map(([k, l]) => `<option value="${k}">${l}</option>`).join("")}</optgroup>` : "");
+  $("colorby").innerHTML = colorGroup("Cell labels", ROLE_ORDER.filter((k) => m.cats[k]).map((k) => [k, ROLE_LABEL[k]]))
+    + colorGroup("Expression", [["__gene", "Gene expression (one gene)"], ["__dual", "Two genes (dual colour)"], ["__sig", "Gene signature (mean of genes)"], ["__sigdual", "Two gene signatures (dual colour)"]])
+    + colorGroup("Other columns", Object.keys(m.cats).filter((k) => k.startsWith("meta:")).map((k) => [k, k.slice(5)]))
+    + colorGroup("Numeric columns", Object.keys(m.numeric).map((k) => [k, k.slice(5)]));
   $("compfield").innerHTML = ROLE_ORDER.filter((k) => m.cats[k]).map((k) => `<option value="${k}">${ROLE_LABEL[k]}</option>`).join("");
   buildFilterUI();
-  bindUI();
+  syncGroupOptions(); fillWithin(); renderGroups();
+  bindUI(); bindGroups(); bindMenus(); bindInfo(); syncFolds(); agentInit();
   await loadSample(m.samples[0].id);
 }
 
@@ -166,13 +170,15 @@ async function loadSample(id) {
 // ---------------------------------------------------------------- filters
 function buildFilterUI() {
   const keys = ROLE_ORDER.filter((k) => S.meta.cats[k]), gi = keys.indexOf("glom_quality");
-  keys.splice(gi < 0 ? keys.length : gi, 0, "path_region");   // after the region levels
-  const pathBox = `<label class="chk"><input type="checkbox" id="showpath"> draw the outlines on the viewer</label><div id="pathstat" class="muted small"></div>
-    <div class="muted small">${S.meta.cats.path_region ? "Cells inside any ticked region (regions can be nested, e.g. gloms lie inside the cortex)." : "Region membership has not been built (run scripts/build_paths.py)."}</div>`;
-  $("filters").innerHTML = keys.map((k) => `<details class="fgroup" data-k="${k}" ${k === "cell_type" ? "open" : ""}><summary>${ROLE_LABEL[k]} <span class="muted" id="fcount-${k}"></span></summary>
+  if (S.meta.cats.path_region) keys.splice(gi < 0 ? keys.length : gi, 0, "path_region");   // after the region levels
+  const pathBox = `<label class="chk"><input type="checkbox" id="showpath"> draw the outlines on the viewer <span class="info" tabindex="0" aria-label="help" data-tip="Filtering keeps the cells inside any ticked region. Regions can be nested, for example gloms lie inside the cortex.">ⓘ</span></label><div id="pathstat" class="muted small"></div>
+    `;
+  const orBox = S.meta.cats.cell_type && S.meta.cats.cell_state ? `<label class="chk" title="Off: every selected field must match (cell type AND cell state). On: a cell is shown when it matches the selected cell types OR the selected cell states, e.g. proximal tubule cells plus M7 macrophages."><input type="checkbox" id="orts"${S.orTS ? " checked" : ""}> cell type OR cell state (union of the two selections)</label>` : "";
+  $("filters").innerHTML = orBox + keys.map((k) => `<details class="fgroup" data-k="${k}" ${k === "cell_type" ? "open" : ""}><summary>${ROLE_LABEL[k]} <span class="muted" id="fcount-${k}"></span></summary>
     ${k === "path_region" ? pathBox : ""}<input class="fs" placeholder="search…" data-k="${k}"><div class="opts" id="fopts-${k}"></div></details>`).join("") +
     exprGroupHTML();
   keys.forEach(renderFilterOpts);
+  $("orts")?.addEventListener("change", (e) => { S.orTS = e.target.checked; refresh(); });
   document.querySelectorAll(".fs").forEach((el) => el.addEventListener("input", (e) => renderFilterOpts(e.target.dataset.k)));
   bindExprUI(); renderExprList();
 }
@@ -188,16 +194,16 @@ const normLabel = (short) => S.meta.ln_given ? "log-normalised (as given)" : sho
 const exprDesc = (e) => { const t = [e.layer === "counts" ? "raw counts" : "", e.sigma > 0 ? `σ ${e.sigma} µm` : "", e.scope !== "none" ? "z-score" : "", e.within !== "tissue" ? "compute-over subset" : ""].filter(Boolean).join(", ");
   return `${e.name} ${e.op === "gt" ? "positive" : "negative"} (score ${e.op === "gt" ? ">" : "≤"} ${e.thr}${t ? "; " + t : ""})`; };
 function exprGroupHTML() {
-  return `<details class="fgroup" data-k="__expr"><summary>Gene / signature positive <span class="muted" id="fcount-__expr"></span></summary><div class="xf">
+  return `<details class="fgroup" data-k="__expr"><summary>Gene / signature positive <span class="info" tabindex="0" aria-label="help" data-tip="Score = the gene's value (mean over the genes for several) with the Layer / Smoothing / Z-score / Compute-over settings chosen here for this filter (independent of the viewer's colouring settings), so 0 on the raw layers means “detected”. Several filters and the other filters combine with AND. The number is the cells of this tissue passing that filter alone.">ⓘ</span> <span class="muted" id="fcount-__expr"></span></summary><div class="xf">
     <input id="xfgenes" list="genelist" placeholder="gene, or several genes (mean = signature)…" autocomplete="off">
     <select id="xfpreset" title="use a built-in signature instead"><option value="">— or a built-in signature —</option></select>
     <div class="xfrow"><select id="xfop"><option value="gt">positive: score &gt;</option><option value="le">negative: score ≤</option></select><input id="xfthr" type="number" step="any" value="0" title="threshold on the score; 0 on the raw layers means detected"><button id="xfadd" class="sm">Add</button></div>
     <div class="xfrow"><label class="small">Layer</label><select id="xflayer"><option value="logcpx">log-normalised</option>${S.meta.has_counts === false ? "" : '<option value="counts">raw counts</option>'}</select></div>
     <div class="xfrow"><label class="small">Smooth σ</label><input type="range" id="xfsigma" min="0" max="100" step="5" value="0"><span id="xfsigmalab" class="small">off</span></div>
-    <div class="xfrow"><label class="small">Z-score</label><select id="xfscope"><option value="none">none (raw values)</option><option value="sample">within each donor</option><option value="subtype">across samples of the same disease subtype</option><option value="type">across samples of the same disease type</option><option value="all">across all samples</option><option value="nocontrol">across all non-control samples</option></select></div>
+    <div class="xfrow"><label class="small">Z-score</label><select id="xfscope"></select></div>
     <div class="xfrow"><label class="small">Compute over</label><select id="xfwithin"><option value="tissue">the whole tissue</option><option value="glom">glomeruli only</option><option value="region">the region chosen in the Regions window</option></select></div>
     <div id="xfmsg" class="muted small"></div><div id="xflist"></div>
-    <div class="muted small">Score = the gene's value (mean over the genes for several) with the Layer / Smoothing / Z-score / Compute-over settings chosen here for this filter (independent of the viewer's colouring settings), so 0 on the raw layers means “detected”. Several filters and the other filters combine with AND. The number is the cells of this tissue passing that filter alone.</div></div></details>`;
+    </div></details>`;
 }
 function renderExprList() {
   const box = $("xflist"); if (!box) return;
@@ -237,7 +243,8 @@ function bindExprUI() {
   $("xfpreset").addEventListener("change", () => { if ($("xfpreset").value) $("xfgenes").value = ""; });
   $("xfgenes").addEventListener("input", debounce(async (e) => { const q = e.target.value; if (!q || /[\s,;]/.test(q)) return; const l = await jget("/api/genes/search?q=" + encodeURIComponent(q)); $("genelist").innerHTML = l.map((g) => `<option value="${g}">`).join(""); }));
 }
-const fltText = (spec) => [...Object.entries(spec.filters).map(([k, ids]) => `${labelOf(k)} = ${ids.map((i) => display(k, i)).join(", ")}`), ...(spec.expr || []).map(exprDesc)].join(" · ");
+const fltText = (spec) => { const one = ([k, ids]) => `${labelOf(k)} = ${ids.map((i) => display(k, i)).join(", ")}`, ents = Object.entries(spec.filters).filter(([k]) => k !== "__or"), isOr = ([k]) => !!spec.filters.__or && (k === "cell_type" || k === "cell_state");
+  return [...(spec.filters.__or ? [ents.filter(isOr).map(one).join(" OR ")] : []), ...ents.filter((e) => !isOr(e)).map(one), ...(spec.expr || []).map(exprDesc)].join(" · "); };
 const UMX = {};
 async function exprMaskAll() {   // server: 1 = the cell passes every gene / signature filter, for all cells in cache order (the UMAP shows all tissues)
   const body = JSON.stringify({ expr: exprSpecs() });
@@ -266,13 +273,18 @@ function renderFilterOpts(k) {
 }
 
 // ---------------------------------------------------------------- visibility, colours
+// Category filters: AND across fields; with S.orTS the cell type and cell state selections count as ONE condition either can satisfy
+// (proximal tubule cells OR M7 macrophages). `cat(k)` gives the per-cell codes of field k; clears keep[i] for cells that fail.
+function applyCatFilters(keep, n, fkeys, cat) {
+  const orK = S.orTS && fkeys.includes("cell_type") && fkeys.includes("cell_state") ? ["cell_type", "cell_state"] : [];
+  const mk = (k) => { const set = S.filters[k], mu = isMulti(k), sm = mu ? selMask(set) : 0, c = cat(k); return (i) => (mu ? (c[i] & sm) !== 0 : set.has(c[i])); };
+  for (const k of fkeys) { if (orK.includes(k)) continue; const f = mk(k); for (let i = 0; i < n; i++) if (keep[i] && !f(i)) keep[i] = 0; }
+  if (orK.length) { const fs = orK.map(mk); for (let i = 0; i < n; i++) if (keep[i] && !fs.some((f) => f(i))) keep[i] = 0; }
+}
+const selKeys = () => Object.keys(S.filters).filter((k) => S.filters[k].size && S.cats[k]);
 function computeVisible() {
   const n = S.n, vis = new Uint8Array(n).fill(1);
-  for (const [k, set] of Object.entries(S.filters)) {
-    if (!set.size || !S.cats[k]) continue;
-    const c = S.cats[k], mu = isMulti(k), sm = mu ? selMask(set) : 0;
-    for (let i = 0; i < n; i++) if (vis[i] && !(mu ? (c[i] & sm) !== 0 : set.has(c[i]))) vis[i] = 0;
-  }
+  applyCatFilters(vis, n, selKeys(), (k) => S.cats[k]);
   S.exprFilters.forEach((e, q) => { const v = S.exprV[q]; if (!v || v.length !== n) return; for (let i = 0; i < n; i++) if (vis[i] && !exprPass(e, v[i])) vis[i] = 0; });
   const hid = S.hiddenCats[S.colorBy];
   if (hid?.size && S.cats[S.colorBy]) { const c = S.cats[S.colorBy]; for (let i = 0; i < n; i++) if (vis[i] && hid.has(c[i])) vis[i] = 0; }
@@ -344,7 +356,8 @@ function makeScale(bundles) {
   }
   if (S.meta.cats[mode]) {
     const cl = catMeta(mode).levels.map((_, k) => hex2rgb(catColor(mode, k)));
-    return { info: { type: "cat" }, color: (b, i) => { const c = b.codes[i]; return c === MISSING ? GRAY : cl[c]; } };
+    const oc = {};   // the colour choices are looked up when a cell is coloured, so a figure can use them without touching the windows' own scales
+    return { info: { type: "cat" }, color: (b, i) => { const c = b.codes[i]; if (c === MISSING) return GRAY; const h = ovHex(mode, c); return h ? (oc[h] ||= hex2rgb(h)) : cl[c]; } };
   }
   if (bundles.some((b) => b.num)) {   // numeric column: optional log scale, colour-bar limits (values beyond them take the end colours) and a keep-range (others grey)
     const ns = S.numScale, tf = ns.log ? (v) => Math.log1p(Math.max(v, 0)) : (v) => v, inF = (v) => (ns.fmin == null || v >= ns.fmin) && (ns.fmax == null || v <= ns.fmax);
@@ -365,7 +378,7 @@ function mainBundle() {
 }
 const GREY = [150, 155, 162], GREY_LINE = [128, 134, 143, 235];   // "Grey cells": plain fill and outline, so transcripts and other overlays stand out
 function computeColors() {
-  const di = S.drawIdx, m = di.length, out = new Uint8Array(m * 4), a = Math.round(S.opacity * 255), ad = Math.round(a * 0.45);
+  const di = S.drawIdx, m = di.length, out = new Uint8Array(m * 4), a = Math.round(S.opacity * 255), ad = Math.round(a * S.dimA);
   const b = mainBundle(), sc = makeScale([b]); S.colorInfo = sc.info;
   for (let j = 0; j < m; j++) {
     const i = di[j], c = S.vis[i] ? (S.grey ? GREY : sc.color(b, i)) : DIM, al = S.vis[i] ? a : ad;
@@ -565,14 +578,14 @@ async function hesLoadScan(key) {
   const q = key ? "?scan=" + encodeURIComponent(key) : "";
   HS.idx = await jget("/api/heslide" + q); HS.ann = null; HS.hide = new Set(); HS.key = key || "";
   if (HS.idx.annotations) { try { HS.ann = await jget("/api/heslide/annotations" + q); for (const f of HS.ann.features) f.geometry.coordinates = f.geometry.coordinates.map((r) => r.map(([x, y]) => [x, -y])); } catch (e) { HS.ann = null; } }   // deck y is the negated slide y
-  $("hestitle").textContent = `H&E slide — ${HS.idx.source}`; hesPanel();
+  $("hestitle").textContent = `H&E scan — ${HS.idx.source}`; hesPanel();
   if (HS.deck) hesFit(HS.idx.bounds_um);
 }
 function hesScanOfSample() {   // the scan of the run of the current tissue in a multi-scan project ("" when that run was given none)
-  const m = HS.multi, sm = S.meta.samples.find((x) => x.id === S.sample), run = sm ? subtypeOf(sm) : "";
+  const m = HS.multi, sm = S.meta.samples.find((x) => x.id === S.sample), run = sm ? runOf(sm) : "";
   return m.runs[run] || "";
 }
-function hesNoScanNote(k) { if (!k) { const sm = S.meta.samples.find((x) => x.id === S.sample); $("hesnote").textContent = `No H&E scan was given for ${sm ? subtypeOf(sm) : "this run"}; showing ${HS.idx.source}.`; } }
+function hesNoScanNote(k) { if (!k) { const sm = S.meta.samples.find((x) => x.id === S.sample); $("hesnote").textContent = `No H&E scan was given for ${sm ? runOf(sm) : "this run"}; showing ${HS.idx.source}.`; } }
 async function hesToggle(on) {
   HS.open = on ?? !HS.open; $("heswin").hidden = !HS.open; $("hesbtn").classList.toggle("on", HS.open); if (!HS.open) return;
   if (!HS.idx) {
@@ -584,7 +597,7 @@ async function hesToggle(on) {
     } else {
       HS.idx = d; HS.ann = null;
       if (HS.idx.annotations) { try { HS.ann = await jget("/api/heslide/annotations"); for (const f of HS.ann.features) f.geometry.coordinates = f.geometry.coordinates.map((r) => r.map(([x, y]) => [x, -y])); } catch (e) { HS.ann = null; } }
-      $("hestitle").textContent = `H&E slide — ${HS.idx.source}`; hesPanel();
+      $("hestitle").textContent = `H&E scan — ${HS.idx.source}`; hesPanel();
     }
     HS.deck = new deck.Deck({ parent: $("hesdeck"), views: new deck.OrthographicView({ flipY: false }), initialViewState: { target: [0, 0, 0], zoom: -4 }, controller: { dragPan: true, scrollZoom: true, doubleClickZoom: true }, layers: [],
       onViewStateChange: ({ viewState }) => { HS.vs = viewState; hesRedo(); },
@@ -639,7 +652,7 @@ function ptBindCanvas(el, w) {
   }, true);
 }
 function ptWrap(fn, sampleOf) {   // draw the arrows on the canvases of a side-by-side pair after the tile is drawn
-  return function (...a) { const r = fn.apply(this, a), cv = a[0]; try { if (cv && (cv._heOnly || (cv.parentNode && cv.parentNode.classList.contains("hepair")))) ptCanvasDraw(cv, sampleOf(a)); } catch (e) { /* no arrows */ } return r; };
+  return function (...a) { const r = fn.apply(this, a), cv = a[0]; try { if (cv && (cv._heOnly || cv._ptFree || (cv.parentNode && cv.parentNode.classList.contains("hepair")))) ptCanvasDraw(cv, sampleOf(a)); } catch (e) { /* no arrows */ } return r; };
 }
 function ptUi() {
   const row = $("ptrow"); if (!row) return; const ok = ptAllowed(); if (!ok && !HE_SIDE.some((k) => ptAllowedFor(k))) PT.on = false;   // the tool stays on while some window can use it
@@ -710,14 +723,14 @@ async function scanLoad() {   // the scan of the tissue being viewed (a batch pr
   if (imcMode()) return imcSceneLoad();
   const d = await jget("/api/heslide");
   if (d.multi) {
-    SC.multi = d; const sm = S.meta.samples.find((x) => x.id === S.sample), run = sm ? subtypeOf(sm) : "", key = d.runs[run] || SC.key || d.scans[0].key, sel = $("scansel");
+    SC.multi = d; const sm = S.meta.samples.find((x) => x.id === S.sample), run = sm ? runOf(sm) : "", key = d.runs[run] || SC.key || d.scans[0].key, sel = $("scansel");
     sel.replaceChildren(); for (const sc of d.scans) { const op = document.createElement("option"); op.value = sc.key; op.textContent = `${sc.source} · ${sc.runs.length} run${sc.runs.length === 1 ? "" : "s"}`; sel.append(op); }
     sel.value = key; if (key !== SC.key || !SC.idx) { SC.key = key; SC.idx = await jget("/api/heslide?scan=" + encodeURIComponent(key)); SC.sample = S.sample; scanUi(); return scanFit(); }
   } else if (!SC.idx) { SC.idx = d; SC.key = ""; SC.sample = S.sample; scanUi(); return scanFit(); }
   SC.sample = S.sample; scanUi(); heSideLayers();
 }
 function scanUi() {
-  const on = scanMode() && HEW.main.side; $("scanrow").hidden = !on; $("scansel").hidden = !(on && SC.multi); $("imcrow").hidden = !(on && imcMode()); $("scanlab").textContent = imcMode() ? "IMC" : "Slide scan";
+  const on = scanMode() && HEW.main.side; $("scanrow").hidden = !on; $("scansel").hidden = !(on && SC.multi); $("imcrow").hidden = !(on && imcMode()); $("scanlab").textContent = imcMode() ? "IMC" : "H&E scan"; $("henalign").hidden = !on;
   $("scannote").hidden = !on; $("scannote").textContent = SC.idx ? `${SC.idx.source}: not aligned to the cells; pan and zoom here are independent of the cell view.${imcMode() ? " Pick the ROI of this tissue in the list." : ""}` : (imcMode() ? "loading the IMC ROI…" : "loading the scan…");
 }
 function scanInit() {
@@ -747,7 +760,7 @@ function heMainView(vs) {   // H&E -> main (linked)
   if (S.colors) { clearTimeout(S.vt); S.vt = setTimeout(() => deckgl.setProps({ layers: layers(S.colors) }), 120); }
 }
 function heSideLayout() {
-  const on = HEW.main.side; $("viewer").classList.toggle("he2", on);
+  const on = HEW.main.side; $("viewer").classList.toggle("he2", on); if (S.umOpen) umDockApply();
   if (on && !HEX.deck) {
     HEX.deck = new deck.Deck({
       parent: $("hewrap"), views: new deck.OrthographicView({ flipY: false }), initialViewState: S.viewState || { target: [0, 0, 0], zoom: 0 }, controller: { dragPan: true, scrollZoom: true, doubleClickZoom: true }, layers: [],
@@ -767,6 +780,7 @@ function hePtr(info, from) {   // mark the point under the cursor of one pane in
   if (x < 0 || y < 0 || x > el.clientWidth || y > el.clientHeight) return;
   mk2.style.left = x + "px"; mk2.style.top = y + "px"; mk2.hidden = false;
 }
+function refreshWindows() { for (const [k, id] of [["gal", "gallery"], ["rgn", "rgn"], ["glom", "glom"], ["gcmp", "glomcmp"], ["rnb", "rnb"], ["nbh", "nbh"], ["slide", "slide"]]) if ($(id) && !$(id).hidden && HE_RENDER[k]) HE_RENDER[k](); }   // redraw the open tile windows
 function render() {
   computeVisible();
   const colors = S.colors = computeColors();
@@ -875,7 +889,7 @@ function updateStats() {
   if (S.cats.path_region) { const m = S.cats.path_region, nl = catMeta("path_region").levels.length, out = new Array(nl).fill(0);
     for (const i of S.visIdx) { const v = m[i]; for (let b = 0; b < nl; b++) if ((v >> b) & 1) out[b]++; } S.counts.path_region = out; }
   const nsel = [...S.selected].filter((i) => S.vis[i]).length;
-  const rows = [["Cells in dataset", fmt(S.meta.n_cells)], ["Cells in this donor tissue", fmt(S.n)], ["Passing filters", fmt(S.visIdx.length)], ["Selected", fmt(nsel)]];
+  const rows = [["Cells in dataset", fmt(S.meta.n_cells)], ["Cells in this tissue", fmt(S.n)], ["Passing filters", fmt(S.visIdx.length)], ["Selected", fmt(nsel)]];
   const cur = S.meta.samples.find((x) => x.id === S.sample);
   if (cur && cur.tx_tissue_total != null) rows.splice(2, 0, ["Transcripts in this tissue", fmt(cur.tx_tissue_total)]);   // rows of the transcripts file that belong to this tissue (all qualities)
   if (cur && cur.tx_slide_total) rows.splice(cur && cur.tx_tissue_total != null ? 3 : 2, 0, ["Transcripts in this slide", fmt(cur.tx_slide_total)]);   // all rows of the slide's transcripts file (the run this tissue is from)
@@ -916,15 +930,18 @@ function legendEntries(mode, order) {
   for (const g of S.stateInfo.groups) { const m = g.levels.filter((i) => by.has(i)); if (m.length) { out.push({ head: g.name }); m.forEach((i) => out.push({ i, c: by.get(i) })); } }
   return out;
 }
-const legendRowHTML = (mode, e, hid) => e.head ? `<div class="ghead">${e.head}</div>`
-  : `<div class="opt ${hid.has(e.i) ? "off" : ""}" data-i="${e.i}" title="click: grey out/show · double-click: highlight only this"><span class="sw" style="background:${catColor(mode, e.i)}"></span><span class="l">${display(mode, e.i)}</span><span class="n">${fmt(e.c)}</span></div>`;
+// The Composition list repeats the Legend only when both show the same field over the same cells: no cell selected and none greyed out in the legend.
+const compIsLegend = () => S.compField === S.colorBy && S.colorInfo?.type === "cat" && !S.hiddenCats[S.colorBy]?.size && ![...S.selected].some((i) => S.vis[i]);
+const legendRowHTML = (mode, e, hid, total) => e.head ? `<div class="ghead">${e.head}</div>`
+  : `<div class="opt ${hid.has(e.i) ? "off" : ""}" data-i="${e.i}" title="click: grey out/show · double-click: highlight only this"><span class="sw" style="background:${catColor(mode, e.i)}"></span><span class="l">${display(mode, e.i)}</span><span class="n">${fmt(e.c)}${total ? ` · ${(100 * e.c / total).toFixed(1)}%` : ""}</span></div>`;
 function updateLegend() {
   const el = $("legend"), mode = S.colorBy, ci = S.colorInfo;
   $("legtitle").textContent = "— " + ({ __gene: "gene", __dual: "two genes", __sig: "signature", __sigdual: "two signatures" }[mode] || labelOf(mode));
   if (ci.type !== "cat") { el.innerHTML = scaleLegendHTML(ci); return; }
   const q = $("legsearch").value.toLowerCase(), counts = countsAll(mode), hid = S.hiddenCats[mode] || new Set();
   const order = counts.map((c, i) => [i, c]).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]);
-  el.innerHTML = legendEntries(mode, order.filter(([i]) => display(mode, i).toLowerCase().includes(q))).map((e) => legendRowHTML(mode, e, hid)).join("");
+  let total = 0; if (compIsLegend()) { const f = countsFor(mode); total = f.out.reduce((a, b) => a + b, 0) + f.miss; }
+  el.innerHTML = legendEntries(mode, order.filter(([i]) => display(mode, i).toLowerCase().includes(q))).map((e) => legendRowHTML(mode, e, hid, total)).join("");
   el.querySelectorAll(".opt").forEach((o) => {
     o.addEventListener("click", () => { const h = S.hiddenCats[mode] || (S.hiddenCats[mode] = new Set()); const i = +o.dataset.i; h.has(i) ? h.delete(i) : h.add(i); refresh(); });
     o.addEventListener("dblclick", () => { S.hiddenCats[mode] = new Set(order.map(([i]) => i).filter((i) => i !== +o.dataset.i)); refresh(); });
@@ -953,9 +970,15 @@ function initFloating(el, head, KEY) {
   if (saved.w) el.style.width = saved.w + "px"; if (saved.h) el.style.height = saved.h + "px";
   const place = (l, t) => { el.style.right = "auto"; el.style.bottom = "auto"; el.style.left = l + "px"; el.style.top = t + "px"; };   // switch from the CSS default corner to explicit left/top
   if (saved.l != null) place(saved.l, saved.t);
-  const save = () => { const r = el.getBoundingClientRect(), v = view.getBoundingClientRect(); localStorage.setItem(KEY, JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height), l: Math.round(r.left - v.left), t: Math.round(r.top - v.top) })); };
+  const save = () => { if (el.classList.contains("fmax")) return; const r = el.getBoundingClientRect(), v = view.getBoundingClientRect(); localStorage.setItem(KEY, JSON.stringify({ w: Math.round(r.width), h: Math.round(r.height), l: Math.round(r.left - v.left), t: Math.round(r.top - v.top) })); };
   let drag = null;
-  head.addEventListener("pointerdown", (e) => { if (e.target.closest("button, select, input, label")) return; const r = el.getBoundingClientRect(), v = view.getBoundingClientRect();
+  const mx = el.querySelector(".fmaxbtn");   // fill the view and back (the window's own size and place are kept for when it shrinks again)
+  if (mx) {
+    const set = (on) => { el.classList.toggle("fmax", on); mx.textContent = on ? "⤡" : "⤢"; mx.title = on ? "back to the window size (Esc)" : "fill the view (Esc: back to the window size)"; };
+    mx.addEventListener("click", () => set(!el.classList.contains("fmax")));
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape" && el.classList.contains("fmax") && !el.hidden) set(false); });
+  }
+  head.addEventListener("pointerdown", (e) => { if (e.target.closest("button, select, input, label") || el.dataset.dock || el.classList.contains("fmax")) return; const r = el.getBoundingClientRect(), v = view.getBoundingClientRect();
     drag = { dx: e.clientX - r.left, dy: e.clientY - r.top, v }; place(r.left - v.left, r.top - v.top); head.setPointerCapture(e.pointerId); });
   head.addEventListener("pointermove", (e) => { if (!drag) return;
     el.style.left = Math.max(0, Math.min(drag.v.width - 60, e.clientX - drag.dx - drag.v.left)) + "px"; el.style.top = Math.max(0, Math.min(drag.v.height - 36, e.clientY - drag.dy - drag.v.top)) + "px"; });
@@ -1005,7 +1028,7 @@ function initOvLegend() {
 }
 function countsAll(k) { // counts over the filtered population ignoring legend-hiding (so hidden items stay listed)
   const c = S.cats[k], n = catMeta(k).levels.length, out = new Array(n).fill(0); const keep = new Uint8Array(S.n).fill(1);
-  for (const [fk, set] of Object.entries(S.filters)) if (set.size && S.cats[fk]) { const mu = isMulti(fk), sm = mu ? selMask(set) : 0; for (let i = 0; i < S.n; i++) if (keep[i] && !(mu ? (S.cats[fk][i] & sm) !== 0 : set.has(S.cats[fk][i]))) keep[i] = 0; }
+  applyCatFilters(keep, S.n, selKeys(), (k) => S.cats[k]);
   S.exprFilters.forEach((e, q) => { const v = S.exprV[q]; if (v && v.length === S.n) for (let i = 0; i < S.n; i++) if (keep[i] && !exprPass(e, v[i])) keep[i] = 0; });
   for (let i = 0; i < S.n; i++) if (keep[i] && c[i] !== MISSING) out[c[i]]++;
   return out;
@@ -1015,10 +1038,16 @@ function updateComp() {
   const k = S.compField, sel = [...S.selected].filter((i) => S.vis[i]), subset = sel.length ? sel : null;
   const { out, miss } = countsFor(k, subset), tot = out.reduce((a, b) => a + b, 0) + miss;
   $("comphead").textContent = `Composition of ${subset ? "selected cells" : "filtered cells"} (n=${fmt(tot)})`;
+  const same = compIsLegend(), link = (txt, v) => `<a href="#" id="comptoggle" data-v="${v}">${txt}</a>`;
+  if (same && !S.compShow) {
+    $("comp").innerHTML = `<div class="small muted">The legend above lists these cells with their percentages.${miss ? ` ${fmt(miss)} cells have no annotation.` : ""} Descriptive only — no statistical test. ${link("Show bars", 1)}</div>`;
+    $("comptoggle").addEventListener("click", (e) => { e.preventDefault(); S.compShow = true; updateComp(); }); return;
+  }
   const order = out.map((c, i) => [i, c]).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).slice(0, 25), mx = order[0]?.[1] || 1;
   $("comp").innerHTML = order.map(([i, c]) => `<div class="bar" data-i="${i}" title="click to filter to this category"><span class="b" style="width:${Math.max(2, 120 * c / mx)}px;background:${catColor(k, i)}"></span>
     <span class="t">${display(k, i)}</span><span class="muted small">${fmt(c)} · ${(100 * c / tot).toFixed(1)}%</span></div>`).join("") +
-    (miss ? `<div class="small muted">${fmt(miss)} cells with missing annotation</div>` : "") + `<div class="small muted">% of ${subset ? "selected" : "filtered"} cells (denominator ${fmt(tot)}). Descriptive only — no statistical test.</div>`;
+    (miss ? `<div class="small muted">${fmt(miss)} cells with missing annotation</div>` : "") + `<div class="small muted">% of ${subset ? "selected" : "filtered"} cells (denominator ${fmt(tot)}). Descriptive only — no statistical test.${same ? " " + link("Hide bars", 0) : ""}</div>`;
+  if (same) $("comptoggle").addEventListener("click", (e) => { e.preventDefault(); S.compShow = false; updateComp(); });
   $("comp").querySelectorAll(".bar").forEach((b) => b.addEventListener("click", () => { S.filters[k] = new Set([+b.dataset.i]); refresh(); }));
 }
 
@@ -1040,14 +1069,15 @@ function updateLegNote() {
   const f = S.n - S.visIdx.length;
   $("legnote").textContent = f ? `${fmt(f)} cells are filtered out and shown in grey; ${fmt(S.visIdx.length)} highlighted.` : "";
 }
-function updateAll() { clearTimeout(S.gzT); S.gzT = setTimeout(refreshGlomZoom, 300); clearTimeout(S.ghT); S.ghT = setTimeout(() => { if (!$("ghet").hidden) renderGH(); }, 400); clearTimeout(S.umT); S.umT = setTimeout(() => updateUmap(), 120); renderGallery(); renderSlide(); renderGlom(); clearTimeout(S.rgT); S.rgT = setTimeout(renderRgn, 450); clearTimeout(S.gcT); S.gcT = setTimeout(renderGlomCmp, 600); clearTimeout(S.rnT); S.rnT = setTimeout(renderRnb, 500); clearTimeout(S.nbT); S.nbT = setTimeout(renderNbr, 400); clearTimeout(S.nbhT); S.nbhT = setTimeout(renderNbh, 450); render(); updateLegNote(); updateStats(); updateLegend(); updateOvLegend(); updateComp(); updateSelInfo(); updateCrumbs(); renderExprList(); [...ROLE_ORDER, "path_region"].filter((k) => S.meta.cats[k]).forEach(renderFilterOpts); }
+function updateAll() { agentStateSoon(); clearTimeout(S.gzT); S.gzT = setTimeout(refreshGlomZoom, 300); clearTimeout(S.ghT); S.ghT = setTimeout(() => { if (!$("ghet").hidden) renderGH(); }, 400); clearTimeout(S.umT); S.umT = setTimeout(() => updateUmap(), 120); renderGallery(); renderSlide(); renderGlom(); clearTimeout(S.rgT); S.rgT = setTimeout(renderRgn, 450); clearTimeout(S.gcT); S.gcT = setTimeout(renderGlomCmp, 600); clearTimeout(S.rnT); S.rnT = setTimeout(renderRnb, 500); clearTimeout(S.nbT); S.nbT = setTimeout(renderNbr, 400); clearTimeout(S.nbhT); S.nbhT = setTimeout(renderNbh, 450); render(); updateLegNote(); updateStats(); updateLegend(); updateOvLegend(); updateComp(); updateSelInfo(); updateCrumbs(); renderExprList(); [...ROLE_ORDER, "path_region"].filter((k) => S.meta.cats[k]).forEach(renderFilterOpts); }
 
 function syncTransformUI() {   // the main panel and the Glom heterogeneity window show the same gene / signature settings
   const set = (id, v) => { const e = $(id); if (e && e.value !== String(v)) e.value = v; }, sm = S.smooth ? S.smooth + " µm" : "off";
   set("smooth", S.smooth); $("smoothlab").textContent = sm; set("zscope", S.zscope); set("layer", S.layer); set("zregion", S.within);
   set("ghsm", S.smooth); $("ghsmlab").textContent = sm; set("ghzs", S.zscope); set("ghexl", S.layer); set("ghwi", S.within);
   const t = RG.level >= 0 ? `the region “${rgName()}” (Regions window)` : "the region chosen in the Regions window (none yet)";
-  $("zregionopt").textContent = t; $("ghwi").options[2].textContent = t;
+  for (const e of [$("zregion"), $("ghwi")]) { const o = e.querySelector("option[value=region]"); if (o) o.textContent = t; }
+  syncFolds();
 }
 async function refresh(fit = false) {
   loading(true); syncTransformUI();
@@ -1081,17 +1111,89 @@ async function loadSignature(sfx = "") {   // sfx "" = signature A, "2" = signat
   S["sigVec" + sfx] = vec; S["sigKey" + sfx] = key;
 }
 
-// ---------------------------------------------------------------- gallery: all tissues of a disease subtype
+// ---------------------------------------------------------------- gallery: all tissues, by group
 // Donors: a donor can have two tissue pieces (sample ids ending _fragment-1 / _fragment-2). Windows show the blinded donor id and count donors;
 // a piece of a two-piece donor is labelled "<donor> · fragment N" so the two tiles can be told apart.
 const donorOfId = (id) => S.meta.samples.find((s) => s.id === id)?.donor || String(id).replace(/_fragment[-_]?\d+$/, "");
 const dlabel = (id) => { const d = donorOfId(id), f = /_fragment[-_]?(\d+)$/.exec(String(id)); return f && S.meta.samples.filter((s) => s.donor === d).length > 1 ? `${d} · fragment ${f[1]}` : d; };
 const nDonors = (list) => new Set(list.map((s) => (typeof s === "string" ? donorOfId(s) : s.donor))).size;
 const donTxt = (n) => `${n} donor${n === 1 ? "" : "s"}`;
-const subtypeOf = (s) => (s.disease_subtype && s.disease_subtype !== "nan" ? s.disease_subtype : s.disease_type) || "unknown";
+// The groups donors are compared by (server: engine/groups.py): one column of the cell table, an optional reference group and the order of the groups.
+const NO_GROUP = "All donors", groupOf = (s) => s.group || NO_GROUP, hasGroups = () => !!S.meta.groups?.column;
+const groupName = () => (hasGroups() ? S.meta.groups.column.replace(/[._]+/g, " ") : "group"), groupTitle = () => { const n = groupName(); return n[0].toUpperCase() + n.slice(1); };
+const gTag = (s) => (s.group ? " · " + s.group : ""), runOf = (s) => s.run || "All tissues", shortLabel = (t, n = 9) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
 const GAL_BOX = 300;
-const SUB_ORDER = ["Control", "No LN", "Class I/II", "Class III", "Class V"];  // display order; any other subtype follows
-const sortedSubtypes = () => [...new Set(S.meta.samples.map(subtypeOf))].sort((a, b) => { const r = (t) => (SUB_ORDER.includes(t) ? SUB_ORDER.indexOf(t) : 99); return r(a) - r(b) || a.localeCompare(b); });
+const sortedGroups = () => { const o = S.meta.groups?.order || [], have = [...new Set(S.meta.samples.map(groupOf))]; return [...o.filter((t) => have.includes(t)), ...have.filter((t) => !o.includes(t)).sort()]; };
+const groupRank = (t) => { const i = sortedGroups().indexOf(t); return i < 0 ? 99 : i; };
+const scopeKeys = () => ["none", "sample", ...(hasGroups() ? ["group"] : []), "all", ...(S.meta.groups?.reference ? ["notref"] : [])];
+const scopeText = (k) => ({ none: "none (raw values)", sample: "within each donor", group: `within each ${groupName()}`, all: "across all tissues", notref: `against all tissues except ${S.meta.groups?.reference}` })[k];
+function fillOpts(sel, rows) { const v = sel.value; sel.replaceChildren(...rows.map(([k, t]) => Object.assign(document.createElement("option"), { value: k, textContent: t }))); if (rows.some(([k]) => k === v)) sel.value = v; }
+// Every menu that depends on the groups: z-score scopes, "show per", the tissue picker.
+function syncGroupOptions() {
+  const keys = scopeKeys();
+  for (const id of ["zscope", "xfscope", "ghzs"]) if ($(id)) fillOpts($(id), keys.map((k) => [k, scopeText(k)]));
+  fillOpts($("vioscope"), keys.filter((k) => k !== "group").map((k) => [k, k === "none" ? "no z-score" : "z-score " + scopeText(k)]));
+  if (!keys.includes(S.zscope)) S.zscope = "none"; if (!keys.includes(SIG.scope)) SIG.scope = "all"; if (!keys.includes(VIO.scope) || VIO.scope === "group") VIO.scope = "none";
+  if (!hasGroups()) VIO.unit = "sample";
+  const gc = $("ghcol"); let go = gc.querySelector("option[value=group]"); if (hasGroups()) { if (!go) { go = Object.assign(document.createElement("option"), { value: "group" }); gc.prepend(go); } go.textContent = groupTitle(); gc.value = "group"; } else { go?.remove(); if (gc.value === "group" || !gc.value) gc.value = "sample"; }
+  fillOpts($("nbgroup"), [...(hasGroups() ? [["group", groupName()]] : []), ["sample", "donor"]]);
+  fillOpts($("vionit"), [["sample", "donor"], ...(hasGroups() ? [["group", `${groupName()} (bars: mean of donors)`]] : [])]);
+  $("vionit").closest("label").hidden = !hasGroups(); $("vionit").value = VIO.unit; $("vioscope").value = VIO.scope; $("zscope").value = S.zscope;
+  const keep = $("sample").value; fillOpts($("sample"), S.meta.samples.map((x) => [x.id, `${dlabel(x.id)}${x.group ? " — " + x.group : ""} (${fmt(x.n)} cells)`])); if (keep) $("sample").value = keep;
+}
+// "Compute over": only the subsets this project has; the row goes when the whole tissue is the only choice.
+function fillWithin() {
+  const glom = !!S.meta.cats.glom_id, reg = rgnKeys().length > 0;
+  for (const id of ["zregion", "xfwithin", "ghwi"]) { const e = $(id); if (!e) continue; if (!glom) e.querySelector("option[value=glom]")?.remove(); if (!reg) e.querySelector("option[value=region]")?.remove(); if (e.options.length < 2) e.closest(".row, .xfrow, label").style.display = "none"; }
+  if ($("zregion").options.length > 1) $("exprinfo").dataset.tip += " “Compute over” limits both steps to a part of the tissue; cells outside it are drawn grey.";
+}
+// The toolbar and About menus: one open at a time; picking an item closes it.
+function bindMenus() {
+  const menus = [...document.querySelectorAll(".tbm")], close = () => menus.forEach((m) => { m.querySelector(".tbpop").hidden = true; m.querySelector(".tbbtn").classList.remove("on"); });
+  for (const m of menus) { const b = m.querySelector(".tbbtn"), p = m.querySelector(".tbpop");
+    b.addEventListener("click", (e) => { e.stopPropagation(); const open = p.hidden; close(); p.hidden = !open; b.classList.toggle("on", open); });
+    p.addEventListener("click", (e) => { if (e.target.closest("button")) close(); }, true);
+    if (![...p.querySelectorAll("button")].some((x) => !x.hidden && x.style.display !== "none") && m.id !== "aboutm") m.style.display = "none"; }
+  document.addEventListener("click", close); document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+}
+// Help text: the ⓘ marks show it on hover or keyboard focus; a click on one inside a fold heading does not open the fold.
+function bindInfo() {
+  const tip = document.createElement("div"); tip.id = "infotip"; tip.hidden = true; document.body.append(tip);
+  const show = (el) => { tip.textContent = el.dataset.tip; tip.hidden = false; const r = el.getBoundingClientRect(); tip.style.left = Math.max(6, Math.min(r.right + 6, innerWidth - tip.offsetWidth - 6)) + "px"; tip.style.top = Math.max(6, Math.min(r.top - 4, innerHeight - tip.offsetHeight - 6)) + "px"; };
+  const at = (e) => { const i = e.target.closest?.(".info"); if (i) show(i); else tip.hidden = true; };
+  document.addEventListener("pointerover", at); document.addEventListener("focusin", at); document.addEventListener("click", (e) => { if (e.target.closest?.(".info")) e.preventDefault(); });
+  $("dispfold").addEventListener("input", syncFolds); $("dispfold").addEventListener("change", syncFolds);
+}
+// What a closed fold is hiding: only the settings that differ from the defaults.
+function syncFolds() {
+  $("exprsum").textContent = [S.layer === "counts" ? "raw counts" : "", S.smooth ? `σ ${S.smooth} µm` : "", S.zscope !== "none" ? "z-score" : "", S.within !== "tissue" ? "part of tissue" : "", +$("clip").value !== 99.5 ? `clip p${$("clip").value}` : ""].filter(Boolean).join(", ");
+  $("dispsum").textContent = [$("shape").value !== "auto" ? $("shape").selectedOptions[0].text.split(" (")[0] : "", +$("psize").value !== 5 ? `${$("psize").value} µm` : "", $("olmain").checked ? "outlines" : "", $("greycells").checked ? "grey cells" : "", $("txon").checked ? "transcripts" : "", S.bgWhite ? "white background" : ""].filter(Boolean).join(", ");
+}
+function renderGroups() {
+  const g = S.meta.groups; $("groupsec").hidden = !g.options.length; if (!g.options.length) return;
+  $("groupsum").textContent = g.column ? g.column + (g.reference ? ` · vs ${g.reference}` : "") : "none";
+  fillOpts($("groupcol"), [["", "(no groups)"], ...g.options.map((o) => [o.column, `${o.column} (${o.levels.length})`])]); $("groupcol").value = g.column || "";
+  $("grouprefrow").hidden = $("groupmore").hidden = !g.column; if (!g.column) return;
+  fillOpts($("groupref"), [["", "(none)"], ...g.order.map((t) => [t, t])]); $("groupref").value = g.reference || "";
+  $("grouplist").replaceChildren(...g.order.map((t, i) => {
+    const row = document.createElement("div"); row.className = "grouprow"; const nm = document.createElement("span"); nm.textContent = t + (t === g.reference ? " (reference)" : ""); row.append(nm);
+    for (const [txt, d, off] of [["▲", -1, i === 0], ["▼", 1, i === g.order.length - 1]]) { const b = document.createElement("button"); b.type = "button"; b.className = "sm"; b.textContent = txt; b.disabled = off; b.title = d < 0 ? "move up" : "move down";
+      b.addEventListener("click", () => { const o = [...g.order]; [o[i], o[i + d]] = [o[i + d], o[i]]; setGroups({ column: g.column, reference: g.reference, order: o, ordered: g.ordered }); }); row.append(b); }
+    return row; }));
+  $("groupord").checked = g.ordered; $("groupordlab").hidden = g.order.length < 3;
+}
+async function setGroups(body) {
+  let d; try { d = await postJSON("/api/groups", body); } catch (e) { alert("Could not change the groups: " + e.message); renderGroups(); return; }
+  S.meta.groups = d.groups; for (const x of S.meta.samples) x.group = d.samples[x.id];
+  closeAllWindows(); SIG.locSub = ""; S.genes = {}; S.sigKey = S.sigKey2 = ""; GH.colCache = {};           // z-scores within a group depend on the groups
+  for (const k of Object.keys(sigVecCache)) delete sigVecCache[k]; for (const c of Object.values(galData)) c.ex = {};
+  syncGroupOptions(); renderGroups(); await refresh();
+}
+function bindGroups() {
+  $("groupcol").addEventListener("change", (e) => setGroups({ column: e.target.value || null, reference: "auto" }));
+  $("groupref").addEventListener("change", (e) => { const g = S.meta.groups, r = e.target.value || null; setGroups({ column: g.column, reference: r, order: g.ordered || !r ? g.order : [r, ...g.order.filter((t) => t !== r)], ordered: g.ordered }); });
+  $("groupord").addEventListener("change", (e) => { const g = S.meta.groups; setGroups({ column: g.column, reference: g.reference, order: g.order, ordered: e.target.checked }); });
+}
 const galData = {};  // sample -> { xy: Promise, cats: {key: Promise} } (per-sample arrays are cached for the session)
 function galGet(sample, key) {
   const c = galData[sample] || (galData[sample] = { cats: {} });
@@ -1117,7 +1219,7 @@ async function winBundle(sid) {
   const [xy, fc, codes, num, a, bv, ev] = await Promise.all([galGet(sid, "xy"), Promise.all(fkeys.map((k) => galGet(sid, k))), isCat ? galGet(sid, mode) : null,
     !isCat && S.meta.numeric[mode] ? galNum(sid, mode) : null, A.length ? galExpr(sid, A) : null, Bg.length ? galExpr(sid, Bg) : null, Promise.all(S.exprFilters.map((e) => galExpr(sid, e.genes, e)))]);
   const n = xy.length / 2, pass = new Uint8Array(n).fill(1);
-  fkeys.forEach((k, q) => { const set = S.filters[k], mu = isMulti(k), sm = mu ? selMask(set) : 0; for (let i = 0; i < n; i++) if (pass[i] && !(mu ? (fc[q][i] & sm) !== 0 : set.has(fc[q][i]))) pass[i] = 0; });
+  applyCatFilters(pass, n, fkeys, (k) => fc[fkeys.indexOf(k)]);
   S.exprFilters.forEach((e, q) => { for (let i = 0; i < n; i++) if (pass[i] && !exprPass(e, ev[q][i])) pass[i] = 0; });
   if (hid.size) for (let i = 0; i < n; i++) if (pass[i] && hid.has(codes[i])) pass[i] = 0;
   return { n, xy, pass, codes, num, A: a, B: bv, sample: sid };
@@ -1137,9 +1239,9 @@ function closeAllWindows() {
 }
 function openGallery() {
   closeAllWindows();
-  const subs = sortedSubtypes();
+  const subs = sortedGroups();
   $("galsub").innerHTML = `<option value="__all">All donors (${nDonors(S.meta.samples)})</option>` +
-    subs.map((t) => `<option value="${t}">${t} (${nDonors(S.meta.samples.filter((s) => subtypeOf(s) === t))})</option>`).join("");
+    (hasGroups() ? subs : []).map((t) => `<option value="${t}">${t} (${nDonors(S.meta.samples.filter((s) => groupOf(s) === t))})</option>`).join("");
   $("galsub").value = S.galSub && (S.galSub === "__all" || subs.includes(S.galSub)) ? S.galSub : "__all";
   $("gallery").hidden = false; renderGallery();
 }
@@ -1149,7 +1251,7 @@ async function renderGallery() {
   if ($("gallery").hidden) return;
   const tok = ++galToken, sub = $("galsub").value; S.galSub = sub;
   const sel = S.galSel || (S.galSel = new Set()), only = $("galonly").checked, box0 = +$("galsz").value;
-  const groups = sortedSubtypes().filter((t) => sub === "__all" || t === sub).map((t) => ({ t, samples: S.meta.samples.filter((s) => subtypeOf(s) === t && (!only || sel.has(s.id))) })).filter((g) => g.samples.length);
+  const groups = sortedGroups().filter((t) => sub === "__all" || t === sub).map((t) => ({ t, samples: S.meta.samples.filter((s) => groupOf(s) === t && (!only || sel.has(s.id))) })).filter((g) => g.samples.length);
   const samples = groups.flatMap((g) => g.samples);
   const nT = samples.length, box = box0 > 0 ? box0 : GAL_BOX;
   $("galsz").disabled = only; $("galgrid").classList.toggle("cmpgrid", only); if (!only) $("galgrid").removeAttribute("style");
@@ -1159,7 +1261,7 @@ async function renderGallery() {
   if (only && !samples.length) { $("galgrid").innerHTML = `<div class="muted">No ticked tissue${sub === "__all" ? "" : " in this group"}. Untick “only ticked” and tick the tissues to compare.</div>`; $("galleg").innerHTML = ""; return; }
   $("galgrid").innerHTML = groups.map((g) => (only ? "" : `<div class="galsec"><div class="sechead">${g.t} · ${donTxt(nDonors(g.samples))}</div><div class="secgrid">`) +
     g.samples.map((s) => `<div class="tile ${s.id === S.sample ? "cur" : ""}" data-id="${s.id}" title="Open ${dlabel(s.id)}"><input type="checkbox" class="gsel" title="tick to compare this tissue" ${sel.has(s.id) ? "checked" : ""}><span class="zb"></span><canvas width="${box}" height="60"></canvas>
-    <div class="cap" style="max-width:${box}px"><b>${dlabel(s.id)}</b><br><span class="muted">${fmt(s.n)} cells · ${s.disease_type} · ${subtypeOf(s)}</span></div></div>`).join("") + (only ? "" : `</div></div>`)).join("");
+    <div class="cap" style="max-width:${box}px"><b>${dlabel(s.id)}</b><br><span class="muted">${fmt(s.n)} cells${gTag(s)}</span></div></div>`).join("") + (only ? "" : `</div></div>`)).join("");
   $("galgrid").querySelectorAll(".tile").forEach((t) => {
     t.classList.toggle("sel", sel.has(t.dataset.id));
     t.addEventListener("click", async (e) => { if (only && e.target.closest("canvas")) return; $("sample").value = t.dataset.id; closeGallery(); await loadSample(t.dataset.id); });   // compare view: the picture is for zooming; click the caption to open the tissue
@@ -1185,18 +1287,18 @@ async function renderGallery() {
   }).catch((e) => console.error(e)));
 }
 // ---------------------------------------------------------------- slide: every tissue of one slide (run) at its true position, each in a labelled box
-// Tissues of a slide share one coordinate frame (the run's), so they are grouped by run (= disease subtype / run name in imported projects).
+// Tissues of a slide share one coordinate frame (the run's), so they are grouped by run.
 function tissueName(s, grp) {   // "<run>_T1" -> "T1": the slide name is dropped, the window is already one slide
   let n = String(s.id); if (n.startsWith(grp + "_")) return n.slice(grp.length + 1);
   const m = /(?:^|_)((?:T|S)\d+|tissue_\d+|small_piece_\d+)$/.exec(n); return m ? m[1] : n;
 }
 let slideTok = 0, slideObs = null;
-const slideGroups = () => [...new Set(S.meta.samples.map(subtypeOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+const slideGroups = () => [...new Set(S.meta.samples.map(runOf))].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 function openSlide() {
   closeAllWindows();
   const groups = slideGroups();
-  $("slidesel").innerHTML = `<option value="__all">All slides (${groups.length})</option>` + groups.map((g) => `<option value="${g}">${g} (${S.meta.samples.filter((s) => subtypeOf(s) === g).length} tissues)</option>`).join("");
-  const cur = S.meta.samples.find((s) => s.id === S.sample); $("slidesel").value = S.slideSel && (S.slideSel === "__all" || groups.includes(S.slideSel)) ? S.slideSel : cur ? subtypeOf(cur) : groups[0];
+  $("slidesel").innerHTML = `<option value="__all">All slides (${groups.length})</option>` + groups.map((g) => `<option value="${g}">${g} (${S.meta.samples.filter((s) => runOf(s) === g).length} tissues)</option>`).join("");
+  const cur = S.meta.samples.find((s) => s.id === S.sample); $("slidesel").value = S.slideSel && (S.slideSel === "__all" || groups.includes(S.slideSel)) ? S.slideSel : cur ? runOf(cur) : groups[0];
   $("slide").hidden = false; renderSlide();
 }
 const closeSlide = () => { $("slide").hidden = true; };
@@ -1209,14 +1311,14 @@ const SLIDE_TOP = 24, SLIDE_BOT = 24;   // strips above / below the tissues: lab
 function drawSlideInto(cv, g, samples, bs, sc, k, geom, dpr, ts = 1, opt = {}) {   // ts = text scale (exports draw at a high dpr, so their text is scaled down); opt = { imgs: draw the images ticked in Images, imgOnly: no cells (the pane beside), redo }
   const Wd = Math.round(geom.w * k), Hd = Math.round(geom.h * k) + SLIDE_TOP + SLIDE_BOT;
   cv.width = Math.round(Wd * dpr); cv.height = Math.round(Hd * dpr); cv.style.width = Wd + "px"; cv.style.height = Hd + "px";
-  const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, Wd, Hd);
+  const ctx = cv.getContext("2d"); ctx.scale(dpr, dpr); ctx.fillStyle = opt.bg || "#0f1218"; ctx.fillRect(0, 0, Wd, Hd);
   const X = (x) => (x - geom.x0 + geom.pad) * k, Y = (y) => (y - geom.y0 + geom.pad) * k + SLIDE_TOP, px = Math.max(1.2, 8 * k);
-  if (opt.imgs) for (const s of samples) drawHE(ctx, { sample: s.id, redo: opt.redo, w: "slide", side: !!opt.imgOnly }, X, Y, Wd, Hd, k);   // registered H&E / IF of every tissue, at its true place
+  if (opt.imgs) for (const s of samples) drawHE(ctx, { sample: s.id, redo: opt.redo, w: "slide", side: !!opt.imgOnly, miss: opt.miss }, X, Y, Wd, Hd, k);   // registered H&E / IF of every tissue, at its true place
   const cellsOn = !opt.imgOnly && hw("slide").cells; ctx.globalAlpha = hw("slide").a;
   if (cellsOn) for (const dim of [true, false]) bs.forEach((b) => {   // filtered-out cells first, coloured ones on top
     const groups = new Map();
     for (let i = 0; i < b.n; i++) {
-      const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : "rgba(105,110,122,0.45)";
+      const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : `rgba(105,110,122,${S.dimA})`;
       if (col.startsWith("rgba") !== dim) continue; (groups.get(col) || groups.set(col, []).get(col)).push(i);
     }
     for (const [col, list] of groups) { ctx.fillStyle = col; for (const i of list) ctx.fillRect(X(b.xy[i * 2]) - px / 2, Y(b.xy[i * 2 + 1]) - px / 2, px, px); }
@@ -1226,15 +1328,15 @@ function drawSlideInto(cv, g, samples, bs, sc, k, geom, dpr, ts = 1, opt = {}) {
   const hit = (r, but) => boxes.some((q) => q !== but && r.x < q.x + q.w && r.x + r.w > q.x && r.y < q.y + q.h && r.y + r.h > q.y);   // does rectangle r cover another tissue's box?
   ctx.textBaseline = "alphabetic";
   for (const q of boxes) {
-    const cur = q.id === S.sample; ctx.lineWidth = cur ? 2.5 : 1.5; ctx.strokeStyle = cur ? "#4c8dff" : "rgba(215,221,230,0.75)"; ctx.strokeRect(q.x, q.y, q.w, q.h);
+    const cur = !opt.fig && q.id === S.sample; ctx.lineWidth = cur ? 2.5 : 1.5; ctx.strokeStyle = cur ? "#4c8dff" : opt.light ? "rgba(40,44,52,0.6)" : "rgba(215,221,230,0.75)";   // opt.fig: a figure marks no current tissue ctx.strokeRect(q.x, q.y, q.w, q.h);
     const nm = tissueName(q.s, g), cnt = ` · ${fmt(q.s.n)} cells`, fs = 13 * ts; ctx.font = `600 ${fs}px ${FONT}`; const wn = ctx.measureText(nm).width; ctx.font = `${12 * ts}px ${FONT}`;
     const lw = wn + ctx.measureText(cnt).width, lx = Math.max(2, Math.min(q.x, Wd - lw - 4));   // slid left when it would run off the picture
     let ly = q.y - 5; const above = { x: lx, y: ly - fs, w: lw, h: fs + 3 };   // label above the box; below it when that would cover another tissue
     if (hit(above, q) || ly - fs < 0) { const below = { x: lx, y: q.y + q.h + 2, w: lw, h: fs + 3 }; if (!hit(below, q) && below.y + below.h <= Hd) ly = q.y + q.h + fs + 1; }
-    ctx.font = `600 ${fs}px ${FONT}`; ctx.fillStyle = cur ? "#8fb4ff" : "#e6ebf2"; ctx.fillText(nm, lx, ly); ctx.font = `${12 * ts}px ${FONT}`; ctx.fillStyle = "#8b95a5"; ctx.fillText(cnt, lx + wn, ly);
+    ctx.font = `600 ${fs}px ${FONT}`; ctx.fillStyle = cur ? "#8fb4ff" : opt.light ? "#111" : "#e6ebf2"; ctx.fillText(nm, lx, ly); ctx.font = `${12 * ts}px ${FONT}`; ctx.fillStyle = opt.light ? "#555" : "#8b95a5"; ctx.fillText(cnt, lx + wn, ly);
   }
   const target = 0.15 * Wd / k, p = 10 ** Math.floor(Math.log10(target)), nice = [1, 2, 5, 10].map((m) => m * p).reduce((a, c) => (Math.abs(c - target) < Math.abs(a - target) ? c : a));
-  ctx.fillStyle = "#fff"; ctx.fillRect(10, Hd - 14 * ts, nice * k, 3 * ts); ctx.font = `${12 * ts}px ${FONT}`; ctx.fillText(nice >= 1000 ? nice / 1000 + " mm" : nice + " µm", 10, Hd - 20 * ts);
+  if (!opt.fig) { ctx.fillStyle = "#fff"; ctx.fillRect(10, Hd - 14 * ts, nice * k, 3 * ts); ctx.font = `${12 * ts}px ${FONT}`; ctx.fillText(nice >= 1000 ? nice / 1000 + " mm" : nice + " µm", 10, Hd - 20 * ts); }
   return hits;
 }
 async function renderSlide() {
@@ -1243,7 +1345,7 @@ async function renderSlide() {
   $("slidecv").hidden = all; $("slideall").hidden = !all; $("slidecolsl").hidden = !all; $("slidecv2").hidden = true;
   if (HEW.slide.on || HEW.slide.side) await heReady();
   if (all) return renderSlideAll(tok);
-  const samples = S.meta.samples.filter((s) => subtypeOf(s) === g); if (!samples.length) return;
+  const samples = S.meta.samples.filter((s) => runOf(s) === g); if (!samples.length) return;
   const bp = samples.map((s) => winBundle(s.id)), sc = await winScale(bp, () => slideTok, tok).catch((e) => { console.error(e); return null; });
   if (!sc || tok !== slideTok) return;
   const bs = await Promise.all(bp); if (tok !== slideTok) return;
@@ -1253,6 +1355,7 @@ async function renderSlide() {
   const geom = slideGeom(samples), win = $("slide"), cv = $("slidecv"), cv2 = $("slidecv2"), side = HEW.slide.side;
   const Wc = Math.max(300, win.clientWidth - 30 - (side ? 8 : 0)) / (side ? 2 : 1), availH = Math.max(300, win.clientHeight - (cv.getBoundingClientRect().top - win.getBoundingClientRect().top + win.scrollTop) - 16);
   const k = Math.min(Wc / geom.w, (availH - SLIDE_TOP - SLIDE_BOT) / geom.h), dpr = window.devicePixelRatio || 1, he = { imgs: HEW.slide.on, redo: slideHeRedo };
+  S.ctxs.slideFig = { g, samples, bs, sc };
   cv._hits = drawSlideInto(cv, g, samples, bs, sc, k, geom, dpr, 1, he);
   cv2.hidden = !side;
   if (side) cv2._hits = drawSlideInto(cv2, g, samples, bs, sc, k, geom, dpr, 1, { imgs: true, imgOnly: true, redo: slideHeRedo });   // the same slide again: the ticked images, no cells; a click opens a tissue in either view
@@ -1260,7 +1363,7 @@ async function renderSlide() {
 let slideHeT = 0; const slideHeRedo = () => { clearTimeout(slideHeT); slideHeT = setTimeout(renderSlide, 160); };   // an image tile arrived
 // All slides: one scrolling page, common scale (same µm per pixel everywhere) and one colour scale over every tissue. Each slide is drawn when it scrolls into view.
 async function renderSlideAll(tok) {
-  const groups = slideGroups(), bySlide = groups.map((g) => ({ g, samples: S.meta.samples.filter((s) => subtypeOf(s) === g) })), cols = +$("slidecols").value, win = $("slide"), gap = 14;
+  const groups = slideGroups(), bySlide = groups.map((g) => ({ g, samples: S.meta.samples.filter((s) => runOf(s) === g) })), cols = +$("slidecols").value, win = $("slide"), gap = 14;
   const colW = Math.max(250, Math.floor((win.clientWidth - 30 - gap * (cols - 1)) / cols)), geoms = bySlide.map((o) => slideGeom(o.samples)), k = colW / Math.max(...geoms.map((q) => q.w));
   const cache = new Map(), getB = (id) => cache.get(id) || (cache.set(id, winBundle(id)), cache.get(id)), N = S.meta.samples.length;
   let sc;
@@ -1434,16 +1537,17 @@ const IMC_K = {
 function imcBtns() { const l = chLabel("IMC", IMC.chans, IMC.sel); document.querySelectorAll(".imcbtn").forEach((b) => { b.textContent = l.text; b.title = l.title; }); }
 const imcMenu = (btn) => chanMenu(btn, IMC_K);
 const IF_K = {
-  id: "ifmenu", btnSel: "#ifch", max: 0, note: "each channel is shown from 0 to its default limit; the slider changes its brightness (shared by every window)",
+  id: "ifmenu", btnSel: "#ifch, .ifchbtn", max: 0, note: "each channel is shown from 0 to its default limit; the slider changes its brightness (shared by every window)",
   chans: () => Object.values(IFS.idx)[0] || [], sel: IFS.sel, cfg: ifCfg, color: (i) => ifCfg(i).color, gamma: { get: () => IFS.g, set: (v) => (IFS.g = v) },
   tick: (i, on) => { on ? IFS.sel.add(i) : IFS.sel.delete(i); IFS.auto = true; ifApply(); return true; }, changed: () => { ifRerender(); ifBtn(); },
   groups: (chans) => [["Channels", chans.map((c, i) => [c, i])]],
 };
-function ifBtn() { const b = $("ifch"); if (!b) return; const l = chLabel("IF", IF_K.chans(), IFS.sel); b.textContent = l.text; b.title = l.title; }
+function ifBtn() { const l = chLabel("IF", IF_K.chans(), IFS.sel); document.querySelectorAll("#ifch, .ifchbtn").forEach((b) => { b.textContent = l.text; b.title = l.title; }); }
 async function imcInit() {
   await imcLoad();
   $("imcch").addEventListener("click", (e) => imcMenu(e.currentTarget));
   $("ifch").addEventListener("click", (e) => chanMenu(e.currentTarget, IF_K));
+  document.addEventListener("click", (e) => { const b = e.target.closest(".ifchbtn"); if (b) chanMenu(b, IF_K); });
   document.addEventListener("click", (e) => { const b = e.target.closest(".imcbtn"); if (b && b.id !== "imcch") imcMenu(b); });
 }
 async function imcAdd() {
@@ -1453,7 +1557,7 @@ async function imcAdd() {
   IMC.status = { state: "converting", progress: 0, msg: "starting" }; imcStatusUi(); clearTimeout(IMC.poll); IMC.poll = setTimeout(imcLoad, 1500);
 }
 // Display state, one per window that draws cells: H&E underlay, opacity of the cells over it, and cell outlines instead of filled cells.
-// main = the main viewer; gal / rgn = Gallery / Regions; glom = Glomeruli; gcmp = Compare glomeruli; nbh = Neighborhoods; gh = Glom heterogeneity detail; gz = glom zoom popup; sig = Signature maps (no outlines there).
+// main = the main viewer; gal / rgn = Gallery / Regions; glom = Glomeruli; gcmp = Compare glomeruli; nbh = Neighbourhoods; gh = Glom heterogeneity detail; gz = glom zoom popup; sig = Signature maps (no outlines there).
 const HEW = {}; ["main", "gal", "rgn", "glom", "gcmp", "nbh", "gh", "gz", "sig", "rnb", "slide"].forEach((k) => (HEW[k] = { on: false, imgs: new Set(), sides: new Set(), a: 1, touched: false, outl: false, side: false, link: true, cells: true }));   // cells = draw the Xenium cells (off: H&E and outlines only));
 const hw = (w) => HEW[w || "main"];
 const heOpt = (w) => ({ on: hw(w).on, a: hw(w).a });   // a = opacity of the cells (filled: the fill; outlines: the lines)
@@ -1472,7 +1576,7 @@ function openTab(path, ev) {
   if (ev) return true;                      // a plain link: the browser follows it
   window.open(path, "_blank"); return false;
 }
-const IMG_NAMES = { he: "H&E", if: "IF", scan: "Slide scan (not aligned)", imc: "IMC (not aligned)" };
+const IMG_NAMES = { he: "H&E (aligned)", if: "IF (aligned)", scan: "H&E scan (not aligned)", imc: "IMC (not aligned)" }, IMG_SHORT = { he: "H&E", if: "IF", scan: "H&E scan", imc: "IMC" };
 const BESIDE_ONLY = ["scan", "imc"];   // not in the cells' frame: only the pane beside them
 const IMC_WINDOWS = ["main", ...HE_SIDE];   // windows with a pane beside the cells that can show an IMC ROI
 const heImgsHTML = (w) => `<button type="button" class="heimgsbtn" data-w="${w}" title="which images this window shows: under the cells (overlay) and / or in a pane beside them">Images ▾</button>`;
@@ -1481,7 +1585,7 @@ function heMenu(btn) {   // one menu for every window: ticks = that window's ima
   let m = $("heimgsmenu");
   if (!m) {
     m = document.createElement("div"); m.id = "heimgsmenu"; m.hidden = true;
-    m.innerHTML = `<div class="imgrow imghead"><span></span><span>Under</span><span>Beside</span></div>` + Object.entries(IMG_NAMES).map(([k, n]) => `<div class="imgrow"><span>${n} <span class="muted small" data-none="${k}"></span></span><input type="checkbox" data-img="${k}" data-mode="under" title="draw it under the cells"><input type="checkbox" data-img="${k}" data-mode="side" title="show it in the pane beside the cells"></div>`).join("") + `<div id="imcadd" class="imcadd" hidden><input id="imcpath" placeholder="IMC file (.mcd) to add" title="an .mcd file of this slide; it is converted once into the cache (a few minutes for 20 GB) and never changed"><button type="button" id="imcaddbtn">Add</button></div><div id="imcstat" class="muted small"></div>`;
+    m.innerHTML = `<div class="imgrow imghead"><span></span><span>Under</span><span>Beside</span></div>` + Object.entries(IMG_NAMES).map(([k, n]) => `<div class="imgrow"><span>${n} <span class="muted small" data-none="${k}"></span></span><input type="checkbox" data-img="${k}" data-mode="under" title="draw it under the cells"><input type="checkbox" data-img="${k}" data-mode="side" title="show it in the pane beside the cells"></div>`).join("") + `<div id="imgchs"><button type="button" class="ifchbtn" hidden></button><button type="button" class="imcbtn" id="imcchmenu" hidden></button></div><div id="imcadd" class="imcadd" hidden><input id="imcpath" placeholder="IMC file (.mcd) to add" title="an .mcd file of this slide; it is converted once into the cache (a few minutes for 20 GB) and never changed"><button type="button" id="imcaddbtn">Add</button></div><div id="imcstat" class="muted small"></div>`;
     document.body.appendChild(m);
     m.querySelector("#imcaddbtn").addEventListener("click", imcAdd);
     m.addEventListener("change", (e) => { const i = e.target.closest("input[data-img]"); if (i && m._w) heSet(m._w, "img", { src: i.dataset.img, on: i.checked, side: i.dataset.mode === "side" }); });
@@ -1489,14 +1593,14 @@ function heMenu(btn) {   // one menu for every window: ticks = that window's ima
   }
   if (!m.hidden && m._w === btn.dataset.w) { m.hidden = true; return; }
   m._w = btn.dataset.w; const av = heAvail(), st = hw(m._w);
-  m.querySelectorAll("input[data-img]").forEach((i) => { const k = i.dataset.img, bo = BESIDE_ONLY.includes(k), ok = k === "scan" ? m._w === "main" : k === "imc" ? IMC_WINDOWS.includes(m._w) : true; i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(k); i.disabled = !av[k] || !ok || (bo && i.dataset.mode === "under"); i.style.visibility = bo && i.dataset.mode === "under" ? "hidden" : ""; });
-  imcStatusUi();
-  m.querySelectorAll("[data-none]").forEach((e) => (e.textContent = !av[e.dataset.none] ? (e.dataset.none === "imc" ? "(none added yet)" : "(none in this project)") : (e.dataset.none === "scan" && m._w !== "main" ? "(main view only)" : e.dataset.none === "imc" && !IMC_WINDOWS.includes(m._w) ? "(not in this window)" : "")));
+  m.querySelectorAll("input[data-img]").forEach((i) => { const k = i.dataset.img, bo = BESIDE_ONLY.includes(k), ok = k === "scan" ? m._w === "main" : k === "imc" ? IMC_WINDOWS.includes(m._w) : true; i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(k); i.disabled = !av[k] || !ok || (bo && i.dataset.mode === "under"); i.style.visibility = bo && i.dataset.mode === "under" ? "hidden" : ""; i.closest(".imgrow").style.display = k === "imc" || av[k] || (k === "if" && S.meta.if_missing) ? "" : "none"; });
+  imcStatusUi(); ifBtn(); imcBtns(); m.querySelector(".ifchbtn").hidden = !av.if; $("imcchmenu").hidden = !av.imc;
+  m.querySelectorAll("[data-none]").forEach((e) => (e.textContent = !av[e.dataset.none] ? (e.dataset.none === "imc" ? "(none added yet)" : e.dataset.none === "if" && S.meta.if_missing ? "(file not found: it may have moved)" : "(none in this project)") : (e.dataset.none === "scan" && m._w !== "main" ? "(main view only)" : e.dataset.none === "imc" && !IMC_WINDOWS.includes(m._w) ? "(not in this window)" : "")));
   const r = btn.getBoundingClientRect(); m.style.left = Math.min(r.left, innerWidth - 190) + "px"; m.style.top = r.bottom + 2 + "px"; m.hidden = false;
 }
 function heCtlHTML(w) {   // the H&E controls placed in each window's header
-  if (w === "slide") return `<span class="hectl" title="this window only: images of the tissues of the slide, under the cells and / or in a second view beside them"><label title="draw the Xenium cells (untick to see the images alone)"><input type="checkbox" data-he="cells" data-hew="slide" checked> Xenium</label> ${heImgsHTML("slide")} <label class="small heop" data-heop="slide" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="slide" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label></span>`;
-  return `<span class="hectl" title="this window only: overlay the images ticked in Images (H&amp;E, IF) under the cells${w === "sig" ? "" : "; outlines draws cell boundaries unfilled"}"><label title="draw the Xenium cells (untick to see the images and outlines alone)"><input type="checkbox" data-he="cells" data-hew="${w}" checked> Xenium</label> ${heImgsHTML(w)}<button type="button" class="imcbtn" data-w="${w}" hidden title="choose the IMC channels (shared by every window)">IMC channels ▾</button> <label class="small heop" data-heop="${w}" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="${w}" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label>${w === "sig" ? "" : ` <label><input type="checkbox" data-he="outl" data-hew="${w}"> outlines</label>`}${HE_SIDE.includes(w) ? ` <span class="ptwin" data-ptw="${w}" hidden title="arrows you place on the tissue: the same arrow appears in the cells and in the image beside them"><button type="button" class="ptwbtn" data-act="tool" data-w="${w}">Pointer</button><button type="button" class="ptwbtn" data-act="undo" data-w="${w}">Undo</button><button type="button" class="ptwbtn" data-act="clear" data-w="${w}" title="remove the arrows of all tissues">Clear</button></span> <label class="small" data-hlink="${w}" hidden title="zoom and pan the images and the cells together"><input type="checkbox" data-he="link" data-hew="${w}" checked> link zoom</label>` : ""}</span>`;
+  if (w === "slide") return `<span class="hectl" title="this window only: images of the tissues of the slide, under the cells and / or in a second view beside them"><label title="draw the cells (untick to see the images alone)"><input type="checkbox" data-he="cells" data-hew="slide" checked> Cells</label> ${heImgsHTML("slide")} <label class="small heop" data-heop="slide" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="slide" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label></span>`;
+  return `<span class="hectl" title="this window only: overlay the images ticked in Images (H&amp;E, IF) under the cells${w === "sig" ? "" : "; outlines draws cell boundaries unfilled"}"><label title="draw the cells (untick to see the images and outlines alone)"><input type="checkbox" data-he="cells" data-hew="${w}" checked> Cells</label> ${heImgsHTML(w)}<button type="button" class="imcbtn" data-w="${w}" hidden title="choose the IMC channels (shared by every window)">IMC channels ▾</button> <label class="small heop" data-heop="${w}" title="how solid the cells are (0 = see-through, 100 = solid): the fill, or the lines when outlines is ticked. Cells start at 55 once an image is under them, else at 100">cell opacity <input type="range" data-he="a" data-hew="${w}" min="0" max="100" value="55" style="width:70px;vertical-align:middle"></label>${w === "sig" ? "" : ` <label><input type="checkbox" data-he="outl" data-hew="${w}"> outlines</label>`}${HE_SIDE.includes(w) ? ` <span class="ptwin" data-ptw="${w}" hidden title="arrows you place on the tissue: the same arrow appears in the cells and in the image beside them"><button type="button" class="ptwbtn" data-act="tool" data-w="${w}">Pointer</button><button type="button" class="ptwbtn" data-act="undo" data-w="${w}">Undo</button><button type="button" class="ptwbtn" data-act="clear" data-w="${w}" title="remove the arrows of all tissues">Clear</button></span> <label class="small" data-hlink="${w}" hidden title="zoom and pan the images and the cells together"><input type="checkbox" data-he="link" data-hew="${w}" checked> link zoom</label>` : ""}</span>`;
 }
 function heSync(w) {   // show window w's settings in its controls
   const st = hw(w);
@@ -1505,7 +1609,7 @@ function heSync(w) {   // show window w's settings in its controls
   document.querySelectorAll(`.imcbtn[data-w="${w}"]`).forEach((b) => { if (b.id !== "imcch") b.hidden = !imcSide(w); });
 
   document.querySelectorAll(`[data-ptw="${w}"]`).forEach((e) => (e.hidden = !ptAllowedFor(w)));
-  const names = [...new Set([...st.imgs, ...st.sides])].sort().map((k) => (k === "scan" ? "scan" : k === "imc" ? "IMC" : IMG_NAMES[k]));      // "he" before "if"
+  const names = [...new Set([...st.imgs, ...st.sides])].sort().map((k) => IMG_SHORT[k]);      // "he" before "if"
   document.querySelectorAll(`.heimgsbtn[data-w="${w}"]`).forEach((b) => { b.textContent = names.length ? `Images: ${names.join(" + ")} ▾` : "Images ▾"; b.classList.toggle("on", names.length > 0); });
   if ($("heimgsmenu") && $("heimgsmenu")._w === w && !$("heimgsmenu").hidden) $("heimgsmenu").querySelectorAll("input[data-img]").forEach((i) => (i.checked = (i.dataset.mode === "side" ? st.sides : st.imgs).has(i.dataset.img)));
   if (w === "main" && $("scanrow")) { scanUi(); ptUi(); if (HEX.deck) ptDraw(); }
@@ -1524,9 +1628,10 @@ async function heSet(w, key, val) {
   }
   else { st[key] = key === "a" ? val / 100 : val; if (key === "a") st.touched = true; }
   if (key === "img" && !val.side && !st.touched) st.a = st.imgs.size ? 0.55 : 1;   // cells start see-through once an image is under them (until the slider is moved)
+  if (w === "main" && key === "img" && !val.side && !S.opTouched) { S.opacity = st.imgs.size ? 0.55 : 0.9; $("opacity").value = S.opacity; }
   heSync(w);
   if (w === "main" && key === "outl") for (const k of Object.keys(HEW)) if (k !== "main" && k !== "sig") { HEW[k].outl = val; heSync(k); HE_T[k] && clearTimeout(HE_T[k]); HE_T[k] = setTimeout(() => HE_RENDER[k] && HE_RENDER[k](), 0); }   // the main view's Outlines setting carries over to the windows; each window can still be changed on its own afterwards
-  const none = (HEW.main.on || HEW.main.side) && !scanMode() && !(HE.data && HE.data[S.sample]); document.querySelectorAll(".henote").forEach((e) => (e.textContent = none ? (S.meta && S.meta.has_he_slide ? "the slide H&E is not aligned to the cells yet: use the toolbar “H&E slide”" : "none for this tissue") : ""));
+  const none = (HEW.main.on || HEW.main.side) && !scanMode() && !(HE.data && HE.data[S.sample]); document.querySelectorAll(".henote").forEach((e) => (e.textContent = none ? (S.meta && S.meta.has_he_slide ? "the H&E scan is not aligned to the cells yet: use View → H&E scan" : "none for this tissue") : ""));
   HE_T[w] && clearTimeout(HE_T[w]); HE_T[w] = setTimeout(() => HE_RENDER[w] && HE_RENDER[w](), key === "a" ? 150 : 0);
 }
 const HE_T = {};
@@ -1547,6 +1652,7 @@ function hePane(t, cv, w, sample) {   // idempotent: windows whose canvas persis
   const pair = document.createElement("div"); pair.className = "hepair"; cv.replaceWith(pair);
   const cv2 = document.createElement("canvas"), m1 = document.createElement("i"), m2 = document.createElement("i"); cv2._heOnly = true; cv2._hw = w; cv2.className = cv.className; cv2.title = "H&E (no cells)";
   m1.className = m2.className = "hept"; m1.hidden = m2.hidden = true; pair.append(cv, cv2, m1, m2); t._he2 = cv2; t._hw = w;
+  if (imcSide(w)) { const na = document.createElement("span"); na.className = "nalign"; na.textContent = "IMC not aligned"; pair.append(na); }
   const bind = (src, dst, m) => {
     src.addEventListener("pointermove", (e) => {
       if (!src._xf || !dst._xf) return; const r = src.getBoundingClientRect(), x = ((e.clientX - r.left) * src.width / r.width - src._xf.ox) / src._xf.s, y = ((e.clientY - r.top) * src.height / r.height - src._xf.oy) / src._xf.s;
@@ -1648,7 +1754,7 @@ function drawTile(cv, s, b, sc, box = GAL_BOX, view = null, cache = null, dims =
   cv.width = dims ? dims.W : Math.max(40, Math.ceil(w * k) + 8); cv.height = dims ? dims.H : Math.max(40, Math.ceil(h * k) + 8);
   const ctx = cv.getContext("2d"), n = b.n, z = view ? view.z : 1, W = cv.width, H = cv.height, kz = k * z;
   const cx = s.x[0] + (view ? view.rx : 0.5) * w, cy = s.y[0] + (view ? view.ry : 0.5) * h, px = (n > 30000 ? 1.4 : 2) * Math.min(z, 5) * q;
-  ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = cv._bg || bgCol(); ctx.fillRect(0, 0, W, H);
   const X = (x) => W / 2 + (x - cx) * kz, Y = (y) => H / 2 + (y - cy) * kz;
   cv._xf = { s: kz, ox: W / 2 - cx * kz, oy: H / 2 - cy * kz };
   if (he) drawHE(ctx, { ...(he.w ? he : { ...he, w: w8 }), side: !!cv._heOnly }, X, Y, W, H, kz);
@@ -1658,7 +1764,7 @@ function drawTile(cv, s, b, sc, box = GAL_BOX, view = null, cache = null, dims =
   if (!order) {
     const groups = new Map();  // colour -> cells (fewer fillStyle switches)
     for (let i = 0; i < n; i++) {
-      const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : "rgba(105,110,122,0.45)";
+      const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : `rgba(105,110,122,${S.dimA})`;
       (groups.get(col) || groups.set(col, []).get(col)).push(i);
     }
     order = [...groups.entries()].sort((p, q) => (p[0].startsWith("rgba") ? -1 : 0) - (q[0].startsWith("rgba") ? -1 : 0));  // grey first
@@ -1721,8 +1827,8 @@ function galPoly(sample) {
 }
 function openGlom() {
   closeAllWindows();
-  const subs = sortedSubtypes();
-  $("glomscope").innerHTML = `<option value="cur">This donor (${dlabel(S.sample)})</option><option value="all">All donors</option>` + subs.map((t) => `<option value="sub:${t}">Disease subtype: ${t}</option>`).join("");
+  const subs = sortedGroups();
+  $("glomscope").innerHTML = `<option value="cur">This tissue (${dlabel(S.sample)})</option><option value="all">All donors</option>` + (hasGroups() ? subs : []).map((t) => `<option value="sub:${t}">${groupTitle()}: ${t}</option>`).join("");
   if (!$("glom").dataset.init) { $("glomscope").value = "cur"; $("glom").dataset.init = "1"; } else $("glomscope").value = S.glomScope || "cur";
   $("glom").hidden = false; renderGlom();
 }
@@ -1733,9 +1839,9 @@ async function renderGlom() {
   const tok = ++glomToken, scope = $("glomscope").value, qcSel = $("glomqc").value; S.glomScope = scope;
   const only = $("glomonly").checked; $("glomn").textContent = S.glomSel.size; $("glomscope").disabled = $("glomqc").disabled = only; $("glomzoomctl").hidden = !only; $("glomgrid").classList.toggle("cmpgrid", only); if (!only) $("glomgrid").removeAttribute("style");
   if (only) return renderGlomOnly(tok);
-  const rank = (t) => sortedSubtypes().indexOf(t);
-  const samples = S.meta.samples.filter((s) => scope === "all" || (scope === "cur" ? s.id === S.sample : subtypeOf(s) === scope.slice(4)))
-    .sort((x, y) => rank(subtypeOf(x)) - rank(subtypeOf(y)));  // stable: keeps sample order within a subtype
+  const rank = (t) => sortedGroups().indexOf(t);
+  const samples = S.meta.samples.filter((s) => scope === "all" || (scope === "cur" ? s.id === S.sample : groupOf(s) === scope.slice(4)))
+    .sort((x, y) => rank(groupOf(x)) - rank(groupOf(y)));  // stable: keeps sample order within a group
   const totals = { passed: 0, failed: 0, drawn: 0 }, qcLv = catMeta("glom_quality").levels, gidLv = catMeta("glom_id").levels;
   const info = (done) => { $("glominfo").textContent = `${totals.passed + totals.failed} glomeruli (${totals.passed} passed qc, ${totals.failed} failed qc) · outline = pathologist boundary, passed-qc gloms only (drawn for ${totals.drawn}) · colour: ${colorName()}${winNote()}${done ? "" : " · loading…"} · click one to open it`; };
   $("glomgrid").innerHTML = samples.map((s) => `<div class="glomsec" data-s="${s.id}" hidden><div class="sechead"></div><div class="secgrid"></div></div>`).join("");
@@ -1757,12 +1863,12 @@ async function renderGlom() {
         .sort((x, y) => +gidLv[x.g].match(/#(\d+)/)[1] - +gidLv[y.g].match(/#(\d+)/)[1]);
       const sec = $("glomgrid").querySelector(`.glomsec[data-s="${CSS.escape(s.id)}"]`); if (!sec || !rows.length) return;
       sec.hidden = false;
-      sec.querySelector(".sechead").textContent = `${dlabel(s.id)} · ${s.disease_type} · ${subtypeOf(s)} · ${rows.length} glomeruli`;
+      sec.querySelector(".sechead").textContent = `${dlabel(s.id)}${gTag(s)} · ${rows.length} glomeruli`;
       const grid = sec.querySelector(".secgrid");
       for (const r of rows) {
         r.qc === "passed qc" ? totals.passed++ : totals.failed++;
         const t = document.createElement("div"), gkey = `${s.id}|${gidLv[r.g]}`; t.className = "gtile" + (S.glomSel.has(gkey) ? " sel" : ""); t.dataset.key = gkey; t.title = `${gidLv[r.g]} — click to zoom; tick the box to compare`;
-        t.innerHTML = `<input type="checkbox" class="gsel" title="tick to compare this glom" ${S.glomSel.has(gkey) ? "checked" : ""}><canvas width="328" height="328"></canvas><div class="gid">${gidLv[r.g]}</div><div class="gm">${subtypeOf(s)}</div><div class="gm"><span class="chip ${r.qc === "passed qc" ? "pass" : "fail"}">${r.qc === "passed qc" ? "✓" : "✕"} ${r.qc}</span>${fmt(r.cells.length)} cells</div>`;
+        t.innerHTML = `<input type="checkbox" class="gsel" title="tick to compare this glom" ${S.glomSel.has(gkey) ? "checked" : ""}><canvas width="328" height="328"></canvas><div class="gid">${gidLv[r.g]}</div><div class="gm">${s.group || ""}</div><div class="gm"><span class="chip ${r.qc === "passed qc" ? "pass" : "fail"}">${r.qc === "passed qc" ? "✓" : "✕"} ${r.qc}</span>${fmt(r.cells.length)} cells</div>`;
         const outline = r.qc === "passed qc" ? glomOutline(feats, gidLv[r.g]) : null; totals.drawn += outline ? 1 : 0;   // boundary only for gloms that passed qc
         t.addEventListener("click", () => openGlomZoom({ src: "glom", s, b, sc, poly, cells: r.cells, label: gidLv[r.g], qc: r.qc, outline, note: outline ? "outline = pathologist \"All gloms\" boundary" : undefined }));
         const cb = t.querySelector(".gsel"); cb.addEventListener("click", (e) => e.stopPropagation());
@@ -1795,10 +1901,11 @@ async function renderGlomOnly(tok) {
     }
   }));
   if (tok !== glomToken) return; items.sort((x, y) => order.indexOf(x.gkey) - order.indexOf(y.gkey));
+  S.ctxs.glomOnly = { sc, items };
   $("glomleg").innerHTML = sc.info.type === "cat" ? "" : scaleLegendHTML(sc.info);
   $("glominfo").textContent = `${items.length} ticked glomeruli · colour: ${colorName()}${winNote()} · window split per glom · wheel = zoom, drag = pan, double-click = reset, click a name to open the glom`;
   grid.innerHTML = items.map((r) => `<div class="gtile sel" data-id="${r.gkey}" data-key="${r.gkey}"><input type="checkbox" class="gsel" title="untick to remove from this view" checked><span class="zb"></span><canvas width="300" height="300"></canvas>
-    <div class="cap"><b class="gid">${r.label}</b><div class="gm"><span class="chip ${r.qc === "passed qc" ? "pass" : "fail"}">${r.qc === "passed qc" ? "✓" : "✕"} ${r.qc}</span>${dlabel(r.s.id)} · ${subtypeOf(r.s)} · ${fmt(r.cells.length)} cells</div></div></div>`).join("");
+    <div class="cap"><b class="gid">${r.label}</b><div class="gm"><span class="chip ${r.qc === "passed qc" ? "pass" : "fail"}">${r.qc === "passed qc" ? "✓" : "✕"} ${r.qc}</span>${dlabel(r.s.id)}${gTag(r.s)} · ${fmt(r.cells.length)} cells</div></div></div>`).join("");
   const dims = cmpLayout("glom", "glomgrid", Math.max(1, items.length), 70);
   items.forEach((r) => {
     const t = grid.querySelector(`.gtile[data-id="${CSS.escape(r.gkey)}"]`), cv = t.querySelector("canvas"), B = glomBox(r.cells, r.poly, 12, r.outline); cv._hw = "glom";
@@ -1824,14 +1931,14 @@ function drawGlom(cv, b, sc, poly, cells, context = true, focus = -1, outline = 
   const W = cv.width, H = cv.height, k = Math.min((W - 8) / bw, (H - 8) / bh) * (view ? view.z : 1);
   const ox = W / 2 - (view ? view.rx : 0.5) * bw * k, oy = H / 2 - (view ? view.ry : 0.5) * bh * k;
   const vx0 = B.x0 - ox / k, vx1 = vx0 + W / k, vy0 = B.y0 - oy / k, vy1 = vy0 + H / k;   // visible window (um)
-  const ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, W, H); ctx.lineWidth = Math.max(1, W / 328); ctx.lineJoin = "round";   // CPU canvas: hundreds of small tiles would otherwise each get a GPU surface
+  const ctx = cv.getContext("2d", { willReadFrequently: true }); ctx.fillStyle = cv._bg || bgCol(); ctx.fillRect(0, 0, W, H); ctx.lineWidth = Math.max(1, W / 328); ctx.lineJoin = "round";   // CPU canvas: hundreds of small tiles would otherwise each get a GPU surface
   cv._redraw = () => drawGlom(cv, b, sc, poly, cells, context, focus, outline, onHe, view, dims);
   const st = hw(cv._hw), hs = cv._heOnly ? (HE.data?.[b.sample] || imcSide(cv._hw) ? b.sample : null) : heFor(b.sample, cv._hw), al = st.a, ol = st.outl, lw = Math.max(1, Math.min(W, H) / 328);
   if (hs) {
     const redo = onHe || (() => heRedoCv(cv)), cr = (cv._heOnly ? st.sides : st.imgs).has("he") && !(cv._heOnly && imcSide(cv._hw)) ? heCrop(hs, cells) : null, sl = 1;
     if (cr && vx0 >= cr.x0 - sl && vx1 <= cr.x0 + cr.w + sl && vy0 >= cr.y0 - sl && vy1 <= cr.y0 + cr.h + sl) {   // the glom's own crop covers the window: one image, one draw
-      const im = heCropImg(hs, cr, redo, k <= 2.6); if (im) { ctx.imageSmoothingQuality = "low"; ctx.drawImage(im, ox + (cr.x0 - B.x0) * k, oy + (cr.y0 - B.y0) * k, cr.w * k, cr.h * k); }
-    } else drawHE(ctx, { sample: hs, redo, w: cv._hw, side: !!cv._heOnly }, (x) => ox + (x - B.x0) * k, (y) => oy + (y - B.y0) * k, W, H, k);
+      const im = heCropImg(hs, cr, redo, k <= 2.6); if (im) { ctx.imageSmoothingQuality = "low"; ctx.drawImage(im, ox + (cr.x0 - B.x0) * k, oy + (cr.y0 - B.y0) * k, cr.w * k, cr.h * k); } else if (cv._heMiss) cv._heMiss.n++;
+    } else drawHE(ctx, { sample: hs, redo, w: cv._hw, side: !!cv._heOnly, miss: cv._heMiss }, (x) => ox + (x - B.x0) * k, (y) => oy + (y - B.y0) * k, W, H, k);
   }
   cv._xf = cv._heOnly && imcSide(cv._hw) ? null : { s: k, ox: ox - B.x0 * k, oy: oy - B.y0 * k };
   const paint = (i, fill, stroke) => { path(i); if (ol) { ctx.lineWidth = lw * 1.8; ctx.strokeStyle = stroke; ctx.stroke(); } else { ctx.globalAlpha = al; ctx.fillStyle = fill; ctx.fill(); ctx.lineWidth = lw; ctx.strokeStyle = "rgba(10,10,10,0.8)"; ctx.stroke(); ctx.globalAlpha = 1; } };
@@ -1842,14 +1949,14 @@ function drawGlom(cv, b, sc, poly, cells, context = true, focus = -1, outline = 
     if (inGlom.has(i)) continue; const x = b.xy[i * 2], y = b.xy[i * 2 + 1];
     if (view || dims ? x >= vx0 - 10 && x <= vx1 + 10 && y >= vy0 - 10 && y <= vy1 + 10 : x >= B.x0 && x <= B.x1 && y >= B.y0 && y <= B.y1) paint(i, "rgba(105,110,122,0.22)", "rgba(150,155,168,0.45)");
   }
-  for (const i of cells) if (!ho && !b.pass[i]) paint(i, "rgba(105,110,122,0.5)", "rgba(150,155,168,0.7)");
+  for (const i of cells) if (!ho && !b.pass[i]) paint(i, `rgba(105,110,122,${S.dimA})`, "rgba(150,155,168,0.7)");
   for (const i of cells) if (!ho && b.pass[i]) { const c = rgbStr(sc.color(b, i)); paint(i, c, c); }
   if (outline) {   // pathologist boundary: dark halo, then the pen colour
     const ring = (r) => { ctx.beginPath(); r.forEach(([px, py], j) => { const X = ox + (px - B.x0) * k, Y = oy + (py - B.y0) * k; j ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); }); ctx.closePath(); };
     for (const [w, col] of [[Math.max(4.5, Math.min(W, H) / 75), "rgba(0,0,0,0.85)"], [Math.max(2, Math.min(W, H) / 160), outline.color]]) { ctx.lineWidth = w; ctx.strokeStyle = col; for (const r of outline.rings) { ring(r); ctx.stroke(); } }
   }
   if (focus >= 0) { path(focus); ctx.lineWidth = Math.max(2.5, Math.min(W, H) / 90); ctx.strokeStyle = "#ffffff"; ctx.stroke(); }
-  if (dims) {   // scale bar (compare tiles)
+  if (dims && !cv._noSB) {   // scale bar (compare tiles); a figure draws its own
     const target = 0.2 * (W - 8) / k, p = Math.pow(10, Math.floor(Math.log10(target))), nice = [1, 2, 5, 10].map((f) => f * p).reduce((a, c) => (Math.abs(c - target) < Math.abs(a - target) ? c : a));
     const lab = nice >= 1000 ? `${nice / 1000} mm` : `${nice} µm`; ctx.font = `11px ${FONT}`; ctx.textBaseline = "alphabetic";
     ctx.fillStyle = "rgba(15,18,24,0.75)"; ctx.fillRect(6, H - 32, Math.max(nice * k, ctx.measureText(lab).width) + 10, 28); ctx.fillStyle = "#fff"; ctx.fillRect(10, H - 12, nice * k, 3); ctx.fillText(lab, 10, H - 17);
@@ -1919,7 +2026,7 @@ function composeGlomPNG(v, context) {
     x.fillStyle = chip === "passed qc" ? "#0b0b0b" : "#fff"; x.fillText(chipTxt, 24 + tw + 22, G + 35);
   }
   x.font = `14px ${FONT}`; x.fillStyle = "#8b95a5";
-  x.fillText(`${dlabel(v.s.id)} · ${v.s.disease_type} · ${subtypeOf(v.s)} · ${v.cells.length} cells · colour: ${colorName()}${v.note ? " · " + v.note : ""}`, 24, G + 62);
+  x.fillText(`${dlabel(v.s.id)}${gTag(v.s)} · ${v.cells.length} cells · colour: ${colorName()}${v.note ? " · " + v.note : ""}`, 24, G + 62);
   let items = null;
   if (v.sc.info.type === "cat") {
     const cnt = new Map(); let dimmed = 0;
@@ -1977,7 +2084,9 @@ async function openGlomIn(sample, cells, poly) {
 function saveViewPNG() {
   deckgl.redraw(true);
   const src = deckgl.getCanvas(), side = HEW.main.side && HEX.deck ? (HEX.deck.redraw(true), HEX.deck.getCanvas()) : null;   // side = the image pane beside the cells (a second deck)
-  const W1 = src.width, GAP = side ? Math.max(4, Math.round(W1 / 200)) : 0, W = W1 + GAP + (side ? side.width : 0), H = Math.max(src.height, side ? side.height : 0), u = Math.max(1, W1 / 1100), info = S.colorInfo, mode = S.colorBy;
+  const em = S.umOpen && UM.deck && $("umapwin").clientWidth > 0 ? (UM.deck.redraw(true), UM.deck.getCanvas()) : null, emUnder = !!em && $("umapwin").classList.contains("dockunder");   // the Embeddings window: beside the other panes, or below them when docked under
+  const W1 = src.width, GAP = side || em ? Math.max(4, Math.round(W1 / 200)) : 0, H = Math.max(src.height, side ? side.height : 0), embW = em && !emUnder ? Math.round(em.width * H / em.height) : 0;
+  const W = W1 + (side ? GAP + side.width : 0) + (em && !emUnder ? GAP + embW : 0), EH = emUnder ? GAP + Math.round(em.height * W / em.width) : 0, PH = H + EH, u = Math.max(1, W1 / 1100), info = S.colorInfo, mode = S.colorBy;
   let items = null;
   if (info.type === "cat") {
     const { out, miss } = countsFor(mode);
@@ -1988,9 +2097,11 @@ function saveViewPNG() {
   const X = 24 * u, LW = W - 2 * X, scratch = document.createElement("canvas").getContext("2d"), lh = pngLegend(scratch, info, items, X, 0, LW, u, 9);
   const pitems = S.showPath && S.pathInfo?.legend ? S.pathInfo.legend.map((e) => [e.name, e.color, e.n]) : null;   // pathologist regions (outline colours)
   const ph = pitems ? 30 * u + pngLegend(scratch, { type: "cat" }, pitems, X, 0, LW, u, 3) : 0;
-  const FH = Math.round(124 * u + lh + ph + 14 * u), out = document.createElement("canvas"); out.width = W; out.height = H + FH;
-  const x = out.getContext("2d"); x.fillStyle = "#0f1218"; x.fillRect(0, 0, W, H + FH); x.drawImage(src, 0, 0);
+  const FH = Math.round(124 * u + lh + ph + 14 * u), out = document.createElement("canvas"); out.width = W; out.height = PH + FH;
+  const x = out.getContext("2d"); x.fillStyle = "#0f1218"; x.fillRect(0, 0, W, PH + FH); x.fillStyle = bgCol(); x.fillRect(0, 0, W, PH); x.drawImage(src, 0, 0);
   if (side) { x.drawImage(side, W1 + GAP, 0); x.fillStyle = "#fff"; x.fillRect(W1, 0, GAP, H); }   // white line between the panels
+  if (em && !emUnder) { const ex = W1 + (side ? GAP + side.width : 0); x.fillStyle = "#fff"; x.fillRect(ex, 0, GAP, H); x.drawImage(em, ex + GAP, 0, embW, H); }
+  if (emUnder) { x.fillStyle = "#fff"; x.fillRect(0, H, W, GAP); x.drawImage(em, 0, H + GAP, W, EH - GAP); }
   // scale bar (output px per µm = CSS px per µm × canvas scale); one per pane, each with its own zoom
   const bar = (cv, zoom, x0, pw) => {
     const ppu = Math.pow(2, zoom) * (cv.width / (cv.clientWidth || cv.width)), target = 0.14 * pw / ppu, p = Math.pow(10, Math.floor(Math.log10(target)));
@@ -2002,14 +2113,15 @@ function saveViewPNG() {
   if (side) bar(side, (HEX.vs || S.viewState).zoom, W1 + GAP, side.width);
   // footer
   const inf = S.meta.samples.find((s) => s.id === S.sample);
-  x.fillStyle = "#d7dde6"; x.font = `600 ${22 * u}px ${FONT}`; x.fillText(dlabel(S.sample), X, H + 34 * u);
+  x.fillStyle = "#d7dde6"; x.font = `600 ${22 * u}px ${FONT}`; x.fillText(dlabel(S.sample), X, PH + 34 * u);
   x.font = `${14 * u}px ${FONT}`; x.fillStyle = "#8b95a5";
-  const flt = [...Object.entries(S.filters).filter(([k, set]) => set.size && S.meta.cats[k]).map(([k, set]) => `${labelOf(k)} = ${[...set].map((i) => display(k, i)).join(", ")}`), ...exprSpecs().map(exprDesc)].join(" · ");
+  const flt = fltText(nbrIndexSpec());
   const clip = (t) => (t.length > 220 ? t.slice(0, 217) + "…" : t);
-  x.fillText(`${inf.disease_type} · ${subtypeOf(inf)} · ${fmt(S.n)} cells · colour: ${colorName()}${S.visIdx.length < S.n ? ` · ${fmt(S.visIdx.length)} highlighted` : ""}`, X, H + 60 * u);
-  if (flt) x.fillText(clip("filters: " + flt), X, H + 82 * u);
-  pngLegend(x, info, items, X, H + 112 * u, LW, u, 9);
-  if (pitems) { x.font = `600 ${14 * u}px ${FONT}`; x.fillStyle = "#aab4c3"; x.fillText("Pathologist region outlines (number of regions)", X, H + 112 * u + lh + 22 * u); pngLegend(x, { type: "cat" }, pitems, X, H + 112 * u + lh + 46 * u, LW, u, 3); }
+  x.fillText(`${inf.group ? inf.group + " · " : ""}${fmt(S.n)} cells · colour: ${colorName()}${S.visIdx.length < S.n ? ` · ${fmt(S.visIdx.length)} highlighted` : ""}`, X, PH + 60 * u);
+  if (flt) x.fillText(clip("filters: " + flt), X, PH + 82 * u);
+  pngLegend(x, info, items, X, PH + 112 * u, LW, u, 9);
+  if (pitems) { x.font = `600 ${14 * u}px ${FONT}`; x.fillStyle = "#aab4c3"; x.fillText("Pathologist region outlines (number of regions)", X, PH + 112 * u + lh + 22 * u); pngLegend(x, { type: "cat" }, pitems, X, PH + 112 * u + lh + 46 * u, LW, u, 3); }
+  if (S._snapCb) { const cb = S._snapCb; S._snapCb = null; cb(out); return; }   // a picture for Claude (agent snapshot), not a download
   out.toBlob((blob) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `view_${S.sample}.png`; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }, "image/png");
 }
 
@@ -2018,9 +2130,9 @@ function onSavePNG() {
   if (!$("glomzoom").hidden) return saveGlomPNG();
   if (!$("glomcmp").hidden) return saveGlomCmpPNG();
   if (!$("ghet").hidden) return ghSavePNG();
-  if (!$("vio").hidden) { alert("PNG export is not available in the Violins window yet; take a screenshot."); return; }
+  if (!$("vio").hidden) { alert("PNG export is not available in the Expression plots window yet; take a screenshot."); return; }
   if (!$("sigwin").hidden) { alert("PNG export is not available in the Signatures window yet. Use \"Colour the main viewer by this signature\" and save from the main viewer, or take a screenshot."); return; }
-  if (!$("nbr").hidden) { $("nbrinfo").textContent = "PNG export is not available for the Neighbors window yet — use Export CSV (or a screenshot)."; return; }
+  if (!$("nbr").hidden) { $("nbrinfo").textContent = "PNG export is not available for the Neighbours window yet — use Export CSV (or a screenshot)."; return; }
   if (!$("slide").hidden) return $("slidesel").value === "__all" ? saveSlideZip() : saveSlidePNG();
   if (!$("gallery").hidden) return showPngMenu("gallery");
   if (!$("rgn").hidden) return showPngMenu("rgn");
@@ -2063,7 +2175,7 @@ async function saveWindowPNG(kind, whole) {
     if (dimmed) items.push(["filtered out", "rgba(105,110,122,0.6)", dimmed]);
   }
   const clean = (t) => t.replace(/ · (click [a-z ]+ to open it|scroll for more|loading…)/g, "");
-  const title = kind === "gallery" ? `Gallery — ${$("galsub").selectedOptions[0].text}` : kind === "rgn" ? `Region — ${$("rgnsel").selectedOptions[0].text} (${$("rgnsub").selectedOptions[0].text})` : kind === "nbh" ? `Neighborhoods — ${$("nbhsample").selectedOptions[0].text}`
+  const title = kind === "gallery" ? `Gallery — ${$("galsub").selectedOptions[0].text}` : kind === "rgn" ? `Region — ${$("rgnsel").selectedOptions[0].text} (${$("rgnsub").selectedOptions[0].text})` : kind === "nbh" ? `Neighbourhoods — ${$("nbhsample").selectedOptions[0].text}`
     : `Glomeruli — ${$("glomscope").selectedOptions[0].text}${$("glomqc").value !== "all" ? " · " + $("glomqc").value : ""}`;
   const sub = clean($(kind === "gallery" ? "galinfo" : kind === "nbh" ? "nbhinfo" : kind === "rgn" ? "rgninfo" : "glominfo").textContent) + (whole ? "" : ` · showing ${tiles.length} of ${allTiles} tiles (the part of the window in view)`);
   const cssH0 = 100 + 40 + (y1 - y0), U = Math.max(0.5, Math.min(2, 15500 / cssH0));  // keep the canvas under browser limits
@@ -2172,7 +2284,7 @@ async function saveGalleryZip() {
         const tc = document.createElement("canvas"); drawTile(tc, s, b, ctxS.sc, box, null, null, { W: CW, H: IMH }, poly, null, "gal", Q);
         x.drawImage(tc, e.x, e.y); x.strokeStyle = "#29303b"; x.lineWidth = 2; x.strokeRect(e.x, e.y, CW, IMH); tc.width = 0;
         x.fillStyle = "#e3e8ef"; x.font = `600 ${11 * U}px ${FONT}`; x.fillText(fit(dlabel(e.id), CW), e.x, e.y + IMH + 15 * U);
-        x.fillStyle = "#8b95a5"; x.font = `${9.5 * U}px ${FONT}`; x.fillText(fit(`${fmt(s.n)} cells · ${s.disease_type} · ${subtypeOf(s)}`, CW), e.x, e.y + IMH + 29 * U);
+        x.fillStyle = "#8b95a5"; x.font = `${9.5 * U}px ${FONT}`; x.fillText(fit(`${fmt(s.n)} cells${gTag(s)}`, CW), e.x, e.y + IMH + 29 * U);
       }
       const blob = await new Promise((r) => out.toBlob(r, "image/png"));
       files.push({ name: `${base}_p${String(pi + 1).padStart(2, "0")}.png`, data: new Uint8Array(await blob.arrayBuffer()) }); out.width = 0;
@@ -2183,8 +2295,8 @@ async function saveGalleryZip() {
 }
 
 // ---------------------------------------------------------------- signatures window
-// Curated gene signatures (server: signatures.json) -> explorer (genes, change across disease subtypes, smoothed maps) and type I vs II localisation.
-const SIG = { list: null, gs: null, byId: {}, open: { GO: false, Reactome: false }, sel: "", sig2: "", group: "subtype", tab: "explore", sigma: 25, scope: "all", useFilters: false, view: "plot", a: "", b: "", defA: "", defB: "", locSigma: 25, locQ: 10, locSub: "", mapSample: null, tok: 0 };
+// Curated gene signatures (server: signatures.json) -> explorer (genes, change across the groups, smoothed maps) and type I vs II localisation.
+const SIG = { list: null, gs: null, byId: {}, open: { GO: false, Reactome: false }, sel: "", sig2: "", tab: "explore", sigma: 25, scope: "all", useFilters: false, view: "plot", a: "", b: "", defA: "", defB: "", locSigma: 25, locQ: 10, locSub: "", mapSample: null, tok: 0 };
 const SIG_COLLS = ["GO", "Reactome"], SIG_MAX = 300;   // GO / Reactome gene sets (MSigDB) listed for this panel; at most SIG_MAX rows are drawn per collection
 const mk = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
 const svgEl = (tag, attrs = {}, parent) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (parent) parent.append(e); return e; };
@@ -2197,12 +2309,14 @@ async function postJSON(url, body) { const r = await fetch(url, { method: "POST"
 // Signatures offered: the shown curated ones in full (SIG.list; e.g. the SLE ISG-amplification list) and the GO / Reactome gene sets with enough genes
 // on this panel (SIG.gs, as [id, name, n genes]; a set's genes are fetched when it is chosen, see sigFull).
 async function loadSigList() {
-  if (SIG.list) return; const d = await jget("/api/signatures"); SIG.list = d.signatures; SIG.gs = d.genesets || null; SIG.order = d.subtype_order;
+  if (SIG.list) return; const d = await jget("/api/signatures"); SIG.list = d.signatures; SIG.gs = d.genesets || null;
   SIG.byId = Object.fromEntries(d.signatures.map((x) => [x.id, x]));
   for (const c of SIG_COLLS) for (const [id, name, n] of SIG.gs?.collections?.[c] || []) SIG.byId[id] = { id, name, group: c, n };
-  const pick = (...ids) => ids.find((i) => SIG.byId[i]) || (SIG.list[0] && SIG.list[0].id) || "";
+  const allIds = [...SIG.list.map((x) => x.id), ...SIG_COLLS.flatMap((c) => (SIG.gs?.collections?.[c] || []).map((x) => x[0]))];
+  const pick = (...ids) => ids.find((i) => SIG.byId[i]) || allIds[0] || "";
   SIG.defA = pick("go:GOBP_RESPONSE_TO_TYPE_I_INTERFERON", "reactome:REACTOME_INTERFERON_ALPHA_BETA_SIGNALING");
-  SIG.defB = pick("go:GOBP_RESPONSE_TO_TYPE_II_INTERFERON", "reactome:REACTOME_INTERFERON_GAMMA_SIGNALING");
+  SIG.defB = ["go:GOBP_RESPONSE_TO_TYPE_II_INTERFERON", "reactome:REACTOME_INTERFERON_GAMMA_SIGNALING"].find((i) => SIG.byId[i]) || allIds.find((i) => i !== SIG.defA) || SIG.defA;
+  $("sigtab-loc").hidden = allIds.length < 2;
   if (!SIG.byId[SIG.sel]) SIG.sel = pick("isg_amp_sle"); if (!SIG.byId[SIG.a]) SIG.a = SIG.defA; if (!SIG.byId[SIG.b]) SIG.b = SIG.defB;
   for (const id of ["sigpreset", "sigpreset2", "xfpreset", "viosig", "ghsig", "ghsig2"]) if ($(id)) sigPicker($(id));
 }
@@ -2279,7 +2393,6 @@ function renderSigList() {
   box.replaceChildren(...sigListRows(t, row, null, head));
 }
 function renderSigPane() { $("sigtab-explore").classList.toggle("on", SIG.tab === "explore"); $("sigtab-loc").classList.toggle("on", SIG.tab === "loc"); $("siglist").style.display = SIG.tab === "explore" ? "" : "none"; SIG.tab === "explore" ? renderExplorer() : renderLoc(); }
-const subtypeRank = (t) => { const o = SIG.order || []; return o.includes(t) ? o.indexOf(t) : 99; };
 // ---- colour scale for score maps: diverging around 0 for z-scores, viridis otherwise; values come from all shown samples
 function scoreScale(vecs, z) {
   const pool = []; for (const v of vecs) for (let i = 0; i < v.length; i += 3) pool.push(v[i]);
@@ -2290,8 +2403,8 @@ function scoreScale(vecs, z) {
 function drawScoreTile(cv, meta, xy, vec, sc, box = 260) {
   const w = meta.x[1] - meta.x[0] || 1, h = meta.y[1] - meta.y[0] || 1, k = Math.min((box - 8) / w, (box - 8) / h);
   cv.width = Math.max(40, Math.ceil(w * k) + 8); cv.height = Math.max(40, Math.ceil(h * k) + 8);
-  const ctx = cv.getContext("2d"), n = vec.length, px = n > 30000 ? 1.5 : 2.2; ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, cv.width, cv.height);
-  cv._redraw = () => drawScoreTile(cv, meta, xy, vec, sc, box);
+  const ctx = cv.getContext("2d"), n = vec.length, px = (n > 30000 ? 1.5 : 2.2) * Math.max(1, box / 260); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, cv.width, cv.height);
+  cv._redraw = () => drawScoreTile(cv, meta, xy, vec, sc, box); cv._figDraw = heFor(meta.id, "sig") ? null : (b) => { const c = document.createElement("canvas"); drawScoreTile(c, meta, xy, vec, sc, b); return c; };
   const hs = heFor(meta.id, "sig"); if (hs) { drawHE(ctx, { sample: hs, redo: () => heRedoCv(cv), w: "sig" }, (x) => 4 + (x - meta.x[0]) * k, (y) => 4 + (y - meta.y[0]) * k, cv.width, cv.height, k); ctx.globalAlpha = HEW.sig.a; }
   const o = new Uint32Array(n); for (let i = 0; i < n; i++) o[i] = i; o.sort((p, q) => vec[p] - vec[q]);   // low values first, hot cells on top
   if (HEW.sig.cells) for (const i of o) { const c = sc.color(vec[i]); ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`; ctx.fillRect(4 + (xy[2 * i] - meta.x[0]) * k, 4 + (xy[2 * i + 1] - meta.y[0]) * k, px, px); }
@@ -2305,20 +2418,16 @@ const sigVecCache = {};
 const sigVec = (sid, genes, sigma, scope) => { const k = [sid, sigma, scope, genes.join(",")].join("|"); return sigVecCache[k] || (sigVecCache[k] = bget(exprUrl2(sid, genes, sigma, scope), Float32Array)); };
 
 // ---------------------------------------------------------------- explorer
-const SIG_TYPES = ["Control", "No LN", "LN"], SIG_A = "#3987e5", SIG_B = "#d95926";   // series colours: validated slots 1 and 2 (blue / orange: colour-blind-safe pair)
-const SCOPE_TXT = { none: "none (smoothed raw score)", sample: "within each donor", subtype: "across samples of the same disease subtype", type: "across samples of the same disease type", all: "across all samples", nocontrol: "against the non-control samples (Control excluded from the reference)" };
-const groupLabel = (m) => (SIG.group === "type" ? m.disease_type || "unknown" : subtypeOf(m));
-const groupRank = (g) => { const o = SIG.group === "type" ? SIG_TYPES : SIG.order || []; return o.includes(g) ? o.indexOf(g) : 99; };
+const SIG_A = "#3987e5", SIG_B = "#d95926";   // series colours: validated slots 1 and 2 (blue / orange: colour-blind-safe pair)
 function scopeWarning() {   // z-scoring inside a group removes the differences between the groups it pools over
-  const sc = SIG.scope, gb = SIG.group;
-  if (sc === "sample") return "Each donor is z-scored on its own (its tissue pieces pooled), so every donor's average is 0: differences between donors and groups are removed by design and only the spatial pattern inside a donor remains. The group tests below are not informative.";
-  if (sc === "subtype") return gb === "subtype" ? "Samples are z-scored within their disease subtype, so each subtype's average is about 0: differences between subtypes are removed by design (the tests below are not informative); differences between samples of one subtype remain." : "Samples are z-scored within their disease subtype, which also removes most differences between disease types; spread between samples of one subtype remains.";
-  if (sc === "type") return gb === "type" ? "Samples are z-scored within their disease type (Control / No LN / LN), so the three types are each centred on 0: differences between types are removed by design. The three LN subtypes can still be compared with each other under 'group by subtype'." : "Samples are z-scored within their disease type, so Control and No LN (one subtype each) are centred on 0, while the three LN subtypes (Class I/II, III, V) remain comparable with each other.";
+  if (SIG.scope === "sample") return "Each donor is z-scored on its own (its tissue pieces pooled), so every donor's average is 0: differences between donors and groups are removed by design and only the spatial pattern inside a donor remains. The group tests below are not informative.";
+  if (SIG.scope === "group") return `Samples are z-scored within their ${groupName()}, so each group's average is about 0: differences between groups are removed by design (the tests below are not informative); differences between donors of one group remain.`;
   return "";
 }
-const scopeNote = () => (SIG.scope === "nocontrol" ? "The mean and SD for the z-score come from the non-control samples only (No LN and LN, all their cells); every sample, Control included, is then scored against that reference. Differences between groups are kept, and Control samples show up as below the disease average." : "");
+const scopeNote = () => (SIG.scope === "notref" ? `The mean and SD for the z-score come from every tissue except the reference (${S.meta.groups.reference}); every tissue, the reference included, is then scored against them. Differences between groups are kept.` : "");
 async function renderExplorer() {
   try { await sigFull(SIG.sel); if (SIG.sig2) await sigFull(SIG.sig2); } catch (e) { $("sigpane").textContent = "Could not load the signature: " + e.message; return; }
+  if (SIG.tab !== "explore" || $("sigwin").hidden) return;     // the user moved on while the genes were loading
   const pane = $("sigpane"), sg = SIG.byId[SIG.sel], tok = ++SIG.tok; if (SIG.sig2 === SIG.sel) SIG.sig2 = ""; const sg2 = SIG.sig2 ? SIG.byId[SIG.sig2] : null; pane.replaceChildren();
   const info = (g, color, tag) => { const box = mk("div"); const h = mk("div", "sh2", (tag ? tag + " " : "") + g.name); h.style.marginTop = tag ? "14px" : "0"; if (color) h.style.borderBottomColor = color; box.append(h, mk("div", "sdesc", g.desc)); if (g.url) { const a = mk("a", "", "MSigDB page for this set"); a.href = g.url; a.target = "_blank"; a.rel = "noopener"; const dl = mk("div", "snote"); dl.append(a); box.append(dl); } if (g.note) box.append(mk("div", "snote", "Note: " + g.note));
     const cov = mk("div", "snote", `${g.genes.length} of ${g.n_defined} candidate genes are on the panel. ` + (g.coherence_bin != null ? `Coherence: ${g.coherence_bin.toFixed(2)} across 100 µm tissue bins, ${g.coherence_cell.toFixed(2)} per cell after removing cell-type means. ` : "")
@@ -2328,40 +2437,39 @@ async function renderExplorer() {
   pane.append(info(sg, sg2 ? SIG_A : null, sg2 ? "A ·" : "")); if (sg2) pane.append(info(sg2, SIG_B, "B ·"));
   // controls
   const ctl = mk("div", "sctl"), sl = mk("input"); sl.type = "range"; sl.min = 0; sl.max = 100; sl.step = 5; sl.value = SIG.sigma; const sv = mk("span", "", SIG.sigma ? SIG.sigma + " µm" : "off"); const l1 = mk("label"); l1.append("Smoothing σ ", sl, sv);
-  const sc = mk("select"); sc.innerHTML = Object.entries(SCOPE_TXT).map(([k, t]) => `<option value="${k}">z-score ${k === "none" ? t : t}</option>`).join("").replace("z-score none (smoothed raw score)", "no z-score (smoothed raw score)"); sc.value = SIG.scope; const l2 = mk("label"); l2.append("Score ", sc);
-  const gb = mk("select"); gb.innerHTML = `<option value="subtype">disease subtype (5 groups)</option><option value="type">disease type (Control / No LN / LN)</option>`; gb.value = SIG.group; const l4 = mk("label"); l4.append("Group by ", gb);
+  const sc = mk("select"); fillOpts(sc, scopeKeys().map((k) => [k, k === "none" ? "no z-score (smoothed raw score)" : "z-score " + scopeText(k)])); sc.value = SIG.scope; const l2 = mk("label"); l2.append("Score ", sc);
   const s2 = mk("select"); s2.innerHTML = `<option value="">— none —</option>`; const l5 = mk("label"); l5.append("Add a second signature ", s2); sigPicker(s2, { exclude: SIG.sel }); s2.value = SIG.sig2 || "";
   const fl = mk("input"); fl.type = "checkbox"; fl.checked = SIG.useFilters; const l3 = mk("label"); l3.append(fl, "only cells passing the current filters");
   const tv = mk("button", "", SIG.view === "plot" ? "Table" : "Plot"), tovw = mk("button", "", sg2 ? "Show both signatures in the main viewer" : "Colour the main viewer by this signature");
-  ctl.append(l1, l2, l4, l5, l3, tv, tovw); ctl.classList.add("stickyctl"); pane.prepend(ctl);   // controls stay at the top of the pane
+  ctl.append(l1, l2, l5, l3, tv, tovw); ctl.classList.add("stickyctl"); pane.prepend(ctl);   // controls stay at the top of the pane
   const warn = scopeWarning(), note = scopeNote();
   if (warn) { const w = mk("div", "snote", "⚠ " + warn); w.style.cssText = "color:#e0a458;max-width:900px;margin:4px 0 8px"; ctl.after(w); }
   else if (note) { const w = mk("div", "snote", "ℹ " + note); w.style.cssText = "max-width:900px;margin:4px 0 8px"; ctl.after(w); }
   sl.addEventListener("input", () => { sv.textContent = +sl.value ? sl.value + " µm" : "off"; }); sl.addEventListener("change", () => { SIG.sigma = +sl.value; renderExplorer(); });
-  sc.addEventListener("change", () => { SIG.scope = sc.value; renderExplorer(); }); gb.addEventListener("change", () => { SIG.group = gb.value; renderExplorer(); }); s2.addEventListener("change", () => { SIG.sig2 = s2.value; renderExplorer(); });
+  sc.addEventListener("change", () => { SIG.scope = sc.value; renderExplorer(); }); s2.addEventListener("change", () => { SIG.sig2 = s2.value; renderExplorer(); });
   fl.addEventListener("change", () => { SIG.useFilters = fl.checked; renderExplorer(); }); tv.addEventListener("click", () => { SIG.view = SIG.view === "plot" ? "table" : "plot"; renderExplorer(); });
   tovw.addEventListener("click", () => { S.sigGenes = [...sg.genes]; S.sigName = sg.name; S.sigKey = ""; $("sigtext").value = sg.genes.join(" "); S.smooth = SIG.sigma; $("smooth").value = SIG.sigma; $("smoothlab").textContent = SIG.sigma ? SIG.sigma + " µm" : "off";
     S.zscope = SIG.scope; $("zscope").value = S.zscope; S.colorBy = "__sig";
     if (sg2) { S.sigGenes2 = [...sg2.genes]; S.sigName2 = sg2.name; S.sigKey2 = ""; $("sigtext2").value = sg2.genes.join(" "); S.colorBy = "__sigdual"; } $("colorby").value = S.colorBy; syncGeneUI(); closeSig(); refresh(); });
   const out = mk("div", "snote", "Computing…"); pane.append(out);
-  const body = (id) => ({ sig: id, sigma: SIG.sigma, scope: SIG.scope, group_by: SIG.group, ...(SIG.useFilters ? nbrIndexSpec() : { filters: {}, hidden: {}, expr: [] }) });
+  const body = (id) => ({ sig: id, sigma: SIG.sigma, scope: SIG.scope, ...(SIG.useFilters ? nbrIndexSpec() : { filters: {}, hidden: {}, expr: [] }) });
   let dA, dB = null; try { [dA, dB] = await Promise.all([postJSON("/api/signature/summary", body(sg.id)), sg2 ? postJSON("/api/signature/summary", body(sg2.id)) : null]); } catch (e) { out.textContent = "Error: " + e.message; return; }
   if (tok !== SIG.tok) return; out.remove();
-  const z = SIG.scope !== "none", gname = SIG.group === "type" ? "disease type" : "disease subtype";
-  pane.append(mk("div", "sh2", `Change across ${gname} (one value per donor: mean score of its cells, tissue pieces pooled)`));
+  const z = SIG.scope !== "none";
+  pane.append(mk("div", "sh2", `${hasGroups() ? "Change across " + groupName() : "Score per donor"} (one value per donor: mean score of its cells, tissue pieces pooled)`));
   pane.append(SIG.view === "plot" ? stripPlot(dA, dB, sg, sg2, z) : sampleTable(dA, dB, sg, sg2)); pane.append(testsBox(dA, dB, sg, sg2));
-  pane.append(mk("div", "sh2", "Which genes drive it (mean expression per group, each gene scaled across groups)")); pane.append(geneHeat(dA, sg, sg2 ? "A · " : "")); if (sg2) pane.append(geneHeat(dB, sg2, "B · "));
-  pane.append(mk("div", "sh2", sg2 ? "Both signatures in space (blue = A, orange = B, white = both high), by sample and group" : "Smoothed signature in space, by sample and group")); const maps = mk("div", "smaps"); pane.append(maps); await drawSigMaps(maps, sg, sg2, dA, dB, z, tok);
+  if (hasGroups()) { pane.append(mk("div", "sh2", "Which genes drive it (mean expression per group, each gene scaled across groups)")); pane.append(geneHeat(dA, sg, sg2 ? "A · " : "")); if (sg2) pane.append(geneHeat(dB, sg2, "B · ")); }
+  pane.append(mk("div", "sh2", sg2 ? "Both signatures in space (blue = A, orange = B, white = both high), by tissue and group" : "Smoothed signature in space, by tissue and group")); const maps = mk("div", "smaps"); pane.append(maps); await drawSigMaps(maps, sg, sg2, dA, dB, z, tok);
 }
 function stripPlot(dA, dB, sg, sg2, z) {
-  const ser = [{ d: dA, name: sg.name, col: SIG_A }].concat(dB ? [{ d: dB, name: sg2.name, col: SIG_B }] : []), groups = dA.groups.map((g) => g.subtype);
+  const ser = [{ d: dA, name: sg.name, col: SIG_A }].concat(dB ? [{ d: dB, name: sg2.name, col: SIG_B }] : []), groups = dA.groups.map((g) => g.group);
   const rowsOf = (d) => d.samples.filter((s) => s.n >= d.tests.min_cells && s.mean != null), all = ser.flatMap((s) => rowsOf(s.d).map((r) => r.mean));
   const W = 700, H = 320, m = { l: 58, r: 18, t: dB ? 34 : 14, b: 54 }, svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
   let lo = Math.min(...all), hi = Math.max(...all); const pad = (hi - lo) * 0.12 || 0.5; lo -= pad; hi += pad;
   const ys = (v) => m.t + (1 - (v - lo) / (hi - lo)) * (H - m.t - m.b), bw = (W - m.l - m.r) / groups.length, xc = (i) => m.l + bw * (i + 0.5);
   const step = (() => { const r = (hi - lo) / 5, p = Math.pow(10, Math.floor(Math.log10(r))); return [1, 2, 5, 10].map((k) => k * p).find((k) => k >= r) || r; })();
   for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) { svgEl("line", { x1: m.l, x2: W - m.r, y1: ys(v), y2: ys(v), stroke: Math.abs(v) < 1e-9 && z ? "#4b566a" : "#29303b", "stroke-width": 1 }, svg); svgEl("text", { x: m.l - 8, y: ys(v) + 4, "text-anchor": "end", fill: "#8b95a5", "font-size": 11 }, svg).textContent = v.toFixed(2); }
-  svgEl("text", { x: 14, y: (H - m.b + m.t) / 2, fill: "#8b95a5", "font-size": 11, transform: `rotate(-90 14 ${(H - m.b + m.t) / 2})`, "text-anchor": "middle" }, svg).textContent = z ? `score (z-score ${SCOPE_TXT[SIG.scope].replace("across samples of the same ", "within ")})`.slice(0, 44) : "smoothed score";
+  svgEl("text", { x: 14, y: (H - m.b + m.t) / 2, fill: "#8b95a5", "font-size": 11, transform: `rotate(-90 14 ${(H - m.b + m.t) / 2})`, "text-anchor": "middle" }, svg).textContent = z ? `score (z-score ${scopeText(SIG.scope)})`.slice(0, 44) : "smoothed score";
   if (dB) ser.forEach((s, k) => { const x0 = m.l + k * 250; svgEl("circle", { cx: x0 + 6, cy: 14, r: 5, fill: s.col, stroke: "#0f1218", "stroke-width": 2 }, svg); svgEl("text", { x: x0 + 18, y: 18, fill: "#d7dde6", "font-size": 12 }, svg).textContent = s.name.length > 34 ? s.name.slice(0, 33) + "…" : s.name; });
   groups.forEach((g, i) => {
     svgEl("text", { x: xc(i), y: H - m.b + 18, "text-anchor": "middle", fill: "#d7dde6", "font-size": 12 }, svg).textContent = g;
@@ -2371,35 +2479,33 @@ function stripPlot(dA, dB, sg, sg2, z) {
       if (gm.se != null) svgEl("line", { x1: cx, x2: cx, y1: ys(gm.mean - gm.se), y2: ys(gm.mean + gm.se), stroke: "#e3e8ef", "stroke-width": 2 }, svg); svgEl("line", { x1: cx - half, x2: cx + half, y1: ys(gm.mean), y2: ys(gm.mean), stroke: "#e3e8ef", "stroke-width": 3 }, svg);
       gs.forEach((r, j) => { const jit = (((j * 0.618) % 1) - 0.5) * bw * (ser.length === 1 ? 0.55 : 0.26); svgEl("circle", { cx: cx + jit, cy: ys(r.mean), r: 5, fill: s.col, stroke: "#0f1218", "stroke-width": 2 }, svg);
         const hit = svgEl("circle", { cx: cx + jit, cy: ys(r.mean), r: 11, fill: "transparent" }, svg);
-        hit.addEventListener("pointermove", (ev) => nbrTip(ev, [{ tag: "b", t: r.mean.toFixed(3) }, { t: `${dlabel(r.sample)} · ${s.name}` }, { cls: "m", t: `${r.subtype} · ${fmt(r.n)} cells · median ${r.median.toFixed(2)}` }])); hit.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; }); });
+        hit.addEventListener("pointermove", (ev) => nbrTip(ev, [{ tag: "b", t: r.mean.toFixed(3) }, { t: `${dlabel(r.sample)} · ${s.name}` }, { cls: "m", t: `${r.group} · ${fmt(r.n)} cells · median ${r.median.toFixed(2)}` }])); hit.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; }); });
     });
   });
   const wrap = mk("div"); wrap.append(svg, mk("div", "snote", "Dots = donors (the tissue pieces of a donor are pooled); bar = mean ± standard error over the donors.")); return wrap;
 }
 function sampleTable(dA, dB, sg, sg2) {
-  const tb = mk("table", "st"), hr = mk("tr"); ["Group / sample", "Cells", `Mean${dB ? " A" : ""}`, ...(dB ? ["Mean B"] : []), "Median" + (dB ? " A" : ""), "IQR" + (dB ? " A" : "")].forEach((t) => hr.append(mk("th", "", t))); tb.append(hr);
+  const tb = mk("table", "st"), hr = mk("tr"); ["Group / donor", "Cells", `Mean${dB ? " A" : ""}`, ...(dB ? ["Mean B"] : []), "Median" + (dB ? " A" : ""), "IQR" + (dB ? " A" : "")].forEach((t) => hr.append(mk("th", "", t))); tb.append(hr);
   const bById = dB ? Object.fromEntries(dB.samples.map((x) => [x.sample, x])) : {};
   dA.groups.forEach((g, gi) => {
-    const tr = mk("tr", "sub"); [g.subtype + ` (${donTxt(g.n_donors)})`, "", g.mean.toFixed(3), ...(dB ? [dB.groups[gi].mean.toFixed(3)] : []), "", g.se != null ? "SE " + g.se.toFixed(3) : ""].forEach((t) => tr.append(mk("td", "", t))); tb.append(tr);
-    for (const r of dA.samples.filter((x) => x.group === g.subtype && x.mean != null).sort((a, b) => dlabel(a.sample).localeCompare(dlabel(b.sample)))) { const t2 = mk("tr"), rb = bById[r.sample];
+    const tr = mk("tr", "sub"); [g.group + ` (${donTxt(g.n_donors)})`, "", g.mean.toFixed(3), ...(dB ? [dB.groups[gi].mean.toFixed(3)] : []), "", g.se != null ? "SE " + g.se.toFixed(3) : ""].forEach((t) => tr.append(mk("td", "", t))); tb.append(tr);
+    for (const r of dA.samples.filter((x) => x.group === g.group && x.mean != null).sort((a, b) => dlabel(a.sample).localeCompare(dlabel(b.sample)))) { const t2 = mk("tr"), rb = bById[r.sample];
       ["   " + dlabel(r.sample) + (r.n < dA.tests.min_cells ? " (too few cells, not tested)" : ""), fmt(r.n), r.mean.toFixed(3), ...(dB ? [rb?.mean != null ? rb.mean.toFixed(3) : "–"] : []), r.median.toFixed(3), `${r.q25.toFixed(2)} – ${r.q75.toFixed(2)}`].forEach((t) => t2.append(mk("td", "", t))); tb.append(t2); }
   }); return tb;
 }
 function testsBox(dA, dB, sg, sg2) {
-  const b = mk("div", "sbox"); b.style.marginTop = "10px"; const ul = mk("ul"); ul.style.cssText = "margin:0;padding-left:18px"; const gname = SIG.group === "type" ? "disease types" : "disease subtypes";
+  const b = mk("div", "sbox"); b.style.marginTop = "10px"; const ul = mk("ul"); ul.style.cssText = "margin:0;padding-left:18px";
   const one = (d, name) => { const t = d.tests, pre = name ? name + ": " : "";
-    ul.append(Object.assign(mk("li"), { textContent: `${pre}Kruskal–Wallis across ${gname} (donors as the unit): ${pTxt(t.kruskal_p)}.` }));
-    if (t.vs_control.length) ul.append(Object.assign(mk("li"), { textContent: `${pre}versus Control (Mann–Whitney, Holm-adjusted): ` + t.vs_control.map((x) => `${x.subtype} ${fmtN(x.diff)} (${pTxt(x.p_holm)})`).join("; ") + "." }));
-    if (t.spearman_rho != null) ul.append(Object.assign(mk("li"), { textContent: `${pre}rank correlation with the order ${d.order.join(" → ")}: ρ = ${t.spearman_rho.toFixed(2)} (${pTxt(t.spearman_p)}); this is the order you asked for, not an established severity scale.` })); };
+    if (hasGroups()) ul.append(Object.assign(mk("li"), { textContent: t.kruskal_p == null ? `${pre}No test across ${groupName()}: at least two groups need 2 or more donors with enough cells.` : `${pre}Kruskal–Wallis across ${groupName()} (donors as the unit): ${pTxt(t.kruskal_p)}.` }));
+    if (t.vs_reference.length) ul.append(Object.assign(mk("li"), { textContent: `${pre}versus ${t.reference} (Mann–Whitney, Holm-adjusted): ` + t.vs_reference.map((x) => `${x.group} ${fmtN(x.diff)} (${pTxt(x.p_holm)})`).join("; ") + "." }));
+    if (t.spearman_rho != null) ul.append(Object.assign(mk("li"), { textContent: `${pre}rank correlation with the order ${d.order.join(" → ")}: ρ = ${t.spearman_rho.toFixed(2)} (${pTxt(t.spearman_p)}); this is the order you set, not an established scale.` })); };
   one(dA, dB ? "A" : ""); if (dB) one(dB, "B");
-  const dead = SIG.scope === "sample" || SIG.scope === "subtype" || (SIG.scope === "type" && SIG.group === "type");   // the pooled groups' differences are removed by construction
-  if (dead) ul.append(Object.assign(mk("li"), { textContent: "With this z-score scope the group tests above are not informative: the z-scoring removed the differences between the groups (see the warning at the top).", style: "color:#e0a458" }));
-  else if (scopeWarning()) ul.append(Object.assign(mk("li"), { textContent: "With this z-score scope only part of the group comparisons remain informative (see the warning at the top).", style: "color:#e0a458" }));
-  ul.append(Object.assign(mk("li"), { textContent: `Samples with fewer than ${dA.tests.min_cells} cells (after filters) are left out. With 3–7 samples per group these tests are descriptive; they do not account for cell-type composition (use the cell-type filter to look within one cell type).`, style: "color:#aab4c3" }));
+  if (hasGroups() && scopeWarning()) ul.append(Object.assign(mk("li"), { textContent: "With this z-score scope the group tests above are not informative: the z-scoring removed the differences between the groups (see the warning at the top).", style: "color:#e0a458" }));   // removed by construction
+  ul.append(Object.assign(mk("li"), { textContent: `Donors with fewer than ${dA.tests.min_cells} cells (after filters) are left out. With few donors per group these tests are descriptive; they do not account for cell-type composition (use the cell-type filter to look within one cell type).`, style: "color:#aab4c3" }));
   b.append(ul); return b;
 }
 function geneHeat(d, sg, tag) {
-  const rows = d.samples.filter((s) => s.n >= d.tests.min_cells), groups = d.groups.map((g) => g.subtype), genes = d.genes;
+  const rows = d.samples.filter((s) => s.n >= d.tests.min_cells), groups = d.groups.map((g) => g.group), genes = d.genes;
   const mean = genes.map((_, gi) => groups.map((g) => { const v = rows.filter((r) => r.group === g && r.gene_means[gi] != null).map((r) => r.gene_means[gi]); return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; }));
   const z = mean.map((r) => { const v = r.filter((x) => x != null), mu = v.reduce((a, b) => a + b, 0) / v.length, sd = Math.sqrt(v.reduce((a, b) => a + (b - mu) ** 2, 0) / v.length) || 1; return r.map((x) => (x == null ? null : (x - mu) / sd)); });
   const order = genes.map((_, i) => i).sort((a, b) => (z[b][z[b].length - 1] ?? 0) - (z[a][z[a].length - 1] ?? 0));
@@ -2409,14 +2515,14 @@ function geneHeat(d, sg, tag) {
     z[gi].forEach((v, k) => { const td = mk("td", "", mean[gi][k] == null ? "–" : mean[gi][k].toFixed(2)); if (v != null) { const c = DIVL[Math.round(((Math.max(-1.6, Math.min(1.6, v)) + 1.6) / 3.2) * 255)]; td.style.background = `rgb(${c})`; td.style.color = inkOn(`rgb(${c})`); } td.title = `${genes[gi]} · ${groups[k]}: mean log-normalised expression ${mean[gi][k] == null ? "n/a" : mean[gi][k].toFixed(3)}`; tr.append(td); });
     tb.append(tr);
   }
-  wrap.append(tb); const w2 = mk("div"); w2.style.display = "inline-block"; w2.append(wrap); if (!tag || tag.startsWith("A")) w2.append(mk("div", "snote", "Cell value = mean log-normalised expression of the gene (average of the samples in the group); colour = that value scaled across the groups (red = highest, blue = lowest). Genes are ordered by how high they are in the last column.")); return w2;
+  wrap.append(tb); const w2 = mk("div"); w2.style.display = "inline-block"; w2.append(wrap); if (!tag || tag.startsWith("A")) w2.append(mk("div", "snote", "Cell value = mean log-normalised expression of the gene (average of the donors in the group); colour = that value scaled across the groups (red = highest, blue = lowest). Genes are ordered by how high they are in the last column.")); return w2;
 }
 // two signatures in one map: blue = A, orange = B, both high -> near white (a colour-blind-safe pair; additive mixing)
 const dualLimits = (vecs, z) => { const pool = []; for (const v of vecs) for (let i = 0; i < v.length; i += 3) pool.push(v[i]); const hi = z ? Z_LIM : quantile(pool, 0.995), lo = z ? 0 : quantile(pool, 0.01); return { lo, hi: Math.max(hi, lo + 1e-6) }; };
 function drawDualTile(cv, meta, xy, vA, vB, lA, lB, box = 260) {
   const w = meta.x[1] - meta.x[0] || 1, h = meta.y[1] - meta.y[0] || 1, k = Math.min((box - 8) / w, (box - 8) / h); cv.width = Math.max(40, Math.ceil(w * k) + 8); cv.height = Math.max(40, Math.ceil(h * k) + 8);
-  const ctx = cv.getContext("2d"), n = vA.length, px = n > 30000 ? 1.5 : 2.2, base = [45, 50, 60], cA = hex2rgb(SIG_A), cB = hex2rgb(SIG_B); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, cv.width, cv.height);
-  cv._redraw = () => drawDualTile(cv, meta, xy, vA, vB, lA, lB, box);
+  const ctx = cv.getContext("2d"), n = vA.length, px = (n > 30000 ? 1.5 : 2.2) * Math.max(1, box / 260), base = [45, 50, 60], cA = hex2rgb(SIG_A), cB = hex2rgb(SIG_B); ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, cv.width, cv.height);
+  cv._redraw = () => drawDualTile(cv, meta, xy, vA, vB, lA, lB, box); cv._figDraw = heFor(meta.id, "sig") ? null : (b) => { const c = document.createElement("canvas"); drawDualTile(c, meta, xy, vA, vB, lA, lB, b); return c; };
   const hs = heFor(meta.id, "sig"); if (hs) { drawHE(ctx, { sample: hs, redo: () => heRedoCv(cv), w: "sig" }, (x) => 4 + (x - meta.x[0]) * k, (y) => 4 + (y - meta.y[0]) * k, cv.width, cv.height, k); ctx.globalAlpha = HEW.sig.a; }
   const tA = new Float32Array(n), tB = new Float32Array(n), key = new Float32Array(n); for (let i = 0; i < n; i++) { tA[i] = Math.max(0, Math.min(1, (vA[i] - lA.lo) / (lA.hi - lA.lo))); tB[i] = Math.max(0, Math.min(1, (vB[i] - lB.lo) / (lB.hi - lB.lo))); key[i] = Math.max(tA[i], tB[i]); }
   const o = new Uint32Array(n); for (let i = 0; i < n; i++) o[i] = i; o.sort((p, q) => key[p] - key[q]);
@@ -2424,21 +2530,21 @@ function drawDualTile(cv, meta, xy, vA, vB, lA, lB, box = 260) {
   ctx.globalAlpha = 1;
 }
 async function drawSigMaps(host, sg, sg2, dA, dB, z, tok) {
-  const metas = S.meta.samples.slice().sort((a, b) => groupRank(groupLabel(a)) - groupRank(groupLabel(b)) || subtypeRank(subtypeOf(a)) - subtypeRank(subtypeOf(b)) || a.id.localeCompare(b.id)); host.replaceChildren(mk("div", "snote", "Loading maps…"));
+  const metas = S.meta.samples.slice().sort((a, b) => groupRank(groupOf(a)) - groupRank(groupOf(b)) || a.id.localeCompare(b.id)); host.replaceChildren(mk("div", "snote", "Loading maps…"));
   let vA, vB = null, xys; try { [vA, vB, xys] = await Promise.all([Promise.all(metas.map((m) => sigVec(m.id, sg.genes, SIG.sigma, SIG.scope))), sg2 ? Promise.all(metas.map((m) => sigVec(m.id, sg2.genes, SIG.sigma, SIG.scope))) : null, Promise.all(metas.map((m) => galGet(m.id, "xy")))]); } catch (e) { host.textContent = "Error: " + e.message; return; }
   if (tok !== SIG.tok) return; const meanA = Object.fromEntries(dA.samples.map((s) => [s.sample, s.mean])), meanB = dB ? Object.fromEntries(dB.samples.map((s) => [s.sample, s.mean])) : {};
   let drawTile, sc, lA, lB;
   if (sg2) {
     lA = dualLimits(vA, z); lB = dualLimits(vB, z); const leg = mk("div"), row = mk("div", "cmpleg"); row.style.flexWrap = "wrap";
     for (const [c, t] of [[SIG_A, `A · ${sg.name}`], [SIG_B, `B · ${sg2.name}`], ["#ffe0ff", "both high"]]) { const sp = mk("span"), k = mk("span", "k"); k.style.background = c; sp.append(k, document.createTextNode(t)); row.append(sp); }
-    leg.append(row, mk("div", "snote", `Intensity = score ${z ? "above the average (z > 0 up to the 99.5th percentile)" : "from the 1st to the 99.5th percentile"}, scaled separately for A and B across all samples; σ = ${SIG.sigma || 0} µm.`)); host.replaceChildren(leg);
+    leg.append(row, mk("div", "snote", `Intensity = score ${z ? "above the average (z > 0 up to the 99.5th percentile)" : "from the 1st to the 99.5th percentile"}, scaled separately for A and B across all tissues; σ = ${SIG.sigma || 0} µm.`)); host.replaceChildren(leg);
     drawTile = (cv, m, xy, i) => drawDualTile(cv, m, xy, vA[i], vB[i], lA, lB);
   } else { sc = scoreScale(vA, z); host.replaceChildren(scoreLegend(sc, `${sg.name} (σ = ${SIG.sigma || 0} µm)`)); drawTile = (cv, m, xy, i) => drawScoreTile(cv, m, xy, vA[i], sc); }
   let cur = null, grid = null;
   metas.forEach((m, i) => {
-    const st = groupLabel(m); if (st !== cur) { cur = st; const sec = mk("div", "glomsec"); sec.append(mk("div", "sechead", st)); grid = mk("div", "secgrid"); sec.append(grid); host.append(sec); }
+    const st = groupOf(m); if (st !== cur) { cur = st; const sec = mk("div", "glomsec"); sec.append(mk("div", "sechead", st)); grid = mk("div", "secgrid"); sec.append(grid); host.append(sec); }
     const t = mk("div", "tile"), cv = mk("canvas"); t.append(cv); const cap = mk("div", "cap"); cap.append(Object.assign(mk("b"), { textContent: dlabel(m.id) }), document.createElement("br"),
-      mk("span", "muted", `${fmt(m.n)} cells${meanA[donorOfId(m.id)] != null ? " · donor mean " + meanA[donorOfId(m.id)].toFixed(2) + (sg2 && meanB[donorOfId(m.id)] != null ? " / " + meanB[donorOfId(m.id)].toFixed(2) : "") : ""}${SIG.group === "type" ? " · " + subtypeOf(m) : ""}`)); t.append(cap); grid.append(t);
+      mk("span", "muted", `${fmt(m.n)} cells${meanA[donorOfId(m.id)] != null ? " · donor mean " + meanA[donorOfId(m.id)].toFixed(2) + (sg2 && meanB[donorOfId(m.id)] != null ? " / " + meanB[donorOfId(m.id)].toFixed(2) : "") : ""}`)); t.append(cap); grid.append(t);
     t.addEventListener("click", async () => { $("sample").value = m.id; closeSig(); await loadSample(m.id); }); drawTile(cv, m, xys[i], i);
   });
 }
@@ -2447,18 +2553,18 @@ async function drawSigMaps(host, sg, sg2, dA, dB, z, tok) {
 async function renderLoc() {
   const pane = $("sigpane"), tok = ++SIG.tok; pane.replaceChildren();
   pane.append(Object.assign(mk("div", "sh2", "Do two signatures localise to different regions of the tissue?"), { style: "margin-top:0" }));
-  pane.append(mk("div", "sdesc", "Both signatures are smoothed within each tissue piece and z-scored within each donor, so each has mean 0 and SD 1 and their difference is in SD units. The test compares the two maps (correlation, overlap of their hottest cells) and asks, region by region and cell type by cell type, whether one signature is systematically higher than the other. Samples are the unit of replication."));
+  pane.append(mk("div", "sdesc", "Both signatures are smoothed within each tissue piece and z-scored within each donor, so each has mean 0 and SD 1 and their difference is in SD units. The test compares the two maps (correlation, overlap of their hottest cells) and asks, region by region and cell type by cell type, whether one signature is systematically higher than the other. Donors are the unit of replication."));
   const ctl = mk("div", "sctl");
   const sa = mk("select"), sb = mk("select"); const la = mk("label"), lb = mk("label"); la.append("A ", sa); lb.append("B ", sb); sigPicker(sa, { none: null }); sigPicker(sb, { none: null }); sa.value = SIG.a; sb.value = SIG.b;
   const sl = mk("input"); sl.type = "range"; sl.min = 0; sl.max = 100; sl.step = 5; sl.value = SIG.locSigma; const sv = mk("span", "", SIG.locSigma ? SIG.locSigma + " µm" : "off"); const l1 = mk("label"); l1.append("Smoothing σ ", sl, sv);
   const q = mk("input"); q.type = "number"; q.min = 5; q.max = 30; q.step = 5; q.value = SIG.locQ; q.style.width = "56px"; const lq = mk("label"); lq.append("Hotspot = top ", q, "%");
-  const ss = mk("select"); ss.innerHTML = `<option value="">all donors</option>` + (SIG.order || []).map((t) => `<option value="${t}" ${t === SIG.locSub ? "selected" : ""}>${t} only</option>`).join(""); const ls = mk("label"); ls.append("Samples ", ss);
+  const ss = mk("select"); ss.innerHTML = `<option value="">all donors</option>` + (hasGroups() ? sortedGroups() : []).map((t) => `<option value="${t}" ${t === SIG.locSub ? "selected" : ""}>${t} only</option>`).join(""); const ls = mk("label"); ls.append("Donors ", ss); ls.hidden = !hasGroups();
   const run = mk("button", "", "Run"); ctl.append(la, lb, l1, lq, ls, run); pane.append(ctl);
   sl.addEventListener("input", () => { sv.textContent = +sl.value ? sl.value + " µm" : "off"; });
   const go = () => { SIG.a = sa.value; SIG.b = sb.value; SIG.locSigma = +sl.value; SIG.locQ = +q.value || 10; SIG.locSub = ss.value; renderLoc(); };
   run.addEventListener("click", go); [sa, sb, ss].forEach((e) => e.addEventListener("change", go)); sl.addEventListener("change", go); q.addEventListener("change", go);
   const out = mk("div", "snote", "Computing…"); pane.append(out);
-  let d; try { d = await postJSON("/api/signature/localization", { a: SIG.a, b: SIG.b, sigma: SIG.locSigma, q: SIG.locQ / 100, subtype: SIG.locSub || null }); } catch (e) { out.textContent = "Error: " + e.message; return; }
+  let d; try { await Promise.all([sigFull(SIG.a), sigFull(SIG.b)]); d = await postJSON("/api/signature/localization", { a: SIG.a, b: SIG.b, sigma: SIG.locSigma, q: SIG.locQ / 100, group: SIG.locSub || null }); } catch (e) { out.textContent = "Error: " + e.message; return; }
   if (tok !== SIG.tok) return; out.remove();
   const A = SIG.byId[SIG.a], B = SIG.byId[SIG.b], na = A.name.replace(/ \(.*/, "").replace("IFN ", "IFN "), nb = B.name.replace(/ \(.*/, "");
   const sig = (rows, key) => rows.filter((r) => r[key] != null && r[key] < 0.05), o = d.overall;
@@ -2468,18 +2574,23 @@ async function renderLoc() {
   li(`The hottest ${SIG.locQ}% of cells overlap ${o.overlap_ratio_mean.toFixed(1)}× more than chance (1× = independent, ${(100 / SIG.locQ).toFixed(0)}× = identical maps).`);
   const rA = sig(d.regions, "d_adj_fdr"), cA = sig(d.cell_types, "d_fdr"), rR = sig(d.regions, "d_fdr");
   const fmtR = (rows, key, k) => rows.length ? rows.map((r) => `${r.name} (${fmtN(r[k])}, FDR ${fmtP(r[key])})`).join("; ") : "none";
-  li(`Regions where ${na} is higher than ${nb} after adjusting for cell type (FDR < 0.05): ${fmtR(rA.filter((r) => r.d_adj > 0), "d_adj_fdr", "d_adj")}. Where ${nb} is higher: ${fmtR(rA.filter((r) => r.d_adj < 0), "d_adj_fdr", "d_adj")}.`);
-  li(`Without the cell-type adjustment the significant regions are: ${fmtR(rR, "d_fdr", "d")}.`);
-  li(`Cell types where one signature is significantly higher (raw contrast, FDR < 0.05; positive = ${na} higher): ${cA.length ? cA.sort((a, b) => b.d - a.d).map((r) => `${r.name} (${fmtN(r.d)})`).join("; ") : "none"}.`);
-  const small = d.regions.filter((r) => r.n_donors < 6).map((r) => r.name); li(`Caveat: regions seen in fewer than 6 donors cannot reach significance (${small.join(", ") || "none here"}); nested regions are analysed independently; ${d.subtype ? "only " + d.subtype + " samples" : "all samples"} pooled.`);
+  // "none" below means tested and not significant; what could not be tested is said so
+  const notTested = (what, seen, n) => (n ? (seen > n ? li(`${seen - n} of ${seen} ${what} were not tested: each needs at least ${d.min_test_donors} donors with ${d.min_cells} or more cells.`) : null) : li(`${what[0].toUpperCase() + what.slice(1)} were not tested: each needs at least ${d.min_test_donors} donors with ${d.min_cells} or more cells (this selection has ${donTxt(d.n_donors)}).`));
+  const nR = d.regions.filter((r) => r.d_fdr != null).length, nC = d.cell_types.filter((r) => r.d_fdr != null).length;
+  if (nR) { li(`Regions where ${na} is higher than ${nb} after adjusting for cell type (FDR < 0.05): ${fmtR(rA.filter((r) => r.d_adj > 0), "d_adj_fdr", "d_adj")}. Where ${nb} is higher: ${fmtR(rA.filter((r) => r.d_adj < 0), "d_adj_fdr", "d_adj")}.`);
+    li(`Without the cell-type adjustment the significant regions are: ${fmtR(rR, "d_fdr", "d")}.`); }
+  if (d.regions_seen) notTested("regions", d.regions_seen, nR);
+  if (nC) li(`Cell types where one signature is significantly higher (raw contrast, FDR < 0.05; positive = ${na} higher): ${cA.length ? cA.sort((a, b) => b.d - a.d).map((r) => `${r.name} (${fmtN(r.d)})`).join("; ") : "none"}.`);
+  notTested("cell types", d.cell_types_seen, nC);
+  const who = d.group ? `only ${d.group} donors` : "all donors"; li(d.regions_seen ? `Nested regions are analysed independently; ${who} included.` : `${who[0].toUpperCase() + who.slice(1)} included.`);
   sum.append(ul); pane.append(sum);
-  pane.append(mk("div", "sh2", "Where does each signature sit? Contrast d = mean(A) − mean(B) over the cells inside, in SD units")); pane.append(forest(d.regions, na, nb, "Pathologist regions")); pane.append(forest(d.cell_types, na, nb, "Cell types"));
+  pane.append(mk("div", "sh2", "Where does each signature sit? Contrast d = mean(A) − mean(B) over the cells inside, in SD units")); if (d.regions_seen) pane.append(forest(d.regions, na, nb, "Pathologist regions", d)); pane.append(forest(d.cell_types, na, nb, "Cell types", d));
   pane.append(mk("div", "sh2", "Per donor")); pane.append(locSampleTable(d));
   pane.append(mk("div", "sh2", "Maps of one donor")); const mp = mk("div"); pane.append(mp); await locMaps(mp, A, B, tok);
 }
-function forest(rows, na, nb, title) {
-  const w = mk("div"); w.append(mk("div", "snote", title + (rows.length && rows[0].d_adj == null ? ` — raw contrast only (removing a cell type's own mean would make it zero);` : ` — hollow = raw contrast, filled = after removing cell-type means;`) + ` blue = ${na} higher, orange = ${nb} higher (FDR < 0.05), grey = not significant`));
-  if (!rows.length) { w.append(mk("div", "snote", "Too few donors with enough cells.")); return w; }
+function forest(rows, na, nb, title, d) {
+  const w = mk("div"); w.append(mk("div", "snote", title + (rows.length && rows[0].d_adj == null ? ` — raw contrast only (removing a cell type's own mean would make it zero);` : ` — hollow = raw contrast, filled = after removing cell-type means;`) + ` blue = ${na} higher, orange = ${nb} higher (FDR < 0.05), grey = not significant or not tested`));
+  if (!rows.length) { w.append(mk("div", "snote", `Not shown: a row needs at least ${d.min_samples} donors with ${d.min_cells} or more cells.`)); return w; }
   rows = rows.slice().sort((a, b) => (b.d_adj ?? b.d) - (a.d_adj ?? a.d)); const W = 760, rh = 28, m = { l: 200, r: 150, t: 24, b: 30 }, H = m.t + m.b + rows.length * rh, svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
   const vals = rows.flatMap((r) => [r.d, ...(r.d_ci || []), r.d_adj, ...(r.d_adj_ci || [])]).filter((v) => v != null), mx = Math.max(0.2, Math.max(...vals.map(Math.abs))) * 1.08, xs = (v) => m.l + ((v + mx) / (2 * mx)) * (W - m.l - m.r);
   for (const t of [-mx, -mx / 2, 0, mx / 2, mx]) { svgEl("line", { x1: xs(t), x2: xs(t), y1: m.t - 6, y2: H - m.b, stroke: t === 0 ? "#6b7785" : "#29303b", "stroke-width": 1 }, svg); svgEl("text", { x: xs(t), y: H - m.b + 16, "text-anchor": "middle", fill: "#8b95a5", "font-size": 11 }, svg).textContent = t.toFixed(2); }
@@ -2497,15 +2608,15 @@ function forest(rows, na, nb, title) {
   w.append(svg); return w;
 }
 function locSampleTable(d) {
-  const tb = mk("table", "st"), hr = mk("tr"); ["Sample", "Cells", "r (A, B)", "r, cell-type-adjusted", "Hotspot overlap (× chance)"].forEach((t) => hr.append(mk("th", "", t))); tb.append(hr);
-  let cur = null; for (const r of d.samples.slice().sort((a, b) => subtypeRank(a.subtype) - subtypeRank(b.subtype) || a.sample.localeCompare(b.sample))) {
-    if (r.subtype !== cur) { cur = r.subtype; const tr = mk("tr", "sub"); const t0 = mk("td", "", cur); t0.colSpan = 5; tr.append(t0); tb.append(tr); }
+  const tb = mk("table", "st"), hr = mk("tr"); ["Donor", "Cells", "r (A, B)", "r, cell-type-adjusted", "Hotspot overlap (× chance)"].forEach((t) => hr.append(mk("th", "", t))); tb.append(hr);
+  let cur = null; for (const r of d.samples.slice().sort((a, b) => groupRank(a.group) - groupRank(b.group) || a.sample.localeCompare(b.sample))) {
+    if (r.group !== cur) { cur = r.group; const tr = mk("tr", "sub"); const t0 = mk("td", "", cur); t0.colSpan = 5; tr.append(t0); tb.append(tr); }
     const tr = mk("tr"); [dlabel(r.sample), fmt(r.n), r.r.toFixed(2), r.r_adj.toFixed(2), r.overlap_ratio != null ? r.overlap_ratio.toFixed(1) + "×" : "–"].forEach((t) => tr.append(mk("td", "", t))); tb.append(tr);
   } const w = mk("div"); w.style.cssText = "max-height:340px;overflow:auto;display:inline-block;border:1px solid #29303b;border-radius:6px"; w.append(tb); return w;
 }
 async function locMaps(host, A, B, tok) {
-  const ids = S.meta.samples.slice().sort((a, b) => subtypeRank(subtypeOf(a)) - subtypeRank(subtypeOf(b)) || a.id.localeCompare(b.id));
-  const pick = mk("select"); pick.innerHTML = ids.map((m) => `<option value="${m.id}">${dlabel(m.id)} · ${subtypeOf(m)}</option>`).join(""); pick.value = SIG.mapSample && ids.some((m) => m.id === SIG.mapSample) ? SIG.mapSample : S.sample;
+  const ids = S.meta.samples.slice().sort((a, b) => groupRank(groupOf(a)) - groupRank(groupOf(b)) || a.id.localeCompare(b.id));
+  const pick = mk("select"); pick.innerHTML = ids.map((m) => `<option value="${m.id}">${dlabel(m.id)}${gTag(m)}</option>`).join(""); pick.value = SIG.mapSample && ids.some((m) => m.id === SIG.mapSample) ? SIG.mapSample : S.sample;
   const row = mk("div", "sctl"), lab = mk("label"); lab.append("Donor ", pick); row.append(lab); host.append(row); const grid = mk("div", "mapgrid"); host.append(grid);
   const draw = async () => {
     SIG.mapSample = pick.value; grid.replaceChildren(mk("div", "snote", "Loading maps…")); const meta = S.meta.samples.find((m) => m.id === pick.value);
@@ -2518,12 +2629,13 @@ async function locMaps(host, A, B, tok) {
 }
 
 // ---------------------------------------------------------------- violins: one violin per sample, by cell type or by cell state
-// Every panel = one gene / signature in one cell type; samples sit side by side in disease-subtype order. In cell-state mode a panel holds all
+// Every panel = one gene / signature in one cell type; samples sit side by side in group order. In cell-state mode a panel holds all
 // cell states of one cell type (one group of per-sample violins per state). Distributions are computed on the server (density, quartiles).
-const VIO = { feats: [], cts: new Set([0]), level: "cell_type", unit: "sample", sigma: 0, scope: "none", nz: false, tok: 0, type: "violin", logy: false };
+const VIO = { feats: [], cts: new Set([0]), level: "cell_type", unit: "sample", panel: "cell_type", dotBy: "all", started: false, sigma: 0, scope: "none", nz: false, tok: 0, type: "violin", logy: false };
 const vioKey = (f) => (f.sig ? "s:" + f.sig : "g:" + f.gene), vioName = (f) => (f.sig ? (SIG.byId[f.sig]?.name || f.sig) : f.gene);
 async function openVio() {
   closeAllWindows();
+  if (!VIO.started) { VIO.started = true; if (nDonors(S.meta.samples) === 1) { VIO.panel = "donor"; VIO.cts = new Set(S.meta.cats.cell_type.levels.slice(0, 60).map((_, i) => i)); } }   // one donor: compare its cell types in one plot
   try { await loadSigList(); } catch (e) { /* signatures optional */ }
   if (!VIO.feats.length) { const d0 = SIG.byId?.isg_amp_sle ? "isg_amp_sle" : SIG.defA; if (d0) VIO.feats.push({ sig: d0 }); else { const l = await jget("/api/genes/search?q="); if (l.length) VIO.feats.push({ gene: l[0] }); } }   // projects without signatures.json: start from the first panel gene
   $("vio").hidden = false; vioControls(); renderVio();
@@ -2540,32 +2652,39 @@ function vioControls() {
   if (VIO.level === "cell_state") VIO.cts.delete(-1);
   const sel = [...VIO.cts].sort((a, b) => a - b).map((i) => (i < 0 ? "All cells" : names[i].replace(/ cells$/, "")));
   $("vioctssum").textContent = `Cell types: ${sel.length ? (sel.length > 3 ? sel.length + " selected" : sel.join(", ")) : "none"} ▾`;
-  $("vioshow").value = VIO.level; $("vioscope").value = VIO.scope; $("vionz").checked = VIO.nz; $("vionit").value = VIO.unit; $("viotype").value = VIO.type; $("viology").checked = VIO.logy; $("viology").parentElement.hidden = VIO.type !== "hist"; $("viohead").querySelector(".muted").textContent = VIO.unit === "sample" ? "one violin per donor (tissue pieces pooled), grouped by disease subtype" : `one bar per disease ${VIO.unit} = mean of its donors' means, grouped by cell type`;
+  $("vioshow").value = VIO.level; $("vioscope").value = VIO.scope; $("vionz").checked = VIO.nz; $("vionit").value = VIO.unit; $("viotype").value = VIO.type; $("viology").checked = VIO.logy; $("viology").parentElement.hidden = VIO.type !== "hist"; $("viohead").querySelector(".muted").textContent = VIO.type === "dot" ? "dot size = cells expressing, colour = mean expression" : VIO.unit === "sample" && VIO.panel === "donor" && VIO.type !== "hist" ? "one panel per donor, one violin per cell type" : VIO.unit === "sample" ? `one violin per donor (tissue pieces pooled)${hasGroups() ? ", grouped by " + groupName() : ""}` : `one bar per ${groupName()} = mean of its donors' means, grouped by cell type`;
 }
 async function vioAddGene() {
-  const v = $("viogene").value.trim(); if (!v) return; const hit = (await jget("/api/genes/search?q=" + encodeURIComponent(v) + "&limit=1"))[0];
-  if (!hit || hit.toLowerCase() !== v.toLowerCase()) { $("viomsg").textContent = `“${v}” is not on the panel`; return; }
-  $("viomsg").textContent = ""; if (!VIO.feats.some((f) => f.gene === hit)) VIO.feats.push({ gene: hit }); $("viogene").value = ""; vioControls(); renderVio();
+  const names = [...new Set($("viogene").value.split(/[\s,;]+/).filter(Boolean))]; if (!names.length) return;
+  const hits = await Promise.all(names.map((v) => jget("/api/genes/search?q=" + encodeURIComponent(v) + "&limit=1").then((l) => (l[0] && l[0].toLowerCase() === v.toLowerCase() ? l[0] : null))));
+  const miss = names.filter((_, i) => !hits[i]); $("viomsg").textContent = miss.length ? `not on the panel: ${miss.join(", ")}` : "";
+  const add = hits.filter(Boolean); if (!add.length) return; for (const hit of add) if (!VIO.feats.some((f) => f.gene === hit)) VIO.feats.push({ gene: hit }); $("viogene").value = ""; vioControls(); renderVio();
 }
 async function renderVio() {
   if ($("vio").hidden) return; const tok = ++VIO.tok, body = $("viobody"), cts = [...VIO.cts].sort((a, b) => a - b);
   if (!VIO.feats.length || !cts.length) { body.replaceChildren(mk("div", "snote", "Add at least one gene or signature and choose at least one cell type.")); return; }
-  if (VIO.feats.length * cts.length > 24) { body.replaceChildren(mk("div", "snote", `That is ${VIO.feats.length * cts.length} panels; please select fewer genes / signatures / cell types (at most 24).`)); return; }
+  vioModeUI(); if (VIO.type === "dot") return renderDot(tok, cts);
+  if (VIO.feats.length > 8) { body.replaceChildren(mk("div", "snote", `Violins and histograms show at most 8 genes / signatures (${VIO.feats.length} chosen). Remove some, or use the dot plot.`)); return; }
+  const byDonor = VIO.panel === "donor" && VIO.unit === "sample" && VIO.type !== "hist", nPanels = VIO.feats.length * (byDonor ? nDonors(S.meta.samples) : cts.length), maxPanels = byDonor ? 40 : 24;
+  $("viopanel").value = VIO.panel;
+  if (nPanels > maxPanels) { body.replaceChildren(mk("div", "snote", `That is ${nPanels} panels; please select fewer genes / signatures${byDonor ? "" : " / cell types"} (at most ${maxPanels}).`)); return; }
+  if (cts.length > 60) { body.replaceChildren(mk("div", "snote", `That is ${cts.length} cell types; please select at most 60.`)); return; }
   body.replaceChildren(mk("div", "snote", "Computing…"));
   if (VIO.type === "hist") return renderVioHist(tok, cts);
   let d; try { d = await postJSON("/api/violin", { features: VIO.feats.map((f) => (f.sig ? { sig: f.sig } : { gene: f.gene })), cell_types: cts, sigma: 0, layer: S.layer, scope: VIO.scope, nonzero_only: VIO.nz, level: VIO.level, unit: VIO.unit }); }
   catch (e) { body.replaceChildren(mk("div", "snote", "Error: " + e.message)); return; }
   if (tok !== VIO.tok) return; body.replaceChildren();
-  let meta = Object.fromEntries(d.samples.map((s) => [s.id, s])), order = d.samples.slice().sort((a, b) => subtypeRank(a.subtype) - subtypeRank(b.subtype) || a.id.localeCompare(b.id)).map((s) => s.id), panels = d.panels;
-  if (VIO.unit !== "sample") {   // pooled violins: one per disease subtype / type; all selected cell types go into ONE plot per feature
-    const names = d.panels[0].groups[0].samples.map((r) => r.sample), rk = (n) => (VIO.unit === "type" ? NB_TYPE_ORDER.indexOf(n) : subtypeRank(n));
-    order = names.slice().sort((a, b) => rk(a) - rk(b)); meta = Object.fromEntries(names.map((n) => [n, { subtype: n }]));
+  let meta = Object.fromEntries(d.samples.map((s) => [s.id, s])), order = d.samples.slice().sort((a, b) => groupRank(a.group) - groupRank(b.group) || a.id.localeCompare(b.id)).map((s) => s.id), panels = d.panels;
+  if (VIO.unit !== "sample") {   // pooled violins: one per group; all selected cell types go into ONE plot per feature
+    const names = d.panels[0].groups[0].samples.map((r) => r.sample), rk = groupRank;
+    order = names.slice().sort((a, b) => rk(a) - rk(b)); meta = Object.fromEntries(names.map((n) => [n, { group: n }]));
     if (VIO.level === "cell_type") panels = [...new Set(d.panels.map((p) => p.feature))].map((f) => { const ps = d.panels.filter((p) => p.feature === f);
       return { feature: f, cell_type: ps.length > 1 ? "all selected cell types" : ps[0].cell_type, cell_type_id: ps[0].cell_type_id, level: "cell_type", lo: ps[0].lo, hi: ps[0].hi, merged: ps.length > 1,
         groups: ps.map((p) => ({ ...p.groups[0], name: p.cell_type, id: p.cell_type_id })) }; });
   }
-  for (const p of panels) body.append(VIO.unit !== "sample" ? barPanel(p, meta, order) : violinPanel(p, meta, order));
-  const note = mk("div", "snote", (VIO.unit !== "sample" ? `Each bar is the mean over the donors of one disease ${VIO.unit} of the donor's own mean (every donor counts once, however many cells it has); error bar = standard error over donors; dots = donors. ` : "Each violin is one donor (its tissue pieces pooled). ") + "(Disease subtype order: Control, No LN, Class I/II, Class III, Class V). Dot = median, dark bar = interquartile range; every violin is scaled to the same maximum width, so read its cell count from the tooltip. A grey tick means fewer than 10 cells. The axis covers the 0.5–99.5th percentile of the plotted cells (values beyond are drawn at the edge). Many cells have a score of 0 for sparse genes: tick “expressing cells only” to see the distribution among expressing cells (the tooltip gives the percentage expressing).");
+  if (byDonor) for (const p of vioDonorPanels(d, order, meta)) body.append(donorViolinPanel(p));
+  else for (const p of panels) body.append(VIO.unit !== "sample" ? barPanel(p, meta, order) : violinPanel(p, meta, order));
+  const note = mk("div", "snote", (VIO.unit !== "sample" ? `Each bar is the mean over the donors of one ${groupName()} of the donor's own mean (every donor counts once, however many cells it has); error bar = standard error over donors; dots = donors. ` : byDonor ? "Each violin is one cell type or state in that donor (tissue pieces pooled); all panels of a gene share one axis. " : "Each violin is one donor (its tissue pieces pooled). ") + "Dot = median, dark bar = interquartile range; every violin is scaled to the same maximum width, so read its cell count from the tooltip. A grey tick means fewer than 10 cells. The axis covers the 0.5–99.5th percentile of the plotted cells (values beyond are drawn at the edge). Many cells have a score of 0 for sparse genes: tick “expressing cells only” to see the distribution among expressing cells (the tooltip gives the percentage expressing).");
   note.style.maxWidth = "900px"; body.append(note);
 }
 // Histograms of the per-cell values behind the violins (all donors pooled): the x-axis is the same scale as the violins' y-axis, and for a single gene
@@ -2582,7 +2701,7 @@ async function renderVioHist(tok, cts) {
       if (clip) svgEl("text", { x: L + i * bw + bw + 4, y: T + 10, fill: "#aab4c3", "font-size": 10 }, svg).textContent = `← cut off at the top: ${o.frac ? (100 * c).toFixed(1) + "% of cells" : fmt(c) + " cells"}`;
       svgEl("title", {}, r).textContent = o.frac ? `${labels[i]}: ${(100 * c).toFixed(c < 0.01 ? 3 : 2)}% of a donor's cells (mean over donors)` : `${labels[i]}: ${fmt(c)} cells (${(100 * c / tot).toFixed(c / tot < 0.01 ? 2 : 1)}%)`; });
     svgEl("line", { x1: L, x2: W - 10, y1: H - B, y2: H - B, stroke: "#39424f" }, svg);
-    const ticks = counts.length <= 12 ? counts.length - 1 : 5; for (let k = 0; k <= ticks; k++) { const i = Math.round((k / ticks) * (counts.length - 1)); svgEl("text", { x: L + i * bw + bw / 2, y: H - B + 14, "text-anchor": "middle", fill: "#8b95a5", "font-size": 10 }, svg).textContent = labels[i].split("–")[0]; }
+    const ticks = counts.length <= 12 ? Math.max(1, counts.length - 1) : 5; for (let k = 0; k <= ticks; k++) { const i = Math.round((k / ticks) * (counts.length - 1)); svgEl("text", { x: L + i * bw + bw / 2, y: H - B + 14, "text-anchor": "middle", fill: "#8b95a5", "font-size": 10 }, svg).textContent = labels[i].split("–")[0]; }
     svgEl("text", { x: L + (W - L - 10) / 2, y: H - 6, "text-anchor": "middle", fill: "#8b95a5", "font-size": 10.5 }, svg).textContent = xlab;
     svgEl("text", { x: 12, y: T + (H - T - B) / 2, "text-anchor": "middle", fill: "#8b95a5", "font-size": 10.5, transform: `rotate(-90 12 ${T + (H - T - B) / 2})` }, svg).textContent = o.frac ? (VIO.logy ? "log10(1 + 10⁴ × share)" : "% of cells (donor mean)") : VIO.logy ? "log10(1 + cells)" : "cells";
     svgEl("text", { x: L - 6, y: T + 8, "text-anchor": "end", fill: "#8b95a5", "font-size": 10 }, svg).textContent = o.frac ? (100 * (VIO.logy ? (10 ** mx - 1) / 1e4 : mx)).toFixed(2) + "%" : VIO.logy ? fmt(Math.round(10 ** mx - 1)) : fmt(Math.round(mx));
@@ -2597,10 +2716,10 @@ async function renderVioHist(tok, cts) {
     const ecol = p.cell_type_id < 0 ? "#8b95a5" : catColor("cell_type", p.cell_type_id), lab = (i) => `${p.edges[i]}–${p.edges[i + 1]}`;
     const labels = ["0", ...p.counts.map((_, i) => lab(i))], xl = "value plotted on the violins' y-axis: " + vioYLabel() + " (bar 1 = exactly 0, the rest are 60 equal bins of the non-zero values)";
     const rl = p.raw ? p.raw.counts.map((_, i) => (i === p.raw.top && p.raw.max > p.raw.top ? `${i}+` : String(i))) : [];
-    const rk = (n) => (VIO.unit === "type" ? NB_TYPE_ORDER.indexOf(n) : subtypeRank(n)), gs = p.groups ? p.groups.slice().sort((a, b) => rk(a.name) - rk(b.name)) : null;
-    if (gs) {   // one histogram per disease subtype / type: the average over its donors of each donor's own histogram
+    const rk = groupRank, gs = p.groups ? p.groups.slice().sort((a, b) => rk(a.name) - rk(b.name)) : null;
+    if (gs) {   // one histogram per group: the average over its donors of each donor's own histogram
       const okg = gs.filter((g) => g.share), ym = Math.max(...okg.flatMap((g) => g.share.slice(1)), 1e-9), rm = p.raw ? Math.max(...okg.flatMap((g) => (g.raw_share || []).slice(1)), 1e-9) : 0;
-      box.append(mk("div", "snote", "One histogram per disease " + VIO.unit + ": the average over its donors of each donor's own histogram (share of that donor's cells per bin; every donor counts once; donors with < 10 cells are left out). Same y-scale in every histogram; the grey zero bar is cut off at the top when it is much taller than the rest (its value is printed)."));
+      box.append(mk("div", "snote", "One histogram per " + groupName() + ": the average over its donors of each donor's own histogram (share of that donor's cells per bin; every donor counts once; donors with < 10 cells are left out). Same y-scale in every histogram; the grey zero bar is cut off at the top when it is much taller than the rest (its value is printed)."));
       for (const g of gs) {
         box.append(Object.assign(mk("div", "vtitle"), { textContent: `${g.name} · ${g.n_donors_used} donor${g.n_donors_used === 1 ? "" : "s"}${g.n_donors_used < g.n_donors ? ` (of ${g.n_donors})` : ""} · ${fmt(g.n)} cells${g.mean != null ? ` · mean of donor means ${g.mean.toFixed(3)}` : ""}` }));
         if (!g.share) { box.append(mk("div", "snote", "Too few cells.")); continue; }
@@ -2617,14 +2736,14 @@ async function renderVioHist(tok, cts) {
     } else box.append(mk("div", "snote", "Signature score = mean of the genes' values on the chosen layer" + (S.layer === "counts" ? " (raw counts)" : S.meta.ln_given ? ", the log-normalised values as given in the input" : ", each log1p(counts / total counts × " + fmt(d.norm_scale) + ")") + (VIO.scope !== "none" ? ", then z-scored" : "") + "."));
     body.append(box);
   }
-  const note = mk("div", "snote", (VIO.unit === "sample" ? "Histograms pool all donors (choose “disease subtype” or “disease type” under “One violin per” for donor-averaged histograms per group)" : "Histograms are averaged over donors") + "; they ignore the cell-state option. Cell types, score, z-score and expressing-cells options are the same as for the violins."); note.style.maxWidth = "900px"; body.append(note);
+  const note = mk("div", "snote", (VIO.unit === "sample" ? "Histograms pool all donors (choose a group under “Show per” for donor-averaged histograms per group)" : "Histograms are averaged over donors") + "; they ignore the cell-state option. Cell types, score, z-score and expressing-cells options are the same as for the violins."); note.style.maxWidth = "900px"; body.append(note);
 }
 function vioYLabel() {   // follows the main viewer's expression layer; z-scores say which scope they use
   const lay = S.layer === "counts" ? "raw counts" : normLabel(false);
-  const zl = { sample: "within each donor", subtype: "within disease subtype", type: "within disease type", all: "across all samples", nocontrol: "vs non-control samples" }[VIO.scope];
+  const zl = scopeText(VIO.scope);
   return VIO.scope === "none" ? lay : `z-score of ${lay} (${zl})`;
 }
-// Disease subtype / type view: one bar per subtype (or type) = mean over its donors of each donor's mean score; whiskers = SE over donors; dots = the donors.
+// Group view: one bar per group = mean over its donors of each donor's mean score; whiskers = SE over donors; dots = the donors.
 function barPanel(p, meta, order) {
   const many = p.groups.length > 1, bw = many ? 16 : 40, gap = 8, ggap = 26, L = 56, T = 24, PH = 190, B = 46;
   const pos = []; let x = L; for (const g of p.groups) { const gx = []; order.forEach(() => { gx.push(x + bw / 2); x += bw + gap; }); pos.push(gx); x += ggap - gap; }
@@ -2648,15 +2767,82 @@ function barPanel(p, meta, order) {
       if (!many) svgEl("text", { x: cx, y: T + PH + 16, "text-anchor": "middle", fill: "#8b95a5", "font-size": 10.5 }, svg).textContent = `${r.sample} (${r.n_donors})`;
     });
     if (many) { const gx = pos[gi]; svgEl("text", { x: (gx[0] + gx[gx.length - 1]) / 2, y: T + PH + 16, "text-anchor": "middle", fill: "#e3e8ef", "font-size": 11.5, "font-weight": 600 }, svg).textContent = p.merged ? g.name.replace(/ cells$/, "") : g.name.split(".")[0];
-      order.forEach((nm, i) => svgEl("text", { x: gx[i], y: T + PH + 30, "text-anchor": "middle", fill: "#6b7785", "font-size": 8.5 }, svg).textContent = nm.replace("Class ", "").replace("Control", "Ctl").replace("No LN", "NoLN")); }
+      order.forEach((nm, i) => svgEl("text", { x: gx[i], y: T + PH + 30, "text-anchor": "middle", fill: "#6b7785", "font-size": 8.5 }, svg).textContent = shortLabel(nm)); }
   });
   const w = mk("div", "vpanel"); w.append(mk("div", "vtitle", `${p.feature} — ${p.cell_type}${many && !p.merged ? " (cell states)" : ""}`));
   if (many) { const leg = mk("div", "vleg"); p.groups.forEach((g) => { const sp = mk("span"), k = mk("span", "k"); k.style.background = catColor(p.merged ? "cell_type" : "cell_state", g.id); sp.append(k, g.name); leg.append(sp); }); w.append(leg); }
   w.append(svg); return w;
 }
+// Which controls apply to the plot type chosen.
+function vioModeUI() {
+  const dot = VIO.type === "dot", many = nDonors(S.meta.samples) > 1;
+  $("viopanell").hidden = dot || VIO.type === "hist" || VIO.unit !== "sample"; $("vionit").closest("label").hidden = dot || !hasGroups(); $("vioscopel").hidden = dot;
+  fillOpts($("viodotby"), [...(many ? [["all", "all donors together"]] : []), ["donor", many ? "each donor" : "this donor"], ...(hasGroups() ? [["group", `each ${groupName()}`]] : [])]);
+  if (![...$("viodotby").options].some((o) => o.value === VIO.dotBy)) VIO.dotBy = $("viodotby").options[0].value; $("viodotby").value = VIO.dotBy; $("viodotl").hidden = !dot || !many;
+}
+async function renderDot(tok, cts) {
+  const body = $("viobody");
+  if (VIO.feats.length > 60 || cts.length > 60) { body.replaceChildren(mk("div", "snote", "A dot plot takes at most 60 genes / signatures and 60 cell types.")); return; }
+  body.replaceChildren(mk("div", "snote", "Computing…"));
+  let d; try { d = await postJSON("/api/dotplot", { features: VIO.feats.map((f) => (f.sig ? { sig: f.sig } : { gene: f.gene })), cell_types: cts, layer: S.layer, nonzero_only: VIO.nz, level: VIO.level, by: VIO.dotBy }); }
+  catch (e) { body.replaceChildren(mk("div", "snote", "Error: " + e.message)); return; }
+  if (tok !== VIO.tok) return; if (!d.columns.length) { body.replaceChildren(mk("div", "snote", "None of the chosen cell types has cell states.")); return; }
+  // colour: each gene from its lowest to its highest mean over every dot shown, so the plots of a page can be compared
+  const range = d.features.map((_, i) => { const v = d.plots.flatMap((p) => p.m[i]).filter((x) => x != null); return v.length ? [Math.min(...v), Math.max(...v)] : [0, 1]; });
+  body.replaceChildren(dotKey(d), ...d.plots.map((p) => dotPanel(d, p, range)));
+  const note = mk("div", "snote", `Dot area = share of cells with a value above 0${VIO.feats.some((f) => f.sig) ? " (for a signature: at least one of its genes detected)" : ""}. Colour = mean of ${S.layer === "counts" ? "raw counts" : normLabel(false)} over ${VIO.nz ? "the expressing cells" : "all cells"} of that column, scaled per gene from its lowest to its highest dot, so colours cannot be compared between genes. ${d.plots.some((p) => p.n_donors > 1) ? "Several donors: each donor is worked out on its own and then averaged, so every donor counts once. " : ""}A small grey dot means fewer than ${d.min_cells} cells${VIO.nz ? " expressing" : ""}. Descriptive only, no statistical test.`);
+  note.style.maxWidth = "900px"; body.append(note);
+}
+function dotKey(d) {
+  const w = mk("div", "dotkey"), bar = mk("span", "dotbar"); bar.style.background = `linear-gradient(90deg,${LUT.filter((_, i) => i % 32 === 0 || i === 255).map((c) => `rgb(${c})`).join(",")})`;
+  const col = mk("span", "dotk"); col.append("Mean (per gene): low ", bar, " high");
+  const size = mk("span", "dotk"); size.append("Cells expressing: ");
+  for (const f of [0.1, 0.25, 0.5, 1]) { const s = svgEl("svg", { width: 22, height: 22, viewBox: "0 0 22 22" }); svgEl("circle", { cx: 11, cy: 11, r: Math.max(1, Math.sqrt(f) * DOT_R), fill: "#aab4c3" }, s); size.append(s, ` ${f * 100}% `); }
+  w.append(col, size); return w;
+}
+const DOT_R = 10;
+function dotPanel(d, p, range) {
+  const cw = 26, rh = 24, nameW = Math.min(230, Math.max(70, 6.4 * Math.max(...d.features.map((f) => Math.min(f.length, 34))))), L = nameW + 10, T = 6, B = 112, W = L + d.columns.length * cw + 16, H = T + d.features.length * rh + B, svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+  const cx = (j) => L + cw * (j + 0.5), cy = (i) => T + rh * (i + 0.5), yB = T + d.features.length * rh;
+  d.columns.forEach((c, j) => { svgEl("line", { x1: cx(j), x2: cx(j), y1: T, y2: yB, stroke: "#20262f", "stroke-width": 1 }, svg); const t = svgEl("text", { x: cx(j) - 3, y: yB + 12, fill: "#cdd6e2", "font-size": 10, transform: `rotate(50 ${cx(j) - 3} ${yB + 12})` }, svg); t.textContent = shortLabel(c.name.replace(/ cells$/, ""), 20); });
+  d.features.forEach((f, i) => { const [lo, hi] = range[i], sp = hi - lo; svgEl("line", { x1: L, x2: W - 16, y1: cy(i), y2: cy(i), stroke: "#20262f", "stroke-width": 1 }, svg);
+    svgEl("text", { x: L - 8, y: cy(i) + 4, "text-anchor": "end", fill: "#e3e8ef", "font-size": 11 }, svg).textContent = shortLabel(f, 34);
+    d.columns.forEach((c, j) => { const pct = p.f[i][j], m = p.m[i][j];
+      if (pct == null) svgEl("circle", { cx: cx(j), cy: cy(i), r: 1.5, fill: "#4b566a" }, svg);
+      else if (pct > 0) { const r = Math.max(1, Math.sqrt(pct) * DOT_R); if (m == null) svgEl("circle", { cx: cx(j), cy: cy(i), r, fill: "none", stroke: "#6b7785", "stroke-width": 1 }, svg); else { const q = LUT[Math.round((sp > 0 ? (m - lo) / sp : 0.5) * 255)]; svgEl("circle", { cx: cx(j), cy: cy(i), r, fill: `rgb(${q[0]},${q[1]},${q[2]})`, stroke: "rgba(255,255,255,.4)", "stroke-width": 0.75 }, svg); } }
+      const hit = svgEl("rect", { x: cx(j) - cw / 2, y: cy(i) - rh / 2, width: cw, height: rh, fill: "transparent" }, svg);
+      hit.addEventListener("pointermove", (ev) => nbrTip(ev, [{ tag: "b", t: pct == null ? "too few cells" : (100 * pct).toFixed(1) + "% expressing" }, { t: `${f} · ${c.name}${c.parent ? " (" + c.parent + ")" : ""}` }, { cls: "m", t: `${m == null ? "mean: n/a" : "mean " + m.toFixed(3)} · ${fmt(p.n[j])} cells${p.n_donors > 1 ? ` · ${p.donors[j]} of ${p.n_donors} donors used` : ""}` }]));
+      hit.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; }); }); });
+  const by = VIO.dotBy, title = by === "donor" ? dlabel(p.name) + gTag(S.meta.samples.find((s) => s.donor === p.name) || {}) : by === "group" ? `${p.name} (${donTxt(p.n_donors)})` : nDonors(S.meta.samples) > 1 ? `All donors (${p.n_donors})` : dlabel(S.meta.samples[0].id);
+  const w = mk("div", "vpanel"); w.append(mk("div", "vtitle", title), svg); return w;
+}
+function drawViolin(svg, r0, cx, hw, ys, p, col, thin) {
+  if (r0.density) {
+    const n = r0.density.length, pts = []; for (let j = 0; j < n; j++) pts.push([cx - r0.density[j] * hw, ys(p.lo + ((p.hi - p.lo) * j) / (n - 1))]); for (let j = n - 1; j >= 0; j--) pts.push([cx + r0.density[j] * hw, ys(p.lo + ((p.hi - p.lo) * j) / (n - 1))]);
+    svgEl("path", { d: "M" + pts.map((q) => q[0].toFixed(1) + "," + q[1].toFixed(1)).join("L") + "Z", fill: col, "fill-opacity": 0.85, stroke: "none" }, svg);
+    svgEl("line", { x1: cx, x2: cx, y1: ys(r0.q25), y2: ys(r0.q75), stroke: "rgba(15,18,24,0.9)", "stroke-width": thin ? 2 : 3 }, svg); svgEl("circle", { cx, cy: ys(r0.median), r: thin ? 1.8 : 2.6, fill: "#ffffff" }, svg);
+  } else svgEl("line", { x1: cx - hw, x2: cx + hw, y1: ys(p.lo), y2: ys(p.lo), stroke: "#4b566a", "stroke-width": 2 }, svg);   // too few cells: a grey tick
+}
+// One panel per (feature, donor), one violin per cell type or state: the same numbers as the per-cell-type panels, arranged the other way.
+function vioDonorPanels(d, order, meta) {
+  return [...new Set(d.panels.map((p) => p.feature))].flatMap((f) => { const ps = d.panels.filter((p) => p.feature === f);
+    return order.map((donor) => ({ feature: f, donor, group: meta[donor]?.group, lo: ps[0].lo, hi: ps[0].hi,
+      violins: ps.flatMap((p) => p.groups.map((g) => ({ id: g.id, name: g.name, field: p.level === "cell_state" ? "cell_state" : "cell_type", row: g.samples.find((r) => r.sample === donor) }))).filter((v) => v.row) })); });
+}
+function donorViolinPanel(p) {
+  const vw = 34, hw = vw * 0.46, L = 56, T = 12, PH = 200, B = 104, W = L + p.violins.length * vw + 16, H = T + PH + B, svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` }), ys = (v) => T + (1 - (v - p.lo) / (p.hi - p.lo)) * PH;
+  const step = (() => { const r = (p.hi - p.lo) / 5, q = Math.pow(10, Math.floor(Math.log10(r))); return [1, 2, 5, 10].map((k) => k * q).find((k) => k >= r) || r; })();
+  for (let v = Math.ceil(p.lo / step) * step; v <= p.hi + 1e-9; v += step) { svgEl("line", { x1: L - 4, x2: W - 10, y1: ys(v), y2: ys(v), stroke: "#29303b", "stroke-width": 1 }, svg); svgEl("text", { x: L - 8, y: ys(v) + 4, "text-anchor": "end", fill: "#8b95a5", "font-size": 10.5 }, svg).textContent = v.toFixed(step < 1 ? 1 : 0); }
+  svgEl("text", { x: 12, y: T + PH / 2, fill: "#8b95a5", "font-size": 10.5, transform: `rotate(-90 12 ${T + PH / 2})`, "text-anchor": "middle" }, svg).textContent = vioYLabel();
+  p.violins.forEach((v, i) => { const r = v.row, cx = L + vw * (i + 0.5), col = v.id < 0 ? "#8b95a5" : catColor(v.field, v.id); drawViolin(svg, r, cx, hw, ys, p, col, false);
+    const tip = (ev) => nbrTip(ev, [{ tag: "b", t: r.median != null ? "median " + r.median.toFixed(2) : "too few cells" }, { t: `${v.name} · ${dlabel(p.donor)}` }, { cls: "m", t: `${fmt(r.n)} cells${r.n_used !== r.n ? " (" + fmt(r.n_used) + " used)" : ""} · ${r.frac_nonzero == null ? "–" : (100 * r.frac_nonzero).toFixed(1) + "% expressing"}` }, ...(r.mean != null ? [{ cls: "m", t: `mean ${r.mean.toFixed(2)} · IQR ${r.q25.toFixed(2)} to ${r.q75.toFixed(2)}` }] : [])]);
+    const hit = svgEl("rect", { x: cx - vw / 2, y: T, width: vw, height: PH, fill: "transparent" }, svg); hit.addEventListener("pointermove", tip); hit.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; });
+    const t = svgEl("text", { x: cx - 3, y: T + PH + 12, fill: "#cdd6e2", "font-size": 10, transform: `rotate(50 ${cx - 3} ${T + PH + 12})` }, svg); t.textContent = shortLabel(v.name.replace(/ cells$/, ""), 20); });
+  const w = mk("div", "vpanel"); w.append(mk("div", "vtitle", `${p.feature} — ${dlabel(p.donor)}${hasGroups() && p.group ? " · " + p.group : ""}`)); w.append(svg); return w;
+}
 function violinPanel(p, meta, order) {
-  const many = p.groups.length > 1, pooled = VIO.unit !== "sample", vw = pooled ? 30 : many ? 9 : 24, hw = vw * 0.46, subs = order.map((id) => meta[id].subtype), gap = 5, ggap = 30, L = 56, T = 28, PH = 190, B = many ? 48 : 78;
-  // x layout: groups -> samples in subtype order (small gap between subtypes)
+  const many = p.groups.length > 1, pooled = VIO.unit !== "sample", vw = pooled ? 30 : many ? 9 : 24, hw = vw * 0.46, subs = order.map((id) => meta[id].group), gap = 5, ggap = 30, L = 56, T = 28, PH = 190, B = many ? 48 : 78;
+  // x layout: panels -> samples in group order (small gap between groups)
   const pos = []; let x = L; for (const g of p.groups) { const gx = []; subs.forEach((sb, i) => { if (i && sb !== subs[i - 1]) x += gap; gx.push(x + vw / 2); x += vw; }); pos.push(gx); x += ggap; }
   const W = x - ggap + 16, H = T + PH + B, svg = svgEl("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` }), ys = (v) => T + (1 - (v - p.lo) / (p.hi - p.lo)) * PH;
   const step = (() => { const r = (p.hi - p.lo) / 5, q = Math.pow(10, Math.floor(Math.log10(r))); return [1, 2, 5, 10].map((k) => k * q).find((k) => k >= r) || r; })();
@@ -2664,17 +2850,13 @@ function violinPanel(p, meta, order) {
   svgEl("text", { x: 12, y: T + PH / 2, fill: "#8b95a5", "font-size": 10.5, transform: `rotate(-90 12 ${T + PH / 2})`, "text-anchor": "middle" }, svg).textContent = vioYLabel();
   const ids = [...new Set(subs)];
   p.groups.forEach((g, gi) => {
-    // alternating bands per disease subtype, with the subtype name on top
+    // alternating bands per group, with the group name on top
     ids.forEach((sb, k) => { const idx = subs.map((s, i) => (s === sb ? i : -1)).filter((i) => i >= 0), x0 = pos[gi][idx[0]] - vw / 2 - 1, x1 = pos[gi][idx[idx.length - 1]] + vw / 2 + 1;
-      if (k % 2 === 0) svgEl("rect", { x: x0, y: T, width: x1 - x0, height: PH, fill: "rgba(255,255,255,0.035)" }, svg); if (many || gi === 0) svgEl("text", { x: (x0 + x1) / 2, y: T - 5, "text-anchor": "middle", fill: "#6b7785", "font-size": 9.5 }, svg).textContent = x1 - x0 < 46 ? sb.replace("Class ", "") : sb; });
+      if (k % 2 === 0) svgEl("rect", { x: x0, y: T, width: x1 - x0, height: PH, fill: "rgba(255,255,255,0.035)" }, svg); if (hasGroups() && (many || gi === 0)) svgEl("text", { x: (x0 + x1) / 2, y: T - 5, "text-anchor": "middle", fill: "#6b7785", "font-size": 9.5 }, svg).textContent = x1 - x0 < 46 ? shortLabel(sb, Math.max(2, Math.floor((x1 - x0) / 5.4))) : sb; });
     const col = p.merged ? (g.id < 0 ? "#8b95a5" : catColor("cell_type", g.id)) : many ? catColor("cell_state", g.id) : catColor("cell_type", p.cell_type_id < 0 ? 0 : p.cell_type_id), colr = p.cell_type_id < 0 && !many ? "#8b95a5" : col;
     g.samples.forEach((r0) => { const i = order.indexOf(r0.sample), cx = pos[gi][i], m = meta[r0.sample];
-      const tip = (ev) => nbrTip(ev, [{ tag: "b", t: r0.median != null ? "median " + r0.median.toFixed(2) : "too few cells" }, { t: `${dlabel(r0.sample)} · ${m.subtype}` }, { cls: "m", t: `${many ? g.name : p.cell_type} · ${fmt(r0.n)} cells${r0.n_used !== r0.n ? " (" + fmt(r0.n_used) + " used)" : ""} · ${r0.frac_nonzero == null ? "–" : (100 * r0.frac_nonzero).toFixed(1) + "% expressing"}` }, ...(r0.mean != null ? [{ cls: "m", t: `mean ${r0.mean.toFixed(2)} · IQR ${r0.q25.toFixed(2)} to ${r0.q75.toFixed(2)}` }] : [])]);
-      if (r0.density) {
-        const n = r0.density.length, pts = []; for (let j = 0; j < n; j++) pts.push([cx - r0.density[j] * hw, ys(p.lo + ((p.hi - p.lo) * j) / (n - 1))]); for (let j = n - 1; j >= 0; j--) pts.push([cx + r0.density[j] * hw, ys(p.lo + ((p.hi - p.lo) * j) / (n - 1))]);
-        svgEl("path", { d: "M" + pts.map((q) => q[0].toFixed(1) + "," + q[1].toFixed(1)).join("L") + "Z", fill: colr, "fill-opacity": 0.85, stroke: "none" }, svg);
-        svgEl("line", { x1: cx, x2: cx, y1: ys(r0.q25), y2: ys(r0.q75), stroke: "rgba(15,18,24,0.9)", "stroke-width": many ? 2 : 3 }, svg); svgEl("circle", { cx, cy: ys(r0.median), r: many ? 1.8 : 2.6, fill: "#ffffff" }, svg);
-      } else svgEl("line", { x1: cx - hw, x2: cx + hw, y1: ys(p.lo), y2: ys(p.lo), stroke: "#4b566a", "stroke-width": 2 }, svg);   // too few cells: a grey tick
+      const tip = (ev) => nbrTip(ev, [{ tag: "b", t: r0.median != null ? "median " + r0.median.toFixed(2) : "too few cells" }, { t: `${dlabel(r0.sample)} · ${m.group}` }, { cls: "m", t: `${many ? g.name : p.cell_type} · ${fmt(r0.n)} cells${r0.n_used !== r0.n ? " (" + fmt(r0.n_used) + " used)" : ""} · ${r0.frac_nonzero == null ? "–" : (100 * r0.frac_nonzero).toFixed(1) + "% expressing"}` }, ...(r0.mean != null ? [{ cls: "m", t: `mean ${r0.mean.toFixed(2)} · IQR ${r0.q25.toFixed(2)} to ${r0.q75.toFixed(2)}` }] : [])]);
+      drawViolin(svg, r0, cx, hw, ys, p, colr, many);
       const hit = svgEl("rect", { x: cx - vw / 2, y: T, width: vw, height: PH, fill: "transparent" }, svg); hit.addEventListener("pointermove", tip); hit.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; });
       if (!many) { const t = svgEl("text", { x: cx, y: T + PH + 12, fill: "#8b95a5", "font-size": 9, transform: `rotate(55 ${cx} ${T + PH + 12})` }, svg); t.textContent = dlabel(r0.sample); }
     });
@@ -2726,9 +2908,9 @@ async function ghColor() {
   const g = GH.info.gloms, mode = $("ghcol").value, msg = $("ghmsg"); msg.textContent = "";
   const catOf = (key, levels, colorOf) => { const idx = new Map(levels.map((l, i) => [String(l), i])); return { cat: { levels: levels.map(String), codes: g.map((x) => idx.get(String(x[key]))), colors: levels.map((l, i) => colorOf(l, i)) } }; };
   const present = (key) => [...new Set(g.map((x) => x[key]))];
-  if (mode === "disease_subtype") return catOf("disease_subtype", present("disease_subtype").sort((a, b) => subtypeRank(a) - subtypeRank(b)), (l) => PAL[Math.max(0, SUB_ORDER.indexOf(l)) % PAL.length]);
-  if (mode === "disease_type") return catOf("disease_type", present("disease_type").sort((a, b) => NB_TYPE_ORDER.indexOf(a) - NB_TYPE_ORDER.indexOf(b)), (l, i) => PAL[i]);
-  if (mode === "sample") { const sub = Object.fromEntries(g.map((x) => [x.sample, x.disease_subtype])), r = catOf("sample", present("sample").sort((a, b) => subtypeRank(sub[a]) - subtypeRank(sub[b]) || a.localeCompare(b)), (l, i) => PAL[i % PAL.length]); r.cat.levels = r.cat.levels.map(dlabel); return r; }
+  if (mode === "group") { const by = new Map(S.meta.samples.map((s) => [s.id, s.group])), of = (x) => by.get(x.sample) || "not in a group", lv = [...new Set(g.map(of))].sort((a, b) => groupRank(a) - groupRank(b) || a.localeCompare(b)), idx = new Map(lv.map((l, i) => [l, i]));
+    return { cat: { levels: lv, codes: g.map((x) => idx.get(of(x))), colors: lv.map((l, i) => PAL[i % PAL.length]) } }; }
+  if (mode === "sample") { const sub = Object.fromEntries(S.meta.samples.map((x) => [x.id, x.group])), r = catOf("sample", present("sample").sort((a, b) => groupRank(sub[a]) - groupRank(sub[b]) || a.localeCompare(b)), (l, i) => PAL[i % PAL.length]); r.cat.levels = r.cat.levels.map(dlabel); return r; }
   if (mode === "activity" || mode === "chronicity") { const lv = present(mode).sort((a, b) => a - b); return catOf(mode, lv, (l, i) => rgbStr(LUT[Math.round((lv.length > 1 ? i / (lv.length - 1) : 1) * 255)])); }
   if (mode === "cluster") { const k = $("ghclr").value; return catOf(k, present(k).sort((a, b) => a - b), (l, i) => PAL[i % PAL.length]); }
   if (mode === "gene" || mode === "dual" || mode === "signature" || mode === "sigdual") return ghExprColor(mode, msg);
@@ -2757,8 +2939,8 @@ async function ghExprColor(mode, msg) {
     if (!cells) {   // glom-level object, as before
       const body = sigm ? { kind: "signature", genes } : { kind: "gene", gene: genes[0] }, key = JSON.stringify(body);
       if (!GH.colCache[key]) GH.colCache[key] = await postJSON("/api/glomhet/color", body);
-      const r = GH.colCache[key]; if (r.genes_used != null && r.genes_used < r.genes_requested) msg.textContent = `${r.genes_used} of ${r.genes_requested} signature genes are in the region_heterogeneity object`;
-      return ghNum(r.values, label + (sigm ? " (mean log-normalised, region_heterogeneity object)" : " (ROI-level log-normalised)"));
+      const r = GH.colCache[key]; if (r.genes_used != null && r.genes_used < r.genes_requested) msg.textContent = `${r.genes_used} of ${r.genes_requested} signature genes are in the ROI object`;
+      return ghNum(r.values, label + (sigm ? " (mean log-normalised, ROI object)" : " (ROI-level log-normalised)"));
     }
     const body = { genes, layer: S.layer, sigma: S.smooth, scope: S.zscope, within: withinSpec() }, key = "cs|" + JSON.stringify(body);
     if (!GH.colCache[key]) GH.colCache[key] = await postJSON("/api/glomhet/cellscore", body);
@@ -2803,7 +2985,7 @@ function ghScatter(svg, X, Y, col, xl, yl) {
   for (const i of order) {
     const pass = ghPass(i), c = svgEl("circle", { cx: sx(X[i]), cy: sy(Y[i]), r: pass ? +$("ghsize").value : Math.max(1.5, +$("ghsize").value * 0.7), fill: col.none ? "#8b95a5" : pass ? ghFill(col, i) : "#3a4250", "fill-opacity": pass ? +$("ghop").value : Math.min(0.55, +$("ghop").value), stroke: "rgba(10,12,16,0.9)", "stroke-width": 0.6, style: "cursor:pointer" }, svg);
     c.addEventListener("click", () => ghSelect(i));
-    c.addEventListener("pointermove", (ev) => { const m = g[i]; nbrTip(ev, [{ tag: "b", t: m.id }, { t: [dlabel(m.sample), m.disease_type, m.disease_subtype].filter((x) => x != null && x !== "").join(" · ") }, { cls: "m", t: `${m.activity != null ? "activity " + m.activity + " · " : ""}${m.chronicity != null ? "chronicity " + m.chronicity + " · " : ""}${m.n_cells} cells` },
+    c.addEventListener("pointermove", (ev) => { const m = g[i]; nbrTip(ev, [{ tag: "b", t: m.id }, { t: [dlabel(m.sample), S.meta.samples.find((x) => x.id === m.sample)?.group].filter(Boolean).join(" · ") }, { cls: "m", t: `${m.activity != null ? "activity " + m.activity + " · " : ""}${m.chronicity != null ? "chronicity " + m.chronicity + " · " : ""}${m.n_cells} cells` },
       ...(col.num ? [{ cls: "m", t: `${col.num.label.split(" (")[0]}: ${col.num.vals[i] === col.num.vals[i] ? col.num.vals[i].toFixed(3) : "no cell inside the subset"}` }] : []),
       ...(col.dual ? [col.dual.A, col.dual.B].map((n) => ({ cls: "m", t: `${n.label.split(" (")[0]}: ${n.vals[i] === n.vals[i] ? n.vals[i].toFixed(3) : "n/a"}` })) : []), ...(pass ? [] : [{ cls: "m", t: "does not pass the main-window filters" }])]); });
     c.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; });
@@ -2830,7 +3012,7 @@ async function renderGH() {
   let f, col; try { f = await ghFilter(); col = await ghColor(); } catch (e) { $("ghmsg").textContent = "Error: " + e.message.slice(0, 160); return; }
   if (tok !== GH.tok) return;
   const I = GH.info, px = +$("ghpx").value, py = +$("ghpy").value;
-  $("ghsub").textContent = `${I.n} ROIs in the region_heterogeneity object · ${f.n} pass the main-window filters${f.hasF ? " (others grey)" : ""}`;
+  $("ghsub").textContent = `${I.n} ROIs in the ROI object · ${f.n} pass the main-window filters${f.hasF ? " (others grey)" : ""}`;
   const hasH = !!I.pca.harmony;   // the batch-corrected PCA is optional in the object
   $("ghpca").closest(".ghp").hidden = !hasH; $("ghpcaraw").closest(".ghp").querySelector(".ghpt").textContent = hasH ? "PCA (uncorrected)" : "PCA";
   $("ghlayer").querySelector("option[value=harmony]").hidden = !hasH; if (!hasH) $("ghlayer").value = "raw";
@@ -2843,7 +3025,7 @@ async function renderGH() {
 function ghSelect(i) { GH.sel = i; renderGH(); }
 async function ghShow(i) {
   const m = GH.info.gloms[i], tok = (GH.dtok = (GH.dtok || 0) + 1), smp = S.meta.samples.find((s) => s.id === m.sample), cv = $("ghcv");
-  $("ghdett").textContent = m.id; $("ghdi").innerHTML = `${dlabel(m.sample)}<br>${[m.disease_type, m.disease_subtype].filter((x) => x != null && x !== "").join(" · ")}${m.activity != null || m.chronicity != null ? `<br>${m.activity != null ? "activity " + m.activity : ""}${m.activity != null && m.chronicity != null ? " · " : ""}${m.chronicity != null ? "chronicity " + m.chronicity : ""}` : ""}<br>${m.n_cells} cells in the viewer${m.n_file != null ? ` (${m.n_file} in the object)` : ""}${GH.info.cluster_cols.length ? `<br>clusters (res ${GH.info.cluster_cols.map((c) => c.replace("cluster_res", "") + ": " + m[c]).join(", ")})` : ""}<br><span class="muted">cells coloured by the main window's Colour by · hover a cell for its type and state</span>`;
+  $("ghdett").textContent = m.id; $("ghdi").innerHTML = `${dlabel(m.sample)}<br>${S.meta.samples.find((x) => x.id === m.sample)?.group || ""}${m.activity != null || m.chronicity != null ? `<br>${m.activity != null ? "activity " + m.activity : ""}${m.activity != null && m.chronicity != null ? " · " : ""}${m.chronicity != null ? "chronicity " + m.chronicity : ""}` : ""}<br>${m.n_cells} cells in the viewer${m.n_file != null ? ` (${m.n_file} in the object)` : ""}${GH.info.cluster_cols.length ? `<br>clusters (res ${GH.info.cluster_cols.map((c) => c.replace("cluster_res", "") + ": " + m[c]).join(", ")})` : ""}<br><span class="muted">cells coloured by the main window's Colour by · hover a cell for its type and state</span>`;
   const gidLv = catMeta("glom_id").levels, code = gidLv.indexOf(m.id);
   const [gid, poly, feats, b] = await Promise.all([galGet(m.sample, "glom_id"), galPoly(m.sample), galPaths(m.sample), winBundle(m.sample)]);
   const sc = await winScale([b], () => tok, tok); if (!sc || tok !== GH.dtok) return;
@@ -2989,7 +3171,7 @@ async function renderCmp() {
   if (tok !== S.cmpTok) return;
   const smp = S.meta.samples.find((s) => s.id === S.sample), el = (t, c, x) => { const e = document.createElement(t); if (c) e.className = c; if (x != null) e.textContent = x; return e; };
   body.replaceChildren();
-  info.textContent = `Xenium donor ${dlabel(d.sample)} (${smp.disease_type} · ${subtypeOf(smp)}): ${fmt(d.xenium.n)} QC'ed Xenium cells.`;
+  info.textContent = `Xenium donor ${dlabel(d.sample)} (${groupOf(smp)}): ${fmt(d.xenium.n)} QC'ed Xenium cells.`;
   if (!d.scffpe) {   // no counterpart: say so, and why
     const box = el("div", "cmpmsg");
     const msg = d.status === "id_without_cells" ? `The metadata links this sample to scFFPE sample ${d.scffpe_id}, but no scFFPE cells carry that sample ID in the data (it is absent from the scFFPE cells).`
@@ -3030,13 +3212,13 @@ async function renderCmp() {
 }
 
 // ---------------------------------------------------------------- neighbours window
-// For the cells passing the current filters ("index cells"): composition of the cells within R µm, per disease subtype / type / sample.
-const NB_TYPE_ORDER = ["Control", "No LN", "LN"], NB_OTHER = "#6b7785";
+// For the cells passing the current filters ("index cells"): composition of the cells within R µm, per group / donor.
+const NB_OTHER = "#6b7785";
 let nbrToken = 0;
-const nbOff = new Set();   // donors left out of the Neighbors / Neighborhoods windows
+const nbOff = new Set();   // donors left out of the Neighbours / Neighbourhoods windows
 const nbSampleOn = (s) => !nbOff.has(s.donor);
 function nbrDonorPicker() {
-  const pop = $("nbdonpop"), donors = [...new Set(S.meta.samples.map((s) => s.donor))], sub = sortedSubtypes(), sOf = (d) => subtypeOf(S.meta.samples.find((s) => s.donor === d));
+  const pop = $("nbdonpop"), donors = [...new Set(S.meta.samples.map((s) => s.donor))], sub = sortedGroups(), sOf = (d) => groupOf(S.meta.samples.find((s) => s.donor === d));
   donors.sort((a, b) => sub.indexOf(sOf(a)) - sub.indexOf(sOf(b)) || a.localeCompare(b));
   const upd = () => { $("nbdonbtn").textContent = nbOff.size ? `Donors (${donors.length - nbOff.size}/${donors.length}) ▾` : "Donors ▾"; };
   const redraw = () => { upd(); if (S.nbr) drawNbr(); if (!$("nbh").hidden) renderNbh(); };
@@ -3054,8 +3236,19 @@ function nbrDonorPicker() {
 function nbrIndexSpec() {
   const filters = {}, hidden = {};
   for (const [k, set] of Object.entries(S.filters)) if (set.size && S.meta.cats[k]) filters[k] = [...set];
+  if (S.orTS && filters.cell_type && filters.cell_state) filters.__or = [1];   // server: cell type OR cell state
   const h = S.hiddenCats[S.colorBy]; if (S.meta.cats[S.colorBy] && h?.size) hidden[S.colorBy] = [...h];
   return { filters, hidden, expr: exprSpecs() };
+}
+// The index cells of the Neighbours windows: the filters, narrowed to the cells clicked or box-selected in the open tissue when there are any.
+const nbrSpec = () => { const sp = nbrIndexSpec(), c = [...S.selected]; return c.length ? { ...sp, cells: { [S.sample]: c } } : sp; };
+const nbrSelected = (spec) => Object.values(spec.cells || {}).reduce((a, c) => a + c.length, 0);
+const nbrHasIndex = (spec = nbrSpec()) => Object.keys(spec.filters).length > 0 || Object.keys(spec.hidden).length > 0 || spec.expr.length > 0 || nbrSelected(spec) > 0;   // with none, every cell would be an index cell: just the tissue composition
+function nbrNoIndex() {
+  S.nbr = null; $("nbrinfo").textContent = ""; const b = $("nbrbody"); b.style.opacity = 1;
+  const box = document.createElement("div"); box.className = "nbempty"; const h = document.createElement("b"); h.textContent = "No cells selected to show neighbourhood information";
+  const t = document.createElement("div"); t.textContent = "Tick a cell type or another filter on the left, or click cells or use Box select in the viewer, and this window shows what surrounds those cells.";
+  box.append(h, t); b.replaceChildren(box);
 }
 function openNbr() {
   closeAllWindows();
@@ -3067,14 +3260,14 @@ function closeNbr() { $("nbr").hidden = true; $("nbrtip").hidden = true; }
 
 // ---------------------------------------------------------------- neighbourhoods in space
 // One tile per index cell (cells passing the filters) of one sample: the cell outlined in white, its neighbours (same definition / distance
-// settings as the Neighbors window) coloured by the current Colour by, other nearby cells faint. Click a tile for the zoomed view / PNG.
+// settings as the Neighbours window) coloured by the current Colour by, other nearby cells faint. Click a tile for the zoomed view / PNG.
 let nbhToken = 0;
 function nbrParams() { return { method: $("nbmethod").value, distance: +$("nbrad").value, k: +$("nbk").value || 6, steps: +$("nbsteps").value || 1 }; }
 function openNbh() {
   if (!S.nbr) return;
-  const subs = sortedSubtypes(), withIdx = (id) => (S.nbr.res.samples[id]?.n_index || 0) > 0;
+  const subs = sortedGroups(), withIdx = (id) => (S.nbr.res.samples[id]?.n_index || 0) > 0;
   if (!S.meta.samples.some((s) => withIdx(s.id))) { $("nbrinfo").textContent = "No index cells: the current filters select no cells in any donor."; return; }
-  $("nbhsample").innerHTML = `<option value="cur">This donor (${dlabel(S.sample)})</option><option value="all">All donors</option>` + subs.map((t) => `<option value="sub:${t}">Disease subtype: ${t}</option>`).join("");
+  $("nbhsample").innerHTML = `<option value="cur">This tissue (${dlabel(S.sample)})</option><option value="all">All donors</option>` + (hasGroups() ? subs : []).map((t) => `<option value="sub:${t}">${groupTitle()}: ${t}</option>`).join("");
   $("nbhsample").value = S.nbhScope && [...$("nbhsample").options].some((o) => o.value === S.nbhScope) ? S.nbhScope : (withIdx(S.sample) ? "cur" : "all");
   S.nbhScope = $("nbhsample").value; if (!S.nbhTouched) $("nbhn").value = S.nbhScope === "cur" ? 48 : 12;
   closeAllWindows(); $("nbh").hidden = false; renderNbh();
@@ -3082,18 +3275,19 @@ function openNbh() {
 function closeNbh() { $("nbh").hidden = true; }
 async function renderNbh() {
   if ($("nbh").hidden) return;
+  if (!nbrHasIndex()) { $("nbh").hidden = true; $("nbr").hidden = false; renderNbr(); return; }   // the filters were cleared while this window was open
   const tok = ++nbhToken, scope = $("nbhsample").value; S.nbhScope = scope;
-  const P = nbrParams(), spec = nbrIndexSpec(), limit = Math.max(4, Math.min(200, +$("nbhn").value || 12)), order = $("nbhorder").value, field = $("nbfield").value, nl = catMeta(field).levels;
-  const sub = sortedSubtypes(), withIdx = (id) => !S.nbr || (S.nbr.res.samples[id]?.n_index || 0) > 0;
-  const samples = S.meta.samples.filter((s) => nbSampleOn(s) && (scope === "all" || (scope === "cur" ? s.id === S.sample : subtypeOf(s) === scope.slice(4))) && withIdx(s.id))
-    .sort((a, b) => sub.indexOf(subtypeOf(a)) - sub.indexOf(subtypeOf(b)) || a.id.localeCompare(b.id));
+  const P = nbrParams(), spec = nbrSpec(), limit = Math.max(4, Math.min(200, +$("nbhn").value || 12)), order = $("nbhorder").value, field = $("nbfield").value, nl = catMeta(field).levels;
+  const sub = sortedGroups(), withIdx = (id) => !S.nbr || (S.nbr.res.samples[id]?.n_index || 0) > 0;
+  const samples = S.meta.samples.filter((s) => nbSampleOn(s) && (scope === "all" || (scope === "cur" ? s.id === S.sample : groupOf(s) === scope.slice(4))) && withIdx(s.id))
+    .sort((a, b) => sub.indexOf(groupOf(a)) - sub.indexOf(groupOf(b)) || a.id.localeCompare(b.id));
   const mtxt = nbrMethodText(P), noteTxt = P.method === "radius" ? `radius ${P.distance} µm` : P.method === "knn" ? `k=${P.k} ≤${P.distance} µm` : `Delaunay ${P.steps} step${P.steps > 1 ? "s" : ""} ≤${P.distance} µm`;
   const flt = fltText(spec);
   const orderTxt = order === "random" ? "random" : order === "most" ? "most neighbours first" : "fewest neighbours first";
   const grid = $("nbhgrid"); grid.style.opacity = 1;
   grid.innerHTML = samples.map((s) => `<div class="glomsec" data-s="${s.id}" hidden><div class="sechead"></div><div class="secgrid"></div></div>`).join("");
   const tot = { idx: 0, tiles: 0, done: 0 }, cnt = new Map(), ones = (b) => ({ ...b, pass: new Uint8Array(b.n).fill(1) });  // neighbours need not pass the filters
-  const info = () => { $("nbhinfo").textContent = `${fmt(tot.idx)} index cells in ${donTxt(nDonors(samples))} (${flt || "no filter active"}); showing up to ${limit} per donor tissue piece (${orderTxt}), ${fmt(tot.tiles)} tiles. `
+  const info = () => { $("nbhinfo").textContent = `${fmt(tot.idx)} index cells in ${donTxt(nDonors(samples))} (${flt || "no filter active"}); showing up to ${limit} per tissue (${orderTxt}), ${fmt(tot.tiles)} tiles. `
     + `White outline = the index cell; coloured cells = its neighbours (${mtxt}); colour: ${colorName()}; faint = other cells nearby.${tot.done < samples.length ? " Loading…" : ""} Click a tile to zoom.`; };
   info(); if (!samples.length) { grid.innerHTML = `<div class="muted">No index cells in the selected donors.</div>`; return; }
   // requests start together; continuous colour scales are pooled over all shown samples, categorical ones need no pooling
@@ -3119,7 +3313,7 @@ async function renderNbh() {
       if (tok !== nbhToken) return;
       const sec = grid.querySelector(`.glomsec[data-s="${CSS.escape(s.id)}"]`); if (!sec || !res.index.length) return;
       sec.hidden = false; tot.idx += res.n_index; tot.tiles += res.index.length;
-      sec.querySelector(".sechead").textContent = `${dlabel(s.id)} · ${s.disease_type} · ${subtypeOf(s)} · ${fmt(res.n_index)} index cells · showing ${res.index.length}`;
+      sec.querySelector(".sechead").textContent = `${dlabel(s.id)}${gTag(s)} · ${fmt(res.n_index)} index cells · showing ${res.index.length}`;
       const g = sec.querySelector(".secgrid");
       res.index.forEach((ci, r) => {
         const nbrs = res.neighbors[r], cells = [ci, ...nbrs], comp = new Map();
@@ -3141,7 +3335,9 @@ async function renderNbh() {
 }
 async function renderNbr() {
   if ($("nbr").hidden) return;
-  const tok = ++nbrToken, field = $("nbfield").value, method = $("nbmethod").value, distance = +$("nbrad").value, k = +$("nbk").value || 6, steps = +$("nbsteps").value || 1, spec = nbrIndexSpec();
+  const tok = ++nbrToken, field = $("nbfield").value, method = $("nbmethod").value, distance = +$("nbrad").value, k = +$("nbk").value || 6, steps = +$("nbsteps").value || 1, spec = nbrSpec(), has = nbrHasIndex(spec);
+  for (const id of ["nbhbtn", "nbcounts", "nbcsv"]) $(id).disabled = !has;
+  if (!has) { nbrNoIndex(); return; }
   $("nbrinfo").textContent = "Computing neighbours…"; $("nbrbody").style.opacity = 0.45;
   let res;
   try {
@@ -3151,22 +3347,21 @@ async function renderNbr() {
   if (tok !== nbrToken) return;
   S.nbr = { res, spec }; $("nbrbody").style.opacity = 1; drawNbr();
 }
-function nbrGroups(res) {  // aggregate per-sample counts into disease subtype / disease type / sample groups (skipping groups without index cells)
+function nbrGroups(res) {  // aggregate per-sample counts into comparison groups and donors (skipping groups without index cells)
   const nl = res.levels.length, meta = Object.fromEntries(S.meta.samples.map((s) => [s.id, s]));
   const mk = (name) => ({ name, counts: new Array(nl).fill(0), bg: new Array(nl).fill(0), n_index: 0, n_pairs: 0, n_cells: 0 });
-  const by = { subtype: new Map(), type: new Map(), sample: new Map() }, subOf = (dn) => subtypeOf(S.meta.samples.find((s) => s.donor === dn));   // "sample" groups are donors: the neighbours are found inside each tissue piece, the counts are then summed per donor
+  const by = { group: new Map(), sample: new Map() }, subOf = (dn) => S.meta.samples.find((s) => s.donor === dn).group || "";   // "sample" groups are donors: the neighbours are found inside each tissue piece, the counts are then summed per donor
   for (const [sid, r] of Object.entries(res.samples)) {
     if (!r.n_index || !nbSampleOn(meta[sid])) continue; const m = meta[sid];
-    for (const [lvl, name] of [["subtype", subtypeOf(m)], ["type", m.disease_type || "unknown"], ["sample", m.donor]]) {
+    for (const [lvl, name] of [["group", groupOf(m)], ["sample", m.donor]]) {
       const g = by[lvl].get(name) || by[lvl].set(name, mk(name)).get(name);
       r.counts.forEach((c, i) => { g.counts[i] += c; g.bg[i] += r.bg[i]; }); g.n_index += r.n_index; g.n_pairs += r.n_pairs; g.n_cells += r.n_cells;
     }
   }
-  const rank = (arr, t) => (arr.includes(t) ? arr.indexOf(t) : 99), sub = sortedSubtypes();
+  const rank = (arr, t) => (arr.includes(t) ? arr.indexOf(t) : 99), sub = sortedGroups();
   return {
-    subtype: [...by.subtype.values()].sort((a, b) => rank(sub, a.name) - rank(sub, b.name)),
-    type: [...by.type.values()].sort((a, b) => rank(NB_TYPE_ORDER, a.name) - rank(NB_TYPE_ORDER, b.name)),
-    sample: [...by.sample.values()].map((g) => ({ ...g, subtype: subOf(g.name) })).sort((a, b) => rank(sub, a.subtype) - rank(sub, b.subtype) || a.name.localeCompare(b.name)),
+    group: [...by.group.values()].sort((a, b) => rank(sub, a.name) - rank(sub, b.name)),
+    sample: [...by.sample.values()].map((g) => ({ ...g, group: subOf(g.name) })).sort((a, b) => rank(sub, a.group || NO_GROUP) - rank(sub, b.group || NO_GROUP) || a.name.localeCompare(b.name)),
   };
 }
 const nbrColor = (field, i, nl) => (i === nl - 1 ? NB_OTHER : catColor(field, i));
@@ -3182,25 +3377,25 @@ function nbrMethodText(res) {
   if (res.method === "delaunay") return `cells within ${res.steps} step${res.steps > 1 ? "s" : ""} of an index cell in the Delaunay triangulation of the cell centres (triangulation edges longer than ${res.distance} µm removed)`;
   return `all cells within ${res.distance} µm of an index cell`;
 }
-// Index cells per donor (tissue pieces summed, zeros included), grouped by disease subtype in the fixed order; reflects every current filter.
+// Index cells per donor (tissue pieces summed, zeros included), grouped by the project's groups; reflects every current filter.
 function nbrCountsTable(res) {
-  const meta = Object.fromEntries(S.meta.samples.map((s) => [s.id, s])), sub = sortedSubtypes();
+  const meta = Object.fromEntries(S.meta.samples.map((s) => [s.id, s])), sub = sortedGroups();
   const rowsBy = new Map();   // one row per donor: the index cells and cells of its tissue pieces are summed
-  for (const s of S.meta.samples) { const r = rowsBy.get(s.donor) || rowsBy.set(s.donor, { id: s.donor, type: s.disease_type || "unknown", sub: subtypeOf(s), n: 0, tot: 0 }).get(s.donor); r.n += res.samples[s.id]?.n_index || 0; r.tot += res.samples[s.id]?.n_cells || s.n; }
+  for (const s of S.meta.samples) { const r = rowsBy.get(s.donor) || rowsBy.set(s.donor, { id: s.donor, sub: groupOf(s), n: 0, tot: 0 }).get(s.donor); r.n += res.samples[s.id]?.n_index || 0; r.tot += res.samples[s.id]?.n_cells || s.n; }
   const rows = [...rowsBy.values()]
     .sort((a, b) => sub.indexOf(a.sub) - sub.indexOf(b.sub) || a.id.localeCompare(b.id));
   const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
   const pct = (n, t) => (t ? (100 * n / t).toFixed(1) + "%" : "–"), tb = el("table", "nc"), hr = el("tr");
-  for (const [t, cls] of [["Disease subtype", ""], ["Donor", ""], ["Disease type", ""], ["Index cells", "num"], ["Cells in donor tissue", "num"], ["% of donor tissue", "num"]]) hr.append(el("th", cls, t));
+  for (const [t, cls] of [[hasGroups() ? groupTitle() : "Group", ""], ["Donor", ""], ["Index cells", "num"], ["Cells in donor", "num"], ["% of donor's cells", "num"]]) hr.append(el("th", cls, t));
   tb.append(hr);
   const add = (cells, cls) => { const tr = el("tr", cls); cells.forEach(([t, c]) => tr.append(el("td", c, t))); tb.append(tr); };
   for (const sb of sub) {
     const g = rows.filter((r) => r.sub === sb); if (!g.length) continue; const n = g.reduce((a, r) => a + r.n, 0), t = g.reduce((a, r) => a + r.tot, 0);
-    add([[sb, ""], [donTxt(nDonors(g.map((r) => r.id))), ""], ["", ""], [fmt(n), "num"], [fmt(t), "num"], [pct(n, t), "num"]], "sub");
-    for (const r of g) add([[r.sub, ""], [dlabel(r.id), ""], [r.type, ""], [fmt(r.n), "num" + (r.n ? "" : " zero")], [fmt(r.tot), "num"], [pct(r.n, r.tot), "num"]], "");
+    add([[sb, ""], [donTxt(nDonors(g.map((r) => r.id))), ""], [fmt(n), "num"], [fmt(t), "num"], [pct(n, t), "num"]], "sub");
+    for (const r of g) add([[r.sub, ""], [dlabel(r.id), ""], [fmt(r.n), "num" + (r.n ? "" : " zero")], [fmt(r.tot), "num"], [pct(r.n, r.tot), "num"]], "");
   }
   const N = rows.reduce((a, r) => a + r.n, 0), T = rows.reduce((a, r) => a + r.tot, 0);
-  add([["All donors", ""], [donTxt(nDonors(rows.map((r) => r.id))), ""], ["", ""], [fmt(N), "num"], [fmt(T), "num"], [pct(N, T), "num"]], "tot");
+  add([["All donors", ""], [donTxt(nDonors(rows.map((r) => r.id))), ""], [fmt(N), "num"], [fmt(T), "num"], [pct(N, T), "num"]], "tot");
   const box = el("div", "nsec"); box.append(el("h4", "", "Index cells per donor (cells passing the current filters, region filters included)"), tb); return box;
 }
 function drawNbr() {
@@ -3208,11 +3403,11 @@ function drawNbr() {
   const { res, spec } = S.nbr, nl = res.levels.length, view = $("nbview").value, field = res.field, groups = nbrGroups(res), body = $("nbrbody");
   const tot = groups.sample.reduce((a, g) => ({ idx: a.idx + g.n_index, pairs: a.pairs + g.n_pairs }), { idx: 0, pairs: 0 });
   const flt = fltText(spec);
-  $("nbrinfo").textContent = `Xenium cells only (QC'ed; no scFFPE). ${fmt(tot.idx)} index cells in ${donTxt(nDonors(groups.sample.map((g) => g.name)))} (${flt || "no filter active: every cell is an index cell, so this is just the tissue composition"}${Object.keys(spec.hidden).length ? " · legend-hidden types excluded" : ""}). `
+  $("nbrinfo").textContent = `${S.meta.has_scffpe ? "Spatial cells only (no scFFPE). " : ""}${fmt(tot.idx)} index cells in ${donTxt(nDonors(groups.sample.map((g) => g.name)))} (${[nbrSelected(spec) ? `${fmt(nbrSelected(spec))} selected in ${dlabel(Object.keys(spec.cells)[0])}` : "", flt, Object.keys(spec.hidden).length ? "legend-hidden types excluded" : ""].filter(Boolean).join(" · ")}). `
     + `Neighbours = ${nbrMethodText(res)}, counted per index cell–neighbour pair (${fmt(tot.pairs)} pairs). Descriptive only, no statistical test; groups with few pairs are noisy.`;
   const pooled = new Array(nl).fill(0); groups.sample.forEach((g) => g.counts.forEach((c, i) => { pooled[i] += c; }));
   const order = pooled.map((c, i) => [i, c]).filter(([, c]) => c > 0).sort((a, b) => b[1] - a[1]).map(([i]) => i);
-  const secs = [["subtype", "By disease subtype"], ["type", "By disease type"], ["sample", "By donor"]];
+  const secs = [...(hasGroups() ? [["group", `By ${groupName()}`]] : []), ["sample", "By donor"]];
   body.replaceChildren(); if (S.nbCounts) body.append(nbrCountsTable(res));
   const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
   $("nbgrouplab").hidden = !(view === "dist" || view === "forest");
@@ -3224,8 +3419,8 @@ function drawNbr() {
     for (const [lvl, title] of secs) {
       if (!groups[lvl].length) continue; const sec = el("div", "nsec"); sec.append(el("h4", "", title));
       for (const g of groups[lvl]) {
-        const row = el("div", "nrow"), bar = el("div", "nbar"), lab = el("div", "nlab", lvl === "sample" ? dlabel(g.name) : g.name); lab.title = (lvl === "sample" ? dlabel(g.name) : g.name) + (g.subtype ? ` · ${g.subtype}` : "");
-        if (g.subtype) { const sm = el("small", "", g.subtype); lab.append(sm); }
+        const row = el("div", "nrow"), bar = el("div", "nbar"), lab = el("div", "nlab", lvl === "sample" ? dlabel(g.name) : g.name); lab.title = (lvl === "sample" ? dlabel(g.name) : g.name) + (g.group ? ` · ${g.group}` : "");
+        if (g.group) { const sm = el("small", "", g.group); lab.append(sm); }
         const parts = top.map((i) => ({ i, c: g.counts[i], col: nbrColor(field, i, nl) })); if (rest.length) parts.push({ i: -1, c: rest.reduce((a, i) => a + g.counts[i], 0), col: NB_OTHER });
         const px = Math.max(300, body.clientWidth - 340);
         for (const p of parts) {
@@ -3233,7 +3428,7 @@ function drawNbr() {
           if (frac * px > 44) { seg.textContent = Math.round(frac * 100) + "%"; seg.style.color = inkOn(hexRgb(p.col)); }
           seg.addEventListener("pointermove", (ev) => {
             const names = p.i < 0 ? `Other (${rest.length} types)` : res.levels[p.i], bgc = p.i < 0 ? rest.reduce((a, i) => a + g.bg[i], 0) : g.bg[p.i], b = bgc / g.n_cells;
-            nbrTip(ev, [{ tag: "b", t: (frac * 100).toFixed(1) + "%" }, { t: names }, { cls: "m", t: `${lvl === "sample" ? dlabel(g.name) : g.name}${g.subtype ? " (" + g.subtype + ")" : ""} · ${fmt(p.c)} of ${fmt(g.n_pairs)} neighbour pairs` },
+            nbrTip(ev, [{ tag: "b", t: (frac * 100).toFixed(1) + "%" }, { t: names }, { cls: "m", t: `${lvl === "sample" ? dlabel(g.name) : g.name}${g.group ? " (" + g.group + ")" : ""} · ${fmt(p.c)} of ${fmt(g.n_pairs)} neighbour pairs` },
               { cls: "m", t: `background ${(b * 100).toFixed(1)}% → ×${b ? (frac / b).toFixed(2) : "–"}` }]);
           });
           seg.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; });
@@ -3252,7 +3447,7 @@ function drawNbr() {
       const tb = el("table", "nh" + (heat ? "" : " plain")), hr = el("tr"); hr.append(el("th", "r", ""));
       for (const i of cols) { const th = el("th", "c", res.levels[i]); th.title = res.levels[i]; hr.append(th); } hr.append(el("th", "", "pairs")); tb.append(hr);
       for (const g of groups[lvl]) {
-        const tr = el("tr"), th = el("th", "r", g.subtype ? `${g.name} · ${g.subtype}` : g.name); th.title = th.textContent; tr.append(th);
+        const tr = el("tr"), th = el("th", "r", g.group ? `${g.name} · ${g.group}` : g.name); th.title = th.textContent; tr.append(th);
         for (const i of cols) {
           const { f, b, e } = nbrEnrich(g, i), td = el("td");
           if (heat) {
@@ -3260,7 +3455,7 @@ function drawNbr() {
             if (v == null) { td.style.background = "#141922"; td.textContent = "·"; td.style.color = "#5b6676"; }
             else { const c = DIVL[Math.round(((v + 2) / 4) * 255)]; td.style.background = `rgb(${c})`; td.style.color = inkOn(`rgb(${c})`); td.textContent = e == null ? "0" : (e > 0 ? "+" : "") + e.toFixed(1); }
           } else td.textContent = `${(f * 100).toFixed(1)}%`;
-          td.addEventListener("pointermove", (ev) => nbrTip(ev, [{ tag: "b", t: `${(f * 100).toFixed(1)}% of neighbours` }, { t: res.levels[i] }, { cls: "m", t: `${g.name}${g.subtype ? " (" + g.subtype + ")" : ""} · ${fmt(g.counts[i])} of ${fmt(g.n_pairs)} pairs` },
+          td.addEventListener("pointermove", (ev) => nbrTip(ev, [{ tag: "b", t: `${(f * 100).toFixed(1)}% of neighbours` }, { t: res.levels[i] }, { cls: "m", t: `${g.name}${g.group ? " (" + g.group + ")" : ""} · ${fmt(g.counts[i])} of ${fmt(g.n_pairs)} pairs` },
             { cls: "m", t: `background ${(b * 100).toFixed(1)}%${e == null ? "" : " · log2 enrichment " + e.toFixed(2)}` }]));
           td.addEventListener("pointerleave", () => { $("nbrtip").hidden = true; }); tr.append(td);
         }
@@ -3275,8 +3470,8 @@ function drawNbr() {
 const NB_GC = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#B8A100", "#999999"];
 const nbSvg = (tag, attrs = {}, txt) => { const e = document.createElementNS("http://www.w3.org/2000/svg", tag); for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v); if (txt != null) e.textContent = txt; return e; };
 async function nbrDistData(res, spec) {
-  const meta = S.meta.samples, groups = { subtype: {}, type: {}, sample: {} };
-  for (const m of meta.filter(nbSampleOn)) { groups.subtype[m.id] = subtypeOf(m); groups.type[m.id] = m.disease_type || "unknown"; groups.sample[m.id] = m.donor; }
+  const meta = S.meta.samples, groups = { group: {}, sample: {} };
+  for (const m of meta.filter(nbSampleOn)) { groups.group[m.id] = groupOf(m); groups.sample[m.id] = m.donor; }
   const body = JSON.stringify({ field: res.field, method: res.method, distance: res.distance, k: res.k, steps: res.steps, ...spec, groups });
   if (S.nbr.dist?.key !== body) {
     const r = await fetch("/api/neighbors/dist", { method: "POST", headers: { "Content-Type": "application/json" }, body });
@@ -3344,10 +3539,10 @@ async function nbrDistView(view, groups, order) {
 }
 function exportNbrCSV() {
   if (!S.nbr) return; const { res, spec } = S.nbr, groups = nbrGroups(res), q = (x) => `"${String(x).replace(/"/g, '""')}"`;
-  const lines = [["group_level", "group", "disease_subtype", "n_index_cells", "n_pairs", "neighbour_type", "neighbour_pairs", "neighbour_fraction", "background_cells", "background_fraction", "log2_enrichment", "method", "distance_um", "k", "steps", "neighbour_field", "index_filters"].join(",")];
-  const flt = JSON.stringify({ ...Object.fromEntries(Object.entries(spec.filters).map(([k, ids]) => [k, ids.map((i) => display(k, i))])), ...((spec.expr || []).length ? { gene_signature_filters: spec.expr.map(exprDesc) } : {}) });
-  for (const lvl of ["subtype", "type", "sample"]) for (const g of groups[lvl]) res.levels.forEach((name, i) => {
-    const { f, b, e } = nbrEnrich(g, i); lines.push([lvl, q(g.name), q(g.subtype || (lvl === "subtype" ? g.name : "")), g.n_index, g.n_pairs, q(name), g.counts[i], f.toFixed(6), g.bg[i], b.toFixed(6), e == null ? "" : e.toFixed(4), res.method, res.distance, res.method === "knn" ? res.k : "", res.method === "delaunay" ? res.steps : "", q(res.field), q(flt)].join(","));
+  const lines = [["group_level", "group", "donor_group", "n_index_cells", "n_pairs", "neighbour_type", "neighbour_pairs", "neighbour_fraction", "background_cells", "background_fraction", "log2_enrichment", "method", "distance_um", "k", "steps", "neighbour_field", "index_filters"].join(",")];
+  const flt = JSON.stringify({ ...(nbrSelected(spec) ? { selected_cells: nbrSelected(spec), selected_in: Object.keys(spec.cells)[0] } : {}), ...Object.fromEntries(Object.entries(spec.filters).filter(([k]) => k !== "__or").map(([k, ids]) => [k, ids.map((i) => display(k, i))])), ...(spec.filters.__or ? { cell_type_or_cell_state: true } : {}), ...((spec.expr || []).length ? { gene_signature_filters: spec.expr.map(exprDesc) } : {}) });
+  for (const lvl of ["group", "sample"]) for (const g of groups[lvl]) res.levels.forEach((name, i) => {
+    const { f, b, e } = nbrEnrich(g, i); lines.push([lvl, q(g.name), q(g.group || (lvl === "group" ? g.name : "")), g.n_index, g.n_pairs, q(name), g.counts[i], f.toFixed(6), g.bg[i], b.toFixed(6), e == null ? "" : e.toFixed(4), res.method, res.distance, res.method === "knn" ? res.k : "", res.method === "delaunay" ? res.steps : "", q(res.field), q(flt)].join(","));
   });
   download(`neighbors_${res.field}_${res.method}.csv`, lines.join("\n"));
 }
@@ -3361,17 +3556,41 @@ function umSample(g) {  // sample holding global cell index g (samples are conti
   const ss = S.meta.samples; let lo = 0, hi = ss.length - 1;
   while (lo < hi) { const mid = (lo + hi + 1) >> 1; ss[mid].offset <= g ? (lo = mid) : (hi = mid - 1); } return ss[lo];
 }
+// A batch import of Xenium runs keeps each run's own 10x UMAP: the runs share no coordinates, so only the cells of the run of the tissue being
+// viewed are drawn (and fitted). null for any other project. mask[i] = 1 for the cells of that run; has = some of them have coordinates.
+function umRun(emb, n) {
+  if (!S.meta.embedding_per_run) return null;
+  const sm = S.meta.samples.find((s) => s.id === S.sample), run = sm ? runOf(sm) : "", mask = new Uint8Array(n); let has = false;
+  for (const s of S.meta.samples) if (runOf(s) === run) for (let i = s.offset; i < s.offset + s.n && i < n; i++) { mask[i] = 1; if (!has && Number.isFinite(emb[2 * i])) has = true; }
+  return { run, mask, has };
+}
+function umBounds(emb, n, key, R) {   // 0.5-99.5 percentile range so a few outliers (common in PCA) do not squeeze the bulk; R: only that run's cells
+  if (UM.bounds[key]) return UM.bounds[key];
+  const xs = [], ys = [], step = R ? 1 : 7;
+  for (let i = 0; i < n; i += step) if ((!R || R.mask[i]) && Number.isFinite(emb[2 * i])) { xs.push(emb[2 * i]); ys.push(emb[2 * i + 1]); }
+  if (!xs.length) return null;
+  xs.sort((a, b) => a - b); ys.sort((a, b) => a - b); const q = (a, f) => a[Math.min(a.length - 1, Math.floor(f * a.length))];
+  return (UM.bounds[key] = [q(xs, 0.005), q(xs, 0.995), q(ys, 0.005), q(ys, 0.995)]);
+}
 function setHighlight(sample, primary, secondary = []) { S.hl = { sample, primary: [...primary], secondary: [...secondary] }; updateUmap(); }
 function clearHighlight() { S.hl = null; updateUmap(); }
+function umDockApply() {
+  const m = $("umdock").value, v = $("viewer"), w = $("umapwin"), ok = !v.classList.contains("he2") && S.umOpen;   // not while a second image pane already uses the right half
+  const side = ok && m === "side", under = ok && m === "under";
+  w.classList.toggle("dockside", side); w.classList.toggle("dockunder", under); w.dataset.dock = side || under ? "1" : "";
+  v.classList.toggle("umside", side); v.classList.toggle("umunder", under);
+  setTimeout(() => { window.dispatchEvent(new Event("resize")); if (UM.deck) { UM.deck.setProps({ width: $("umdeck").clientWidth, height: $("umdeck").clientHeight }); umFit(); } }, 40);
+}
 function toggleUmap(on) {
   S.umOpen = on ?? !S.umOpen; $("umapwin").hidden = !S.umOpen; $("umapbtn").classList.toggle("on", S.umOpen);
   if (S.umOpen) { if (!UM.deck) initUmapDeck(); updateUmap(true); }
+  umDockApply();
 }
 function initUmapDeck() {
   const el = $("umdeck");
   UM.deck = new deck.Deck({ parent: el, views: new deck.OrthographicView({ flipY: false }), initialViewState: { target: [0, 0, 0], zoom: 3 }, controller: true, layers: [], width: el.clientWidth || 440, height: el.clientHeight || 440,
     getTooltip: ({ index, layer }) => {
-      if (!(index >= 0) || layer?.id !== "um-base" || !UM.last) return null; const g = index, s = umSample(g), c = UM.last.codes[g], lv = catMeta(UM.last.key).levels;
+      if (!(index >= 0) || layer?.id !== "um-base" || !UM.last || (UM.last.mask && !UM.last.mask[index])) return null; const g = index, s = umSample(g), c = UM.last.codes[g], lv = catMeta(UM.last.key).levels;
       return { text: `${dlabel(s.id)}\n${UM.last.label}: ${c === MISSING ? "missing" : lv[c]}`, style: { fontSize: "12px", background: "#1b212b", color: "#e3e8ef", border: "1px solid #39424f" } };
     } });
   if (window.ResizeObserver) new ResizeObserver(() => { if (S.umOpen && UM.deck) UM.deck.setProps({ width: el.clientWidth, height: el.clientHeight }); }).observe(el);
@@ -3395,22 +3614,22 @@ async function updateUmap(fit = false) {
     if (S.exprFilters.length) { $("umnote").textContent = "Applying gene / signature filters…"; xm = await exprMaskAll(); }
   } catch (e) { $("umnote").textContent = "UMAP not available: " + e.message; return; }
   if (tok !== umTok) return;
-  const emb = UM.emb[name], codes = UM.cat[mode], n = codes.length;
-  if (!UM.bounds[name]) {  // fit to the 0.5-99.5 percentile range so a few outliers (common in PCA) don't squeeze the bulk
-    const xs = new Float32Array(Math.ceil(n / 7)), ys = new Float32Array(xs.length); for (let i = 0, j = 0; i < n; i += 7, j++) { xs[j] = emb[2 * i]; ys[j] = emb[2 * i + 1]; } xs.sort(); ys.sort();
-    const q = (a, f) => a[Math.min(a.length - 1, Math.floor(f * a.length))]; UM.bounds[name] = [q(xs, 0.005), q(xs, 0.995), q(ys, 0.005), q(ys, 0.995)]; fit = true; }
+  const emb = UM.emb[name], codes = UM.cat[mode], n = codes.length, R = kind === "pca" ? null : umRun(emb, n), bk = R ? `${name}|${R.run}` : name;
+  if (R && !R.has) { UM.deck.setProps({ layers: [] }); UM.last = null; $("umtitle").textContent = "Embeddings"; $("umnote").textContent = `Run ${R.run} has no 10x UMAP (its analysis folder has none). Each run has its own UMAP, so only the run of the tissue you are viewing is shown.`; return; }
+  if (!UM.bounds[bk]) { umBounds(emb, n, bk, R); fit = true; }
   const lut = catMeta(mode).levels.map((_, i) => hex2rgb(catColor(mode, i))), hl = S.hl, hasHl = !!hl && (hl.primary.length + hl.secondary.length) > 0;
   const colors = new Uint8Array(n * 4);
   const keep = new Uint8Array(n).fill(1);
-  for (const k of fkeys) { const set = S.filters[k], c = UM.cat[k], mu = isMulti(k), sm = mu ? selMask(set) : 0; for (let i = 0; i < n; i++) if (keep[i] && !(mu ? (c[i] & sm) !== 0 : set.has(c[i]))) keep[i] = 0; }
+  applyCatFilters(keep, n, fkeys, (k) => UM.cat[k]);
   if (xm) for (let i = 0; i < n; i++) if (keep[i] && !xm[i]) keep[i] = 0;
   if (hid.size) for (let i = 0; i < n; i++) if (keep[i] && hid.has(codes[i])) keep[i] = 0;
   for (let i = 0; i < n; i++) {
     const o = i * 4;
+    if (R && !R.mask[i]) { colors[o + 3] = 0; continue; }   // another run: its UMAP has its own coordinates
     if (hasHl || !keep[i]) { colors[o] = 105; colors[o + 1] = 110; colors[o + 2] = 122; colors[o + 3] = hasHl ? 70 : 90; }   // everything else grey
     else { const c = codes[i] === MISSING ? GRAY : lut[codes[i]]; colors[o] = c[0]; colors[o + 1] = c[1]; colors[o + 2] = c[2]; colors[o + 3] = 215; }
   }
-  const label = ROLE_LABEL[mode] || labelOf(mode); UM.last = { key: mode, label, codes, name };
+  const label = ROLE_LABEL[mode] || labelOf(mode); UM.last = { key: mode, label, codes, name: bk, mask: R ? R.mask : null };
   const gl = (a) => (hl ? a.map((i) => umGlobal(hl.sample, i)) : []), prim = gl(hl?.primary || []), sec = gl(hl?.secondary || []);
   const colOf = (g) => { const c = codes[g]; return c === MISSING ? GRAY : lut[c]; };
   const layers = [new deck.ScatterplotLayer({ id: "um-base", data: { length: n, attributes: { getPosition: { value: emb, size: 2 }, getFillColor: { value: colors, size: 4, normalized: true, type: "unorm8" } } },
@@ -3420,7 +3639,8 @@ async function updateUmap(fit = false) {
     lineWidthUnits: "pixels", getLineWidth: 1.6, radiusUnits: "pixels", getRadius: 6, pickable: false }));
   UM.deck.setProps({ layers });
   $("umtitle").textContent = "Embeddings"; $("umtitle").title = kind === "pca" ? `${S.meta.embedding_label ? S.meta.embedding_label + " PCA" : "Harmony-corrected PCA"}: PC${px} vs PC${py}` : (S.meta.embedding_label ? `${S.meta.embedding_label} UMAP` : "Harmony-integrated UMAP");
-  $("umnote").textContent = (hasHl ? `${fmt(prim.length)} highlighted${sec.length ? ` + ${fmt(sec.length)} related` : ""} in ${hl.sample} · others grey` : "Click a cell in the viewer, a tile or a zoom view to highlight it here")
+  if (R) $("umtitle").title = `10x UMAP of run ${R.run}: each run of this batch import has its own UMAP (computed by the 10x analysis of that run alone), so only this run's cells are shown and the runs cannot be compared on it`;
+  $("umnote").textContent = (R ? `UMAP of run ${R.run} only (each run has its own) · ` : "") + (hasHl ? `${fmt(prim.length)} highlighted${sec.length ? ` + ${fmt(sec.length)} related` : ""} in ${hl.sample} · others grey` : "Click a cell in the viewer, a tile or a zoom view to highlight it here")
     + ` · coloured by ${label}${S.colorBy !== mode ? " (gene/numeric colouring isn't shown here)" : ""}`;
   if (fit) umFit();
 }
@@ -3474,7 +3694,7 @@ function exportCSV(indices, name) {
 // ---------------------------------------------------------------- UI wiring
 function syncGeneUI() {
   const m = S.colorBy, g = m === "__gene" || m === "__dual" || m === "__sig" || m === "__sigdual";
-  $("genebox").style.display = g ? "block" : "none"; $("numbox").style.display = S.meta.numeric[m] ? "block" : "none";
+  $("genebox").style.display = g ? "block" : "none"; $("exprsec").style.display = g ? "" : "none"; $("numbox").style.display = S.meta.numeric[m] ? "block" : "none";
   $("rowA").style.display = m === "__gene" || m === "__dual" ? "flex" : "none";
   $("rowB").style.display = m === "__dual" ? "flex" : "none";
   $("sigbox").style.display = m === "__sig" || m === "__sigdual" ? "block" : "none"; $("sigbox2").style.display = m === "__sigdual" ? "block" : "none";
@@ -3532,13 +3752,15 @@ function bindUI() {
   const numIn = () => { const v = (id) => { const t = $(id).value.trim(); return t === "" || !Number.isFinite(+t) ? null : +t; }; S.numScale = { log: $("numlog").checked, cmin: v("numcmin"), cmax: v("numcmax"), fmin: v("numfmin"), fmax: v("numfmax") }; updateAll(); };
   for (const id of ["numlog", "numcmin", "numcmax", "numfmin", "numfmax"]) $(id).addEventListener("change", numIn);
   $("numreset").addEventListener("click", () => { for (const id of ["numcmin", "numcmax", "numfmin", "numfmax"]) $(id).value = ""; $("numlog").checked = false; numIn(); });
-  $("clip").addEventListener("input", (e) => { S.clip = +e.target.value; $("cliplab").textContent = "p" + S.clip; updateAll(); });
+  $("clip").addEventListener("input", (e) => { S.clip = +e.target.value; $("cliplab").textContent = "p" + S.clip; syncFolds(); updateAll(); });
   $("psize").addEventListener("input", (e) => { S.psize = +e.target.value; $("psizelab").textContent = S.psize + " µm"; render(); });
   $("shape").addEventListener("change", (e) => { S.shape = e.target.value; render(); });
-  $("opacity").addEventListener("input", (e) => { S.opacity = +e.target.value; render(); });
+  $("dimop").addEventListener("input", (e) => { S.dimA = +e.target.value; $("dimoplab").textContent = S.dimA.toFixed(2); render(); clearTimeout(S._dmT); S._dmT = setTimeout(refreshWindows, 150); });
+  $("bgsel").addEventListener("change", (e) => { S.bgWhite = e.target.value === "white"; document.body.classList.toggle("wbg", S.bgWhite); syncFolds(); render(); refreshWindows(); });   // white or dark background for the viewer and every tile window
+  $("opacity").addEventListener("input", (e) => { S.opacity = +e.target.value; S.opTouched = true; render(); });
   bindHE(); ifInit(); imcInit(); scanInit(); ptInit();
   $("cellsearch").addEventListener("input", debounce((e) => { S.cellSearch = e.target.value.trim(); refresh(); }));
-  $("resetf").addEventListener("click", () => { S.filters = {}; S.exprFilters = []; S.hiddenCats = {}; S.cellSearch = ""; $("cellsearch").value = ""; refresh(); });
+  $("resetf").addEventListener("click", () => { S.orTS = false; if ($("orts")) $("orts").checked = false; S.filters = {}; S.exprFilters = []; S.hiddenCats = {}; S.cellSearch = ""; $("cellsearch").value = ""; refresh(); });
   $("fit").addEventListener("click", () => { fitView(); });
   const toggleFocus = () => {  // viewer-only mode: hide header + side panels, then let deck.gl re-measure its container
     const on = document.body.classList.toggle("focus"); $("focusbtn").textContent = on ? "Show panels" : "Hide panels"; $("focusbtn").classList.toggle("on", on);
@@ -3555,6 +3777,8 @@ function bindUI() {
   $("galbtn").addEventListener("click", () => { closeGlom(); openGallery(); });
   slideBind();
   $("glombtn").style.display = S.meta.cats.glom_id && S.meta.cats.glom_quality ? "" : "none";
+  $("cmpbtn").style.display = S.meta.has_scffpe ? "" : "none"; $("rgnbtn").style.display = rgnKeys().length ? "" : "none";    // only what this project has
+  $("sigbtn").style.display = S.meta.has_signatures ? "" : "none"; $("viobtn").style.display = S.meta.cats.cell_type ? "" : "none";
   $("umapbtn").style.display = S.meta.umaps?.length ? "" : "none";
   if (S.meta.has_gloms === false) $("ghbtn").style.display = "none";   // no region_heterogeneity object in this project
   txInit(); hesInit(); greyInit();
@@ -3565,7 +3789,7 @@ function bindUI() {
   const npc = S.meta.n_pcs || 0; if (!npc) [...$("umemb").options].forEach((o) => { if (o.value === "pca") o.remove(); });
   for (const [id, def] of [["umpcx", 1], ["umpcy", 2]]) { $(id).innerHTML = Array.from({ length: npc }, (_, i) => `<option value="${i + 1}">PC${i + 1}</option>`).join(""); $(id).value = def; }
   const umChange = () => { $("umpcs").hidden = $("umemb").value !== "pca"; updateUmap(true); };
-  $("umfit").addEventListener("click", umFit); $("umemb").addEventListener("change", umChange); $("umpcx").addEventListener("change", umChange); $("umpcy").addEventListener("change", umChange); $("gzcanvas").addEventListener("click", glomZoomPick);
+  $("umdock").addEventListener("change", umDockApply); $("umfit").addEventListener("click", umFit); $("umemb").addEventListener("change", umChange); $("umpcx").addEventListener("change", umChange); $("umpcy").addEventListener("change", umChange); $("gzcanvas").addEventListener("click", glomZoomPick);
   initFloating($("umapwin"), $("umhead"), "xb_umap");
   $("ghbtn").addEventListener("click", openGH); $("ghclose").addEventListener("click", closeGH);
   for (const id of ["ghct", "ghcs", "ghclr", "ghlayer", "ghpx", "ghpy", "ghhide"]) $(id).addEventListener("change", renderGH);
@@ -3577,9 +3801,14 @@ function bindUI() {
   $("vioadds").addEventListener("click", () => { const v = $("viosig").value; if (v && !VIO.feats.some((f) => f.sig === v)) { VIO.feats.push({ sig: v }); vioControls(); renderVio(); } });
   $("vioshow").addEventListener("change", (e) => { VIO.level = e.target.value; if (VIO.level === "cell_state") VIO.cts.delete(-1); vioControls(); renderVio(); });
   $("vioscope").addEventListener("change", (e) => { VIO.scope = e.target.value; renderVio(); });
-  $("viotype").addEventListener("change", (e) => { VIO.type = e.target.value; $("viology").parentElement.hidden = VIO.type !== "hist"; renderVio(); }); $("viology").addEventListener("change", (e) => { VIO.logy = e.target.checked; renderVio(); }); $("vionz").addEventListener("change", (e) => { VIO.nz = e.target.checked; renderVio(); });
+  $("viotype").addEventListener("change", (e) => { const t = e.target.value;
+    if (t === "dot" && VIO.type !== "dot") { VIO.ctsBefore = new Set(VIO.cts); if (VIO.cts.size < 2) VIO.cts = new Set(S.meta.cats.cell_type.levels.slice(0, 60).map((_, i) => i)); }   // a dot plot compares cell types
+    else if (t !== "dot" && VIO.type === "dot" && VIO.ctsBefore) { VIO.cts = VIO.ctsBefore; VIO.ctsBefore = null; }
+    VIO.type = t; $("viology").parentElement.hidden = VIO.type !== "hist"; vioControls(); renderVio(); });
+  $("viodotby").addEventListener("change", (e) => { VIO.dotBy = e.target.value; renderVio(); }); $("viology").addEventListener("change", (e) => { VIO.logy = e.target.checked; renderVio(); }); $("vionz").addEventListener("change", (e) => { VIO.nz = e.target.checked; renderVio(); });
   $("layer").addEventListener("change", () => { if (!$("vio").hidden) renderVio(); });
   $("vionit").addEventListener("change", (e) => { VIO.unit = e.target.value; renderVio(); });
+  $("viopanel").addEventListener("change", (e) => { VIO.panel = e.target.value; vioControls(); renderVio(); });
   $("sigbtn").addEventListener("click", openSig); $("sigclose").addEventListener("click", closeSig); $("sigsearch").addEventListener("input", renderSigList);
   $("sigtab-explore").addEventListener("click", () => { SIG.tab = "explore"; renderSigPane(); }); $("sigtab-loc").addEventListener("click", () => { SIG.tab = "loc"; renderSigPane(); });
   loadSigList().catch(() => {}); $("sigpreset").addEventListener("change", (e) => { const sg = SIG.byId[e.target.value]; if (!sg) return; S.sigGenes = [...sg.genes]; S.sigName = sg.name; S.sigKey = ""; $("sigtext").value = sg.genes.join(" ");
@@ -3629,7 +3858,7 @@ function bindUI() {
   $("pngvis").addEventListener("click", () => { pm.hidden = true; saveWindowPNG(pm.dataset.kind, false); });
   $("pngall").addEventListener("click", () => { pm.hidden = true; saveWindowPNG(pm.dataset.kind, true); });
   document.addEventListener("click", (e) => { if (!pm.hidden && !pm.contains(e.target)) pm.hidden = true; });
-  $("showpath").addEventListener("change", async (e) => { S.showPath = e.target.checked; S.pathInfo = null; syncPathUI(); if (S.showPath) await loadPaths(); syncPathUI(); render(); });
+  $("showpath")?.addEventListener("change", async (e) => { S.showPath = e.target.checked; S.pathInfo = null; syncPathUI(); if (S.showPath) await loadPaths(); syncPathUI(); render(); });
   bindBox(); bindNewUI();
   window.addEventListener("resize", () => updateScaleBar());
 }
@@ -3655,7 +3884,7 @@ async function loadPaths() {
 }
 const pathLegendHTML = () => (S.showPath && S.pathInfo?.legend ? S.pathInfo.legend.map((e) => `<div class="opt"><span class="sw" style="background:${e.color}"></span><span class="l">${e.name}</span><span class="n">${e.n}</span></div>`).join("") : "");
 function syncPathUI() {  // status line + legend under the checkbox, and the same legend in the floating legend
-  const i = S.pathInfo, el = $("pathstat");
+  const i = S.pathInfo, el = $("pathstat"); if (!el) return;
   el.textContent = !S.showPath ? "" : !i ? "loading…" : i.none ? "no pathologist annotation was matched to this sample" : i.error ? "could not load: " + i.error : `${i.n} regions from ${i.tissues.join(", ")}`;
   updateOvLegend();
 }
@@ -3727,7 +3956,7 @@ async function renderGlomCmp() {
     }
     const rm = mk("span", "rm", "✕"); rm.title = "remove from the comparison"; rm.addEventListener("click", () => glomTick(c.key, { sample: c.sample, label: c.label }, false));
     const gm = mk("div", "gm"), chip = mk("span", "chip " + (c.qc === "passed qc" ? "pass" : "fail"), (c.qc === "passed qc" ? "✓ " : "✕ ") + c.qc);
-    gm.append(chip, `${dlabel(c.s.id)} · ${subtypeOf(c.s)}`, mk("br"), `${fmt(c.cells.length)} cells${nPass < c.cells.length ? ` (${fmt(nPass)} pass the filters)` : ""}${mean}`);
+    gm.append(chip, `${dlabel(c.s.id)}${gTag(c.s)}`, mk("br"), `${fmt(c.cells.length)} cells${nPass < c.cells.length ? ` (${fmt(nPass)} pass the filters)` : ""}${mean}`);
     const bar = mk("div", "cbar2"); for (const [t, n] of c.comp) { const seg = mk("i"); seg.style.width = (100 * n / c.cells.length) + "%"; seg.style.background = t === MISSING ? rgbStr(GRAY) : catColor("cell_type", t); seg.title = `${t === MISSING ? "no cell type" : catMeta("cell_type").levels[t]}: ${n} (${(100 * n / c.cells.length).toFixed(0)}%)`; bar.append(seg); }
     el.append(rm, cv, mk("div", "gid", c.label), gm, bar); grid.append(el); c.cv = cv; cv._hw = "gcmp";
     const cv2 = hePane(el, cv, "gcmp", c.s.id);   // H&E beside the cells: a second canvas, wheel = zoom, drag = pan
@@ -3760,7 +3989,7 @@ function saveGlomCmpPNG() {
     x.font = `600 13px ${FONT}`; x.fillStyle = "#d7dde6"; x.fillText(c.label, cx + 8, cy + size + 26);
     const chipTxt = (c.qc === "passed qc" ? "✓ " : "✕ ") + c.qc; x.font = `600 11px ${FONT}`; const cwid = x.measureText(chipTxt).width + 12;
     x.fillStyle = c.qc === "passed qc" ? STATUS.good : STATUS.critical; x.fillRect(cx + 8, cy + size + 33, cwid, 16); x.fillStyle = c.qc === "passed qc" ? "#0b0b0b" : "#fff"; x.fillText(chipTxt, cx + 14, cy + size + 45);
-    x.font = `11.5px ${FONT}`; x.fillStyle = "#8b95a5"; x.fillText(`${dlabel(c.s.id)} · ${subtypeOf(c.s)} · ${fmt(c.cells.length)} cells`, cx + 8 + cwid + 8, cy + size + 45);
+    x.font = `11.5px ${FONT}`; x.fillStyle = "#8b95a5"; x.fillText(`${dlabel(c.s.id)}${gTag(c.s)} · ${fmt(c.cells.length)} cells`, cx + 8 + cwid + 8, cy + size + 45);
     let bx = cx + 8; for (const [t, n] of c.comp) { const w = (size * n) / c.cells.length; x.fillStyle = t === MISSING ? rgbStr(GRAY) : catColor("cell_type", t); x.fillRect(bx, cy + size + 56, w, 12); bx += w; }
   });
   out.toBlob((blob) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "glomeruli_comparison.png"; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000); }, "image/png");
@@ -3802,10 +4031,10 @@ function rnbCells(b, inst, others, d) {   // -> { inside, ring } cell indices
 }
 function openRnb() {
   closeAllWindows();
-  const names = catMeta("path_region").levels.slice(0, -1), subs = sortedSubtypes();
+  const names = catMeta("path_region").levels.slice(0, -1), subs = sortedGroups();
   $("rnbsel").innerHTML = names.map((n) => `<option value="${n}">${n === "All gloms" ? "Non-sclerotic gloms (pathologist “All gloms”)" : n}</option>`).join("");
   $("rnbsel").value = S.rnbName && names.includes(S.rnbName) ? S.rnbName : names.includes("Sclerotic Gloms") ? "Sclerotic Gloms" : names[0];
-  $("rnbscope").innerHTML = `<option value="all">All donors</option><option value="cur">This donor (${dlabel(S.sample)})</option>` + subs.map((t) => `<option value="sub:${t}">Disease subtype: ${t}</option>`).join("");
+  $("rnbscope").innerHTML = `<option value="all">All donors</option><option value="cur">This tissue (${dlabel(S.sample)})</option>` + (hasGroups() ? subs : []).map((t) => `<option value="sub:${t}">${groupTitle()}: ${t}</option>`).join("");
   $("rnbscope").value = S.rnbScope || "all"; if ($("rnbscope").value !== (S.rnbScope || "all")) $("rnbscope").value = "all";
   $("rnb").hidden = false; renderRnb();
 }
@@ -3827,8 +4056,8 @@ async function renderRnb() {
   if ($("rnb").hidden) return;
   const tok = ++rnbToken, name = $("rnbsel").value, scope = $("rnbscope").value, d = Math.max(1, +$("rnbd").value || 50), grid = $("rnbgrid"), sel = S.rnbSel || (S.rnbSel = new Map()), only = $("rnbonly").checked, size = +$("rnbsz").value;
   S.rnbName = name; S.rnbScope = scope; $("rnbn").textContent = sel.size; $("rnbclr").disabled = !sel.size; $("rnbscope").disabled = $("rnbsz").disabled = only; $("rnbzoomctl").hidden = !only; grid.classList.toggle("cmpgrid", only); if (!only) grid.removeAttribute("style");
-  const rank = (t) => sortedSubtypes().indexOf(t), pool = S.meta.samples.filter((s) => s.has_paths);
-  const samples = (only ? pool.filter((s) => [...sel.values()].some((r) => r.sample === s.id)) : pool.filter((s) => scope === "all" || (scope === "cur" ? s.id === S.sample : subtypeOf(s) === scope.slice(4)))).sort((x, y) => rank(subtypeOf(x)) - rank(subtypeOf(y)));
+  const rank = (t) => sortedGroups().indexOf(t), pool = S.meta.samples.filter((s) => s.has_paths);
+  const samples = (only ? pool.filter((s) => [...sel.values()].some((r) => r.sample === s.id)) : pool.filter((s) => scope === "all" || (scope === "cur" ? s.id === S.sample : groupOf(s) === scope.slice(4)))).sort((x, y) => rank(groupOf(x)) - rank(groupOf(y)));
   const totals = { n: 0, donors: new Set() }, subInfo = new Map();
   const info = (done) => ($("rnbinfo").textContent = only ? `${totals.n} ticked “${name}” region${totals.n === 1 ? "" : "s"} · cells inside plus within ${d} µm · colour: ${colorName()}${winNote()} · window split per region · wheel = zoom, drag = pan, double-click = reset, click a name to open it${done ? "" : " · loading…"}`
     : `${totals.n} “${name}” region${totals.n === 1 ? "" : "s"} in ${donTxt(totals.donors.size)} · cells inside the outline plus cells within ${d} µm of it (cells inside other glomeruli left out) · white lines separate donors · colour: ${colorName()}${winNote()}${done ? "" : " · loading…"}`);
@@ -3841,9 +4070,9 @@ async function renderRnb() {
   if (only) {   // compare view: one equal chunk per ticked region, wheel = zoom, drag = pan
     const items = [];
     await Promise.all(samples.map(async (s) => { const r = await rnbTiles(s, name, d); if (!r) return; for (const t of r.tiles) if (sel.has(t.key)) items.push({ ...t, s, b: r.b, poly: r.poly }); }));
-    if (tok !== rnbToken) return; const order = [...sel.keys()]; items.sort((x, y) => order.indexOf(x.key) - order.indexOf(y.key)); totals.n = items.length; info(true);
+    if (tok !== rnbToken) return; S.ctxs.rnbFig = { sc, items, name, d, only: true }; const order = [...sel.keys()]; items.sort((x, y) => order.indexOf(x.key) - order.indexOf(y.key)); totals.n = items.length; info(true);
     grid.innerHTML = items.map((r) => `<div class="gtile sel" data-id="${r.key}"><input type="checkbox" class="gsel" title="untick to remove from this view" checked><span class="zb"></span><canvas width="300" height="300"></canvas>
-      <div class="cap"><b class="gid">${r.label}</b><div class="gm">${dlabel(r.s.id)} · ${subtypeOf(r.s)}<br>${fmt(r.inside.length)} cells inside · ${fmt(r.ring.length)} within ${d} µm</div></div></div>`).join("");
+      <div class="cap"><b class="gid">${r.label}</b><div class="gm">${dlabel(r.s.id)}${gTag(r.s)}<br>${fmt(r.inside.length)} cells inside · ${fmt(r.ring.length)} within ${d} µm</div></div></div>`).join("");
     const dims = cmpLayout("rnb", "rnbgrid", Math.max(1, items.length), 70);
     items.forEach((r) => {
       const t = grid.querySelector(`.gtile[data-id="${CSS.escape(r.key)}"]`), cv = t.querySelector("canvas"), B = glomBox(r.cells, r.poly, 12, r.outline); cv._hw = "rnb";
@@ -3855,19 +4084,19 @@ async function renderRnb() {
     });
     return;
   }
-  // one row per disease subtype; tissues of the same donor sit together and a white line separates donors
-  const subs = [...new Set(samples.map(subtypeOf))]; let prevDonor = null;
-  grid.innerHTML = subs.map((t) => `<div class="rnbsec" data-t="${t}" hidden><div class="sechead"></div><div class="rnbrow">` + samples.filter((s) => subtypeOf(s) === t).map((s) => { const nw = s.donor !== prevDonor; prevDonor = s.donor; return `<div class="dgrp${nw ? " dnew" : ""}" data-s="${s.id}"></div>`; }).join("") + `</div></div>`).join("");
-  let pending = samples.length;
+  // one row per group; tissues of the same donor sit together and a white line separates donors
+  const subs = [...new Set(samples.map(groupOf))]; let prevDonor = null;
+  grid.innerHTML = subs.map((t) => `<div class="rnbsec" data-t="${t}" hidden><div class="sechead"></div><div class="rnbrow">` + samples.filter((s) => groupOf(s) === t).map((s) => { const nw = s.donor !== prevDonor; prevDonor = s.donor; return `<div class="dgrp${nw ? " dnew" : ""}" data-s="${s.id}"></div>`; }).join("") + `</div></div>`).join("");
+  let pending = samples.length; const allT = []; S.ctxs.rnbFig = { sc, all: allT, sel, name, d, only: false };
   await Promise.all(samples.map(async (s, k) => {
     try {
       const r = await rnbTiles(s, name, d); if (tok !== rnbToken || !r || !r.tiles.length) return;
-      const slot = grid.querySelector(`.dgrp[data-s="${CSS.escape(s.id)}"]`), sec = slot.closest(".rnbsec"), t0 = subtypeOf(s); sec.hidden = false; totals.donors.add(s.donor);
+      const slot = grid.querySelector(`.dgrp[data-s="${CSS.escape(s.id)}"]`), sec = slot.closest(".rnbsec"), t0 = groupOf(s); sec.hidden = false; totals.donors.add(s.donor);
       const si = subInfo.get(t0) || subInfo.set(t0, { n: 0, donors: new Set() }).get(t0); si.donors.add(s.donor);
       for (const t of r.tiles) {
-        totals.n++; si.n++;
+        totals.n++; si.n++; allT.push({ ...t, s, b: r.b, poly: r.poly });
         const el = document.createElement("div"); el.className = "gtile" + (sel.has(t.key) ? " sel" : ""); el.style.width = size + 12 + "px"; el.title = `${t.label} — click to zoom; tick the box to compare`;
-        el.innerHTML = `<input type="checkbox" class="gsel" title="tick to compare this region" ${sel.has(t.key) ? "checked" : ""}><canvas width="${size}" height="${size}" style="width:${size}px;height:${size}px"></canvas><div class="gid">${t.label}</div><div class="gm">${dlabel(s.id)}<br>${subtypeOf(s)}<br>${fmt(t.inside.length)} cells inside · ${fmt(t.ring.length)} within ${d} µm</div>`;
+        el.innerHTML = `<input type="checkbox" class="gsel" title="tick to compare this region" ${sel.has(t.key) ? "checked" : ""}><canvas width="${size}" height="${size}" style="width:${size}px;height:${size}px"></canvas><div class="gid">${t.label}</div><div class="gm">${dlabel(s.id)}<br>${groupOf(s)}<br>${fmt(t.inside.length)} cells inside · ${fmt(t.ring.length)} within ${d} µm</div>`;
         el.addEventListener("click", () => openGlomZoom({ src: "rnb", s, b: r.b, sc, poly: r.poly, cells: t.cells, label: t.label, qc: null, outline: t.outline, note: `${name} outline · cells inside + within ${d} µm` }));
         const cb = el.querySelector(".gsel"); cb.addEventListener("click", (e) => e.stopPropagation()); cb.addEventListener("change", () => { el.classList.toggle("sel", cb.checked); tick(t, cb.checked, s); });
         slot.appendChild(el); const cv = el.querySelector("canvas"); cv._hw = "rnb"; drawGlom(cv, r.b, sc, r.poly, t.cells, false, -1, t.outline);
@@ -3887,9 +4116,9 @@ function rgnDefault(k) { const L = catMeta(k).levels, ls = rgnLevels(k); return 
 function rgnInit() { if (!S.meta.cats[RG.src]) RG.src = rgnKeys()[0]; if (RG.src && RG.level < 0) RG.level = rgnDefault(RG.src); }
 function rgnFillSel() { const k = RG.src, L = catMeta(k).levels, ls = rgnLevels(k); $("rgnsel").innerHTML = ls.map((i) => `<option value="${i}">${L[i]}</option>`).join(""); if (!ls.includes(RG.level)) RG.level = rgnDefault(k); $("rgnsel").value = RG.level; }
 function openRgn() {
-  closeAllWindows(); rgnInit(); if (!RG.src) { alert("This dataset has no region fields."); return; }
+  closeAllWindows(); rgnInit(); if (!RG.src) return;
   $("rgnsrc").innerHTML = rgnKeys().map((k) => `<option value="${k}">${k === "path_region" ? "Pathologist outlines (cells inside the outline)" : ROLE_LABEL[k] + " (cell labels)"}</option>`).join(""); $("rgnsrc").value = RG.src;
-  const subs = sortedSubtypes(); $("rgnsub").innerHTML = `<option value="__all">All donors (${nDonors(S.meta.samples)})</option>` + subs.map((t) => `<option value="${t}">${t} (${nDonors(S.meta.samples.filter((s) => subtypeOf(s) === t))})</option>`).join("");
+  const subs = sortedGroups(); $("rgnsub").innerHTML = `<option value="__all">All donors (${nDonors(S.meta.samples)})</option>` + (hasGroups() ? subs : []).map((t) => `<option value="${t}">${t} (${nDonors(S.meta.samples.filter((s) => groupOf(s) === t))})</option>`).join("");
   $("rgnsub").value = S.rgnSub && (S.rgnSub === "__all" || subs.includes(S.rgnSub)) ? S.rgnSub : "__all";
   rgnFillSel(); syncTransformUI(); $("rgn").hidden = false; renderRgn();
 }
@@ -3902,7 +4131,7 @@ async function renderRgn() {
   const tok = ++rgnToken, key = RG.src, lvl = RG.level, multi = isMulti(key), name = String(display(key, lvl)).split("›").pop().trim(), grid = $("rgngrid");
   const sub = $("rgnsub").value, box = +$("rgnsz").value, wantOut = $("rgnout").checked, ctxOn = $("rgnctx").checked; S.rgnSub = sub;
   const sel = S.rgnSel || (S.rgnSel = new Set()), only = $("rgnonly").checked;
-  const groups = sortedSubtypes().filter((t) => sub === "__all" || t === sub).map((t) => ({ t, samples: S.meta.samples.filter((s) => subtypeOf(s) === t && (!only || sel.has(s.id))) })).filter((g) => g.samples.length), samples = groups.flatMap((g) => g.samples);
+  const groups = sortedGroups().filter((t) => sub === "__all" || t === sub).map((t) => ({ t, samples: S.meta.samples.filter((s) => groupOf(s) === t && (!only || sel.has(s.id))) })).filter((g) => g.samples.length), samples = groups.flatMap((g) => g.samples);
   $("rgnn").textContent = sel.size; $("rgnsz").disabled = only; $("rgnzoomctl").hidden = !only; grid.classList.toggle("cmpgrid", only); if (!only) grid.removeAttribute("style");
   if (only && !samples.length) { grid.innerHTML = `<div class="muted">No ticked tissue${sub === "__all" ? "" : " in this group"}. Untick “only ticked” and tick the tissues to compare.</div>`; $("rgnleg").innerHTML = ""; $("rgninfo").textContent = ""; return; }
   const what = `Region “${name}” (${key === "path_region" ? "cells inside the pathologist outline" : ROLE_LABEL[key] + " label"})`;
@@ -3923,7 +4152,7 @@ async function renderRgn() {
   if (tok !== rgnToken) return;
   const sc = S.meta.cats[S.colorBy] ? makeScale([]) : makeScale(rows.map((r) => ({ ...r.b, pass: r.b.pass.map((p, i) => p & r.inR[i]) })));   // scale pooled over the region's cells only
   $("rgnleg").innerHTML = (wantOut ? `<div class="opt"><span class="sw" style="background:${regionColor(name, null)}"></span><span class="l">${name} boundary</span></div>` : "") + (sc.info.type === "cat" ? "" : scaleLegendHTML(sc.info));
-  const shown = S.ctxs.rgn = { sc, shown: [] }; let withOut = 0, drawn = 0; const empty = [], drawnIds = [], outIds = [];
+  const shown = S.ctxs.rgn = { sc, shown: [] }; const figTiles = []; S.ctxs.rgnFig = { sc, tiles: figTiles, only, name }; let withOut = 0, drawn = 0; const empty = [], drawnIds = [], outIds = [];
   const dims = only ? cmpLayout("rgn", "rgngrid", Math.max(1, rows.filter((r) => r.cells.length).length), 104) : null;   // compare view: one equal chunk per tissue that has cells in the region
   for (const r of rows) {
     const el = grid.querySelector(`.tile[data-id="${CSS.escape(r.s.id)}"]`); if (!el) continue;
@@ -3937,8 +4166,8 @@ async function renderRgn() {
     const rec = el._dt = { he, last: null, last2: null, bb, draw: (vw, vh) => { rec.last = vw; rec.last2 = vh; drawRegionTile(cv, r, sc, rings, pen, box, ctxOn, bb, vw, dm, cache, r.poly, he, "rgn"); if (cv2) drawRegionTile(cv2, r, sc, rings, pen, box, ctxOn, bb, HEW.rgn.link ? vw : vh, dm, null, null, he2, "rgn"); } }, v0 = only ? rgnCfg.views()[rgnCfg.sync() ? "__all" : r.s.id] || null : null;
     rec.draw(v0, only ? rgnCfg.views()[(rgnCfg.sync() ? "__all" : r.s.id) + "#h"] || null : null); if (only) { attachZoom(el, rec, rgnCfg); if (v0 && v0.z > 1.01) el.querySelector(".zb").textContent = "×" + v0.z.toFixed(1); }
     const area = fs.reduce((a, f) => a + (f.properties.area_um2 || 0), 0) / 1e6, nPass = r.cells.filter((i) => r.b.pass[i]).length;
-    el.querySelector(".cap").innerHTML = `<b>${dlabel(r.s.id)}</b><br><span class="muted">${fmt(r.cells.length)} cells in the region (${(100 * r.cells.length / r.b.n).toFixed(0)}% of the donor tissue)${nPass < r.cells.length ? ` · ${fmt(nPass)} pass the filters` : ""}${area ? ` · outline area ${area.toFixed(2)} mm²` : ""}<br>${r.s.disease_type} · ${subtypeOf(r.s)}</span>`;
-    shown.shown.push({ el, b: r.b, cells: r.cells });
+    el.querySelector(".cap").innerHTML = `<b>${dlabel(r.s.id)}</b><br><span class="muted">${fmt(r.cells.length)} cells in the region (${(100 * r.cells.length / r.b.n).toFixed(0)}% of the tissue)${nPass < r.cells.length ? ` · ${fmt(nPass)} pass the filters` : ""}${area ? ` · outline area ${area.toFixed(2)} mm²` : ""}<br>${r.s.disease_type}${gTag(r.s)}</span>`;
+    shown.shown.push({ el, b: r.b, cells: r.cells }); figTiles.push({ r, rings, pen, bb, ctxOn });
   }
   grid.querySelectorAll(".galsec").forEach((g) => { if (![...g.querySelectorAll(".tile")].some((t) => t.style.display !== "none")) g.style.display = "none"; });
   $("rgninfo").title = empty.length ? `No cells of this region in: ${empty.join(", ")}` : "";
@@ -3958,8 +4187,8 @@ function drawRegionTile(cv, r, sc, rings, pen, box, ctxOn, bb = regionBBox(r, ri
   const { b, cells, inR } = r, { x0, y0, w, h } = bb, k = dims ? Math.min((dims.W - 8) / w, (dims.H - 8) / h) : (box - 8) / Math.max(w, h);
   cv.width = dims ? dims.W : Math.max(40, Math.ceil(w * k) + 8); cv.height = dims ? dims.H : Math.max(40, Math.ceil(h * k) + 8);
   const z = view ? view.z : 1, W = cv.width, H = cv.height, kz = k * z, cx = x0 + (view ? view.rx : 0.5) * w, cy = y0 + (view ? view.ry : 0.5) * h;
-  const ctx = cv.getContext("2d"), X = (x) => W / 2 + (x - cx) * kz, Y = (y) => H / 2 + (y - cy) * kz, sp = Math.sqrt((w * k * h * k) / Math.max(1, cells.length)), px = Math.max(1.2, Math.min(4, sp * 0.8)) * Math.min(z, 5);
-  ctx.fillStyle = "#0f1218"; ctx.fillRect(0, 0, W, H);
+  const ctx = cv.getContext("2d"), X = (x) => W / 2 + (x - cx) * kz, Y = (y) => H / 2 + (y - cy) * kz, sp = Math.sqrt((w * k * h * k) / Math.max(1, cells.length)), ps = cv._ps || 1, px = Math.max(1.2 * ps, Math.min(4 * ps, sp * 0.8)) * Math.min(z, 5);   // ps: a figure drawn at a high resolution scales dots and lines with it
+  ctx.fillStyle = cv._bg || bgCol(); ctx.fillRect(0, 0, W, H);
   cv._xf = { s: kz, ox: W / 2 - cx * kz, oy: H / 2 - cy * kz };
   if (he) drawHE(ctx, { ...(he.w ? he : { ...he, w: w8 }), side: !!cv._heOnly }, X, Y, W, H, kz);
   if (cv._heOnly && imcSide(w8)) cv._xf = null;
@@ -3970,16 +4199,18 @@ function drawRegionTile(cv, r, sc, rings, pen, box, ctxOn, bb = regionBBox(r, ri
   let order = cache?.order;
   if (!order && !ho) {
     const groups = new Map();
-    for (const i of cells) { const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : "rgba(105,110,122,0.45)"; (groups.get(col) || groups.set(col, []).get(col)).push(i); }
+    for (const i of cells) { const col = b.pass[i] ? (S.grey ? rgbStr(GREY) : rgbStr(sc.color(b, i))) : `rgba(105,110,122,${S.dimA})`; (groups.get(col) || groups.set(col, []).get(col)).push(i); }
     order = [...groups.entries()].sort((p, q) => (p[0].startsWith("rgba") ? -1 : 0) - (q[0].startsWith("rgba") ? -1 : 0)); if (cache) cache.order = order;
   }
-  if (!ho) drawCells(ctx, order, b, X, Y, W, H, px, poly, hw(w8).a, hw(w8).outl);
+  if (!ho) drawCells(ctx, order, b, X, Y, W, H, px, poly, hw(w8).a, hw(w8).outl, ps);
   ctx.globalAlpha = 1; ctx.lineJoin = "round";
-  for (const [lw, col] of [[4, "rgba(0,0,0,0.85)"], [2, pen]]) { ctx.lineWidth = lw; ctx.strokeStyle = col; for (const ring of rings) { ctx.beginPath(); ring.forEach(([x, y], j) => (j ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.closePath(); ctx.stroke(); } }
-  const target = 0.2 * (W - 8) / kz, p = Math.pow(10, Math.floor(Math.log10(target))), nice = [1, 2, 5, 10].map((f) => f * p).reduce((a, c) => (Math.abs(c - target) < Math.abs(a - target) ? c : a));
-  const lab = nice >= 1000 ? `${nice / 1000} mm` : `${nice} µm`; ctx.font = `11px ${FONT}`; ctx.textBaseline = "alphabetic";
-  ctx.fillStyle = "rgba(15,18,24,0.75)"; ctx.fillRect(6, H - 32, Math.max(nice * kz, ctx.measureText(lab).width) + 10, 28);   // keeps the scale bar legible over cells
-  ctx.fillStyle = "#fff"; ctx.fillRect(10, H - 12, nice * kz, 3); ctx.fillText(lab, 10, H - 17);
+  for (const [lw, col] of [[4 * ps, "rgba(0,0,0,0.85)"], [2 * ps, pen]]) { ctx.lineWidth = lw; ctx.strokeStyle = col; for (const ring of rings) { ctx.beginPath(); ring.forEach(([x, y], j) => (j ? ctx.lineTo(X(x), Y(y)) : ctx.moveTo(X(x), Y(y)))); ctx.closePath(); ctx.stroke(); } }
+  if (!cv._noSB) {
+    const target = 0.2 * (W - 8) / kz, p = Math.pow(10, Math.floor(Math.log10(target))), nice = [1, 2, 5, 10].map((f) => f * p).reduce((a, c) => (Math.abs(c - target) < Math.abs(a - target) ? c : a));
+    const lab = nice >= 1000 ? `${nice / 1000} mm` : `${nice} µm`; ctx.font = `11px ${FONT}`; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "rgba(15,18,24,0.75)"; ctx.fillRect(6, H - 32, Math.max(nice * kz, ctx.measureText(lab).width) + 10, 28);   // keeps the scale bar legible over cells
+    ctx.fillStyle = "#fff"; ctx.fillRect(10, H - 12, nice * kz, 3); ctx.fillText(lab, 10, H - 17);
+  }
 }
 
 function bindNewUI() {
@@ -4019,3 +4250,67 @@ function bindNewUI() {
 drawTile = ptWrap(drawTile, (a) => a[2].sample); drawGlom = ptWrap(drawGlom, (a) => a[1].sample); drawRegionTile = ptWrap(drawRegionTile, (a) => a[1].s.id);
 
 init().catch((e) => { loading(false); document.body.insertAdjacentHTML("afterbegin", `<pre style="color:#b00;padding:12px">Failed to start: ${e.message}</pre>`); });
+
+// ---------------------------------------------------------------- Claude access (agent.py): what Claude may see of this project, what it did, and the viewer's side of "see / show"
+const AG = { level: "off", seq: 0, timer: null, st: null, busy: false };
+const AG_SHORT = { structure: "structure", summaries: "summaries", full: "full", code: "run code" };
+function agentBadge() { const b = $("agentbadge"), on = AG.level !== "off"; b.hidden = !on; if (on) b.textContent = "Claude: " + AG_SHORT[AG.level]; }
+async function agentOpen() {
+  const d = await jget("/api/sharing"); AG.level = d.level; agentBadge(); $("agentwin").hidden = false;
+  $("agentlevels").replaceChildren(...d.levels.map((l) => { const lab = document.createElement("label"); lab.className = "rad"; const r = Object.assign(document.createElement("input"), { type: "radio", name: "aglev", value: l.key, checked: l.key === d.level });
+    r.addEventListener("change", () => { $("agentcode").hidden = l.key !== "code"; }); lab.append(r, " " + l.text); return lab; }));
+  $("agentcode").hidden = d.level !== "code"; $("agentpy").value = d.python || ""; $("agentr").value = d.r || ""; $("agentmsg").textContent = "";
+  const port = location.port || (location.protocol === "https:" ? "443" : "80");
+  $("agentconn").innerHTML = `<p>Claude reaches WebbScope through its MCP connector, a small program that Claude starts where Claude runs. The connector has its own key: it reaches only what the level above allows and cannot change the level.</p>
+    <p><b>Claude on this machine.</b> Claude Code: <code>claude mcp add webbscope -- ${escHtml(d.connector)}</code>. Claude Desktop: add <code>"webbscope": {"command": …, "args": […, "--mcp"]}</code> with that command under <code>mcpServers</code> in its configuration file. The connector finds this server by itself.</p>
+    <p><b>WebbScope on the HPC, Claude on your computer.</b> Keep the SSH tunnel open and start the connector on your computer (the Mac app's, or <code>python3 …/WebbScope/run_app.py --mcp</code> from a source copy) with this server's address and key:
+    <code>--url http://localhost:${port} --key</code> <code id="agentkey" class="blur">${escHtml(d.agent_key || "(no key: this server runs without an access token)")}</code> <button id="agentkeyshow" class="sm">show</button>. Code that Claude runs (Run code) runs here, on the server.</p>`;
+  $("agentkeyshow")?.addEventListener("click", () => $("agentkey").classList.toggle("blur"));
+  const rows = d.log.slice(0, 120).map((x) => `<tr><td>${x.time}</td><td>${x.tool}</td><td>${x.level}</td><td>${x.outcome}</td><td class="muted">${escHtml(JSON.stringify(x.params || {})).slice(0, 160)}${x.rows != null ? ` · ${fmt(x.rows)} rows` : ""}</td></tr>`).join("");
+  $("agentlog").innerHTML = rows ? `<table class="aglog"><tr><th>time</th><th>what</th><th>level</th><th>outcome</th><th>details</th></tr>${rows}</table>` : '<span class="muted">Nothing yet.</span>';
+}
+const escHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+async function agentSave() {
+  const lv = document.querySelector("input[name=aglev]:checked")?.value || "off";
+  if (lv === "code" && AG.level !== "code" && !confirm("Run code lets Claude run Python or R code it writes, with your account's rights, on the machine running WebbScope, with this project's data. Allow it for this project?")) return;
+  try { const r = await postJSON("/api/sharing", { level: lv, python: $("agentpy").value, r: $("agentr").value }); AG.level = r.level; agentBadge(); agentPollSet(); agentStateSoon(); $("agentmsg").textContent = "Saved."; agentOpen(); }
+  catch (e) { $("agentmsg").textContent = "Not saved: " + e.message; }
+}
+function agentPollSet() { clearInterval(AG.timer); AG.timer = AG.level === "off" ? null : setInterval(agentPoll, 2000); }
+async function agentPoll() {
+  if (AG.busy) return; AG.busy = true;
+  try {
+    const d = await jget(`/api/viewer/commands?after=${AG.seq}`);
+    if (d.level !== AG.level) { AG.level = d.level; agentBadge(); if (AG.level === "off") agentPollSet(); }
+    for (const c of d.commands) { AG.seq = Math.max(AG.seq, c.seq); await agentApply(c); }
+    if (d.seq < AG.seq) AG.seq = d.seq;   // the server restarted
+  } catch (e) { /* the server may be restarting */ } finally { AG.busy = false; }
+}
+async function agentApply(c) {
+  if (c.snapshot) { S._snapCb = (cv) => postJSON("/api/viewer/snapshot", { png_base64: cv.toDataURL("image/png").split(",")[1] }).catch(() => {}); saveViewPNG(); return; }
+  if (c.sample && c.sample !== S.sample && S.meta.samples.some((s) => s.id === c.sample)) { $("sample").value = c.sample; await loadSample(c.sample); }
+  for (const [k, vals] of Object.entries(c.filters || {})) {
+    if (!S.meta.cats[k]) continue; const lv = catMeta(k).levels;
+    S.filters[k] = new Set(vals.map((v) => lv.indexOf(String(v))).filter((i) => i >= 0)); renderFilterOpts(k);
+  }
+  if (c.color_by) {
+    if (S.meta.cats[c.color_by]) { S.colorBy = c.color_by; $("colorby").value = c.color_by; }
+    else { S.colorBy = "__gene"; $("colorby").value = "__gene"; S.geneA = c.color_by; $("geneA").value = c.color_by; }
+    syncGeneUI();
+  }
+  await refresh(); agentStateSoon();
+}
+function agentStateSoon() {
+  if (AG.level === "off") return; clearTimeout(AG.st);
+  AG.st = setTimeout(() => {
+    const filters = {}; for (const k of Object.keys(S.filters)) if (S.filters[k].size && S.meta.cats[k] && !isMulti(k)) filters[k] = [...S.filters[k]].map((i) => catMeta(k).levels[i]);
+    const windows = ["vio", "sigwin", "nbr", "slide", "ghet", "glomzoom", "glomcmp", "umapwin", "heswin", "gallery", "rgn"].filter((id) => $(id) && !$(id).hidden);
+    postJSON("/api/viewer/state", { sample: S.sample, color_by: S.colorBy, gene: S.colorBy === "__gene" || S.colorBy === "__dual" ? S.geneA : "", filters, selected: S.selected?.size || 0, windows, zoom: S.viewState ? +S.viewState.zoom.toFixed(2) : null }).catch(() => {});
+  }, 800);
+}
+function agentInit() {
+  AG.level = S.meta.agent_level || "off"; agentBadge(); agentPollSet(); agentStateSoon();
+  $("agentbtn").addEventListener("click", agentOpen); $("agentbadge").addEventListener("click", agentOpen); $("agentx").addEventListener("click", () => ($("agentwin").hidden = true));
+  $("agentsave").addEventListener("click", agentSave);
+  $("agentclear").addEventListener("click", async () => { if (!confirm("Clear the activity log of this project?")) return; await fetch("/api/sharing/log", { method: "DELETE" }); agentOpen(); });
+}
